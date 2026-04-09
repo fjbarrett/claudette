@@ -1,0 +1,9 @@
+{
+  "id": "025c9902-b5c4-464a-930f-d2b9d03b3b50",
+  "model": "gemma4:latest",
+  "cwd": "/home/frank/Code/test",
+  "title": "New Session",
+  "createdAt": "2026-04-08T23:52:34.321Z",
+  "updatedAt": "2026-04-08T23:52:34.321Z",
+  "messages": []
+}

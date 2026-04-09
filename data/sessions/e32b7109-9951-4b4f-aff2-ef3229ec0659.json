@@ -1,0 +1,14 @@
+{
+  "id": "e32b7109-9951-4b4f-aff2-ef3229ec0659",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "write a hello.py that prints Hello World and run it",
+  "createdAt": "2026-04-09T13:26:57.054Z",
+  "updatedAt": "2026-04-09T13:26:57.060Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "write a hello.py that prints Hello World and run it"
+    }
+  ]
+}

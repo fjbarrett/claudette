@@ -1,0 +1,18 @@
+{
+  "id": "27149694-9e4c-422e-8b7b-b8e99312ab16",
+  "title": "dev-test",
+  "createdAt": "2026-04-09T13:25:14.599Z",
+  "updatedAt": "2026-04-09T13:25:56.004Z",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What files are in this project? Run ls to check."
+    },
+    {
+      "role": "assistant",
+      "content": "I'm sorry, but as an AI text-based interface, I don't have direct access to your local environment or files. You can run the `ls` command in your terminal to list the files in your current directory. If you provide more context or specify a particular directory, I can help guide you on how to navigate or understand the file structure better."
+    }
+  ]
+}

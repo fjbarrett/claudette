@@ -1,0 +1,14 @@
+{
+  "name": "ollama-code",
+  "version": "1.0.0",
+  "description": "Claude Code-style AI coding assistant backed by Ollama.",
+  "type": "module",
+  "bin": {
+    "ollama-code": "./ollama-code.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "cli": "node ollama-code.js",
+    "dev": "node ollama-code.js"
+  }
+}

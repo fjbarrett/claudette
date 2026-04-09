@@ -1,0 +1,14 @@
+{
+  "id": "416c8f52-ca93-4bd3-91fd-4cde45ab8178",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "build me a todo CLI app in python. it should work as: python",
+  "createdAt": "2026-04-08T23:09:19.697Z",
+  "updatedAt": "2026-04-08T23:09:19.711Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "build me a todo CLI app in python. it should work as: python3 todo.py add \"buy milk\", python3 todo.py list, python3 todo.py done 1. save as todo.py and test it."
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "6d89093e-25fa-47c1-aae4-d333cc6924ed",
+  "model": "qwen3.5:latest",
+  "cwd": "/home/frank/Code/test",
+  "title": "list the js files in this project using the glob tool",
+  "createdAt": "2026-04-08T21:48:13.295Z",
+  "updatedAt": "2026-04-08T21:48:13.301Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "list the js files in this project using the glob tool"
+    }
+  ]
+}

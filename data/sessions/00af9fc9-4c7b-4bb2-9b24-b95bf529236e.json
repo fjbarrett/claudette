@@ -1,0 +1,14 @@
+{
+  "id": "00af9fc9-4c7b-4bb2-9b24-b95bf529236e",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "hey what does the code in this dir do?",
+  "createdAt": "2026-04-08T22:53:10.754Z",
+  "updatedAt": "2026-04-08T22:53:22.965Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hey what does the code in this dir do?"
+    }
+  ]
+}

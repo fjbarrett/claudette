@@ -1,0 +1,14 @@
+{
+  "id": "e0ceb586-9083-42dd-83c3-20962dfc544d",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "read src/tools.js and list all exported function names",
+  "createdAt": "2026-04-09T13:32:19.812Z",
+  "updatedAt": "2026-04-09T13:32:19.824Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "read src/tools.js and list all exported function names"
+    }
+  ]
+}

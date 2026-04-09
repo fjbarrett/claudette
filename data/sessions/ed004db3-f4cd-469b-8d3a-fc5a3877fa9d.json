@@ -1,0 +1,22 @@
+{
+  "id": "ed004db3-f4cd-469b-8d3a-fc5a3877fa9d",
+  "model": "qwen3.5:latest",
+  "cwd": "/home/frank/Code/test",
+  "title": "hello how are you",
+  "createdAt": "2026-04-08T21:54:05.879Z",
+  "updatedAt": "2026-04-08T21:55:02.604Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "hello how are you"
+    },
+    {
+      "role": "assistant",
+      "content": "Hello! I'm doing well, thanks for asking. How can I help you today?"
+    },
+    {
+      "role": "user",
+      "content": "I need help writing a python script to run a ping request, id like to write and test it"
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "id": "faa0c04b-27bc-401c-a9e2-f97e70bed147",
+  "model": "llama3.2:latest",
+  "cwd": "/home/frank/Code/test",
+  "title": "list the files in the dir",
+  "createdAt": "2026-04-08T22:10:32.818Z",
+  "updatedAt": "2026-04-08T22:10:38.282Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "list the files in the dir"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_r2xm38d0",
+          "function": {
+            "index": 0,
+            "name": "glob",
+            "arguments": {
+              "pattern": "**/*.md"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "CLAUDE.md\n.persist/COMMANDS.md\n.persist/CONTEXT.md\n.persist/HISTORY.md\n.persist/PIPELINE.md\n.persist/TODO.md\nREADME.md"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_93yzasor",
+          "function": {
+            "index": 0,
+            "name": "glob",
+            "arguments": {
+              "pattern": "persist/*.md"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "(no matches)"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "call_83qveaes",
+          "function": {
+            "index": 0,
+            "name": "read_file",
+            "arguments": {
+              "f": "/home/user/project/persist/COMMANDS.md"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "Error: The \"paths[1]\" argument must be of type string. Received undefined"
+    },
+    {
+      "role": "assistant",
+      "content": "Let's try that again.\n\n{\"name\": \"glob\", \"parameters\": {\"pattern\":\"persist/*}}"
+    }
+  ]
+}

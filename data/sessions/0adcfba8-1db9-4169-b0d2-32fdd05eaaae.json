@@ -1,0 +1,14 @@
+{
+  "id": "0adcfba8-1db9-4169-b0d2-32fdd05eaaae",
+  "model": "gemma4:latest",
+  "cwd": "/home/frank/Code/test",
+  "title": "read workspace/fizzbuzz.py and tell me the function name",
+  "createdAt": "2026-04-09T13:22:22.514Z",
+  "updatedAt": "2026-04-09T13:22:22.521Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "read workspace/fizzbuzz.py and tell me the function name"
+    }
+  ]
+}

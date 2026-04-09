@@ -1,0 +1,14 @@
+{
+  "id": "cdba3244-1cd6-4b09-bde9-b199143be487",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "write a one-liner python script that prints 42",
+  "createdAt": "2026-04-09T13:41:13.155Z",
+  "updatedAt": "2026-04-09T13:41:13.161Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "write a one-liner python script that prints 42"
+    }
+  ]
+}

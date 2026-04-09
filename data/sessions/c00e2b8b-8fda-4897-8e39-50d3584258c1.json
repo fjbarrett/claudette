@@ -1,0 +1,14 @@
+{
+  "id": "c00e2b8b-8fda-4897-8e39-50d3584258c1",
+  "model": "llama3.2:latest",
+  "cwd": "/home/frank/Code/test",
+  "title": "Say only the word PONG",
+  "createdAt": "2026-04-09T13:38:35.036Z",
+  "updatedAt": "2026-04-09T13:38:35.498Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Say only the word PONG"
+    }
+  ]
+}

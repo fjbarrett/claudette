@@ -1,0 +1,14 @@
+{
+  "id": "835e853a-ff8c-460e-aa0e-ca5a507ece34",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "read the README.md and give a one-sentence summary",
+  "createdAt": "2026-04-09T13:30:08.076Z",
+  "updatedAt": "2026-04-09T13:30:08.084Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "read the README.md and give a one-sentence summary"
+    }
+  ]
+}

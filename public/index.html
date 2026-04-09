@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ollama Code Console</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <p class="eyebrow">Local Coding Console</p>
+          <h1>Ollama Code Console</h1>
+          <p class="subtitle">Claude Code-inspired terminal UX for local models.</p>
+        </div>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Models</h2>
+            <button id="refresh-models" class="ghost-button">Refresh</button>
+          </div>
+          <select id="model-select" class="field"></select>
+          <p id="model-meta" class="hint"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Sessions</h2>
+            <button id="new-session" class="ghost-button">New</button>
+          </div>
+          <div id="session-list" class="session-list"></div>
+        </section>
+
+        <section class="panel">
+          <h2>Commands</h2>
+          <p class="hint">`/new` starts a clean session. `@path/to/file` inlines a workspace file into the prompt.</p>
+        </section>
+      </aside>
+
+      <main class="terminal-panel">
+        <header class="terminal-header">
+          <div>
+            <p class="eyebrow">Workspace</p>
+            <h2 id="cwd-label">/home/frank/Code/test</h2>
+          </div>
+          <div class="status-chip" id="status-chip">idle</div>
+        </header>
+
+        <section id="transcript" class="transcript"></section>
+
+        <section class="trace-panel panel">
+          <div class="panel-header">
+            <h2>Agent Trace</h2>
+            <p class="hint">Turn-by-turn execution timeline and metrics.</p>
+          </div>
+          <div id="trace-list" class="trace-list"></div>
+        </section>
+
+        <form id="composer" class="composer">
+          <label for="cwd-input" class="label">Working Directory</label>
+          <input id="cwd-input" class="field" value="/home/frank/Code/test" />
+          <label for="prompt-input" class="label">Prompt</label>
+          <textarea id="prompt-input" class="field prompt-input" placeholder="Ask for code, debugging help, or paste @relative/path references." rows="6"></textarea>
+          <div class="composer-actions">
+            <button type="submit" class="primary-button">Send</button>
+            <button type="button" id="clear-output" class="ghost-button">Clear Output</button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <template id="message-template">
+      <article class="message">
+        <div class="message-role"></div>
+        <pre class="message-content"></pre>
+      </article>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+  </html>

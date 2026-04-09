@@ -1,0 +1,14 @@
+{
+  "id": "a4b0eefd-3ce3-4484-b309-b671406e27c4",
+  "model": "qwen2.5-coder:14b",
+  "cwd": "/home/frank/Code/test",
+  "title": "summarize the purpose of this app",
+  "createdAt": "2026-04-09T13:07:06.866Z",
+  "updatedAt": "2026-04-09T13:07:11.586Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "summarize the purpose of this app"
+    }
+  ]
+}
