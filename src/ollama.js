@@ -1,5 +1,7 @@
 // Ollama API client — direct connection, no server proxy
-const BASE = process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434';
+import { resolveOllamaBaseUrl } from './config.js';
+
+const BASE = resolveOllamaBaseUrl();
 
 export async function getModels() {
   const res = await fetch(`${BASE}/api/tags`);
