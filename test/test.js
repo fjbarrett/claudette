@@ -102,6 +102,19 @@ const stats = { pass: 0, fail: 0, errors: [], startTime: Date.now() };
 function pass(name) { stats.pass++; }
 function fail(name, err) { stats.fail++; stats.errors.push({ name, err: String(err) }); }
 
+describe('config.js', async () => {
+  test('resolveOllamaBaseUrl defaults to localhost tunnel endpoint', async () => {
+    const { resolveOllamaBaseUrl } = await import('../src/config.js');
+    assert.equal(resolveOllamaBaseUrl({}), 'http://localhost:11434');
+  });
+
+  test('resolveOllamaBaseUrl strips /v1 from OpenAI-compatible env vars', async () => {
+    const { resolveOllamaBaseUrl } = await import('../src/config.js');
+    assert.equal(resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'http://localhost:11434/v1/' }), 'http://localhost:11434');
+    assert.equal(resolveOllamaBaseUrl({ OPENAI_API_BASE: 'http://localhost:11434/v1' }), 'http://localhost:11434');
+  });
+});
+
 // ─── Session module tests ─────────────────────────────────────────────────────
 
 describe('session.js', async () => {
@@ -454,11 +467,15 @@ describe('tools.js', async () => {
 
   test('executeTool str_replace: throws when old_str not found', async () => {
     const { executeTool } = await import('../src/tools.js');
-    await fsp.writeFile(path.join(tmpDir, 'nofind.txt'), 'content here');
-    await assert.rejects(
-      () => executeTool('str_replace', { path: 'nofind.txt', old_str: 'MISSING', new_str: 'x' }, { cwd: tmpDir, workspace: tmpDir }),
-      /not found/
-    );
+    await fsp.writeFile(path.join(tmpDir, 'nofind.txt'), 'timeout: 30_000,\ncontent here\n');
+    await assert.rejects(async () => {
+      await executeTool('str_replace', { path: 'nofind.txt', old_str: 'timeout: 30000', new_str: 'timeout: 45_000' }, { cwd: tmpDir, workspace: tmpDir });
+    }, error => {
+      assert.match(error.message, /not found/);
+      assert.match(error.message, /Possible matching lines:/);
+      assert.match(error.message, /timeout: 30_000,/);
+      return true;
+    });
   });
 
   test('executeTool str_replace: throws when old_str appears multiple times', async () => {
@@ -866,6 +883,16 @@ describe('CLI (ollama-code.js)', async () => {
   test('CLI /help lists commands', async () => {
     const { stdout } = await runCliWithInput(['/help\n']);
     assert.ok(stdout.includes('/model') || stdout.includes('help'), '/help output');
+    assert.ok(stdout.includes('/feature') && stdout.includes('/publish'), 'shows git workflow commands');
+  });
+
+  test('CLI parser normalizes grep-like tool calls to search_code', async () => {
+    const { __test_parseTextToolCalls } = await import('../src/chat.js');
+    const calls = __test_parseTextToolCalls(JSON.stringify({
+      name: 'grep',
+      arguments: { pattern: 'needle', path: 'src' },
+    }));
+    assert.equal(calls[0]?.function?.name, 'search_code');
   });
 
   test('CLI /models lists available models', async () => {

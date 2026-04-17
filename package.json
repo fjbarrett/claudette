@@ -9,6 +9,8 @@
   "scripts": {
     "start": "node server.js",
     "cli": "node ollama-code.js",
-    "dev": "node ollama-code.js"
+    "dev": "node ollama-code.js",
+    "bench": "node bench/run.js",
+    "bench:list": "node bench/run.js --list"
   }
 }

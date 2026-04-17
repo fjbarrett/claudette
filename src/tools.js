@@ -304,14 +304,62 @@ async function strReplace(filePath, oldStr, newStr, cwd, workspace) {
   const abs = guardPath(filePath, cwd, workspace);
   const current = await fsp.readFile(abs, 'utf8');
   if (!current.includes(oldStr)) {
-    throw new Error(`old_str not found in ${filePath}`);
+    const hint = buildReplaceHint(current, oldStr, newStr);
+    throw new Error(`old_str not found in ${filePath}${hint ? `\n${hint}` : ''}`);
   }
   const occurrences = current.split(oldStr).length - 1;
   if (occurrences > 1) {
-    throw new Error(`old_str appears ${occurrences} times in ${filePath} — make it more specific`);
+    const hint = buildReplaceHint(current, oldStr, newStr);
+    throw new Error(`old_str appears ${occurrences} times in ${filePath} — make it more specific${hint ? `\n${hint}` : ''}`);
   }
   await fsp.writeFile(abs, current.replace(oldStr, newStr), 'utf8');
   return `Replaced 1 occurrence in ${filePath}`;
+}
+
+function buildReplaceHint(content, oldStr, newStr) {
+  const snippets = findRelevantLines(content, [oldStr, newStr]).slice(0, 3);
+  if (!snippets.length) return '';
+  return [
+    'Read the file and retry with an exact old_str copied from it.',
+    'Possible matching lines:',
+    ...snippets.map(line => `- ${line}`),
+  ].join('\n');
+}
+
+function findRelevantLines(content, candidates) {
+  const lines = String(content).split('\n');
+  const wanted = new Set();
+  for (const candidate of candidates) {
+    for (const token of extractSearchTokens(candidate)) {
+      wanted.add(token);
+    }
+  }
+  if (!wanted.size) return [];
+
+  return lines.filter(line => {
+    const normalized = normalizeSearchText(line);
+    for (const token of wanted) {
+      if (normalized.includes(token)) return true;
+    }
+    return false;
+  });
+}
+
+function extractSearchTokens(value) {
+  const raw = String(value ?? '');
+  const tokens = raw
+    .split(/[^a-zA-Z0-9_]+/)
+    .map(token => token.trim())
+    .filter(token => token.length >= 3)
+    .map(normalizeSearchText);
+
+  const compact = normalizeSearchText(raw);
+  if (compact.length >= 3) tokens.push(compact);
+  return [...new Set(tokens)];
+}
+
+function normalizeSearchText(value) {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 async function runGlob(pattern, cwd) {
