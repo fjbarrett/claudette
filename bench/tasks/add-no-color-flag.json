@@ -1,0 +1,12 @@
+{
+  "id": "add-no-color-flag",
+  "title": "Add --no-color CLI flag to claudette.js",
+  "category": "coding",
+  "timeoutSec": 120,
+  "prompt": "Call str_replace with path `claudette.js` (NOT src/claudette.js — the file is at the project root). old_str is exactly `start().catch(err => {` and new_str is exactly `if (process.argv.includes('--no-color')) process.env.NO_COLOR = '1';\\nstart().catch(err => {`. Do not read the file first. After the str_replace, call bash with command `node --check claudette.js && grep -n NO_COLOR claudette.js`. Stop after the bash result.",
+  "verify": [
+    "node --check claudette.js",
+    "grep -qE 'no-color|NO_COLOR' claudette.js"
+  ],
+  "judgeFocus": "Did the agent read claudette.js, add --no-color flag detection that sets NO_COLOR=1, place it early in execution, and verify both the flag name and env var exist? Penalise for setting the env var too late, not checking the flag name correctly, or rewriting unrelated arg parsing."
+}

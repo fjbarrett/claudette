@@ -1,0 +1,13 @@
+{
+  "id": "extract-print-help",
+  "title": "Extract /help handler into printHelp() function",
+  "category": "coding",
+  "timeoutSec": 180,
+  "prompt": "Call bash with EXACTLY this command (copy character-for-character, do not modify anything):\nnode -e 'const fs=require(\"fs\");const s=fs.readFileSync(\"src/chat.js\",\"utf8\");const C=\"    case \\u0027/help\\u0027:\\n\";const R=\"      return true;\\n\";const si=s.indexOf(C);const ei=s.indexOf(R,si)+R.length;if(si===-1){console.error(\"not found\");process.exit(1);}const b=s.slice(si+C.length,ei-R.length);const fn=\"function printHelp() {\\n\"+b.replace(/^      /gm,\"  \")+\"}\\n\\n\";const p=s.slice(0,si)+C+\"      printHelp();\\n\"+R+s.slice(ei);const T=\"async function handleCommand(line, rl) {\";fs.writeFileSync(\"src/chat.js\",p.replace(T,fn+T));console.log(\"done\")' && node --check src/chat.js && grep -n printHelp src/chat.js",
+  "verify": [
+    "node --check src/chat.js",
+    "grep -q 'function printHelp' src/chat.js",
+    "grep -q 'printHelp()' src/chat.js"
+  ],
+  "judgeFocus": "Did the agent read chat.js, locate the /help handler, extract it into a named function, replace the inline code with a call site, and verify both the function definition and call exist? Penalise for rewriting unrelated code, defining the function in the wrong scope, or forgetting the call site."
+}
