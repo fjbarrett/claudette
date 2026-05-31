@@ -5,6 +5,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { resolveOllamaBaseUrl } from '../src/config.js';
+import { chatStream } from '../src/provider.js';
+import { isAnthropicModel } from '../src/anthropic.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,6 +40,12 @@ async function main() {
 
   const models = args.models.length ? args.models : [await getDefaultJudgeCapableModel()];
   const judgeModel = args.judge ?? 'qwen2.5-coder:14b';
+
+  // Fail fast (before spinning up worktrees) if a cloud model is requested
+  // without credentials, rather than erroring mid-run.
+  if ([...models, judgeModel].some(isAnthropicModel) && !process.env.ANTHROPIC_API_KEY) {
+    throw new Error('An anthropic:* model was requested but ANTHROPIC_API_KEY is not set.');
+  }
 
   await fs.mkdir(WORKTREES_DIR, { recursive: true });
   await fs.mkdir(REPORTS_DIR, { recursive: true });
@@ -305,31 +313,28 @@ async function judgeRun({ judgeModel, task, model, agentRun, workflow, verificat
     diff || '(no diff)',
   ].join('\n');
 
-  const body = {
-    model: judgeModel,
-    stream: false,
-    options: { temperature: 0 },
-    messages: [
-      { role: 'system', content: 'You are a rigorous software engineering evaluator.' },
-      { role: 'user', content: prompt },
-    ],
-  };
-
+  // Route the judge through the provider so the judge model can be a local
+  // Ollama model or an anthropic:* model (and works when Ollama is offline).
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 45_000);
-  const res = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: ac.signal,
-  }).finally(() => clearTimeout(timeout));
-
-  if (!res.ok) {
-    throw new Error(`Judge failed: ${res.status} ${await res.text()}`);
+  let text;
+  try {
+    const result = await chatStream({
+      model: judgeModel,
+      messages: [
+        { role: 'system', content: 'You are a rigorous software engineering evaluator.' },
+        { role: 'user', content: prompt },
+      ],
+      onDelta: () => {},
+      signal: ac.signal,
+    });
+    text = result.content ?? '';
+  } catch (err) {
+    throw new Error(`Judge failed: ${err.message}`);
+  } finally {
+    clearTimeout(timeout);
   }
 
-  const payload = await res.json();
-  const text = payload.message?.content ?? '';
   const parsed = parseJsonObject(text);
   if (!parsed) {
     throw new Error(`Could not parse judge JSON: ${truncate(text, 600)}`);

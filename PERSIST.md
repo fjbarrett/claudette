@@ -47,6 +47,7 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-04-18 | Codex | Added `bench/leaderboard.js`, `npm run bench:leaderboard`, and generated `bench/LEADERBOARD.md` from the latest benchmark report per model/task pair. |
 | 2026-04-18 | Claude | Added live token streaming (`onDelta` in agentLoop), `read_file` offset/limit line-range params, and context-size warning at ~25k tokens. Inspired by Claude Code reference. |
 | 2026-05-30 | Claude | Added Anthropic provider: `src/anthropic.js` (Messages API client w/ SSE streaming, tool_use/tool_result translation, synthesized tool ids) + `src/provider.js` router (`anthropic:` prefix → Anthropic, else Ollama). Wired CLI + web server through the router; `--model anthropic:claude-opus-4-8` now works. +10 tests. |
+| 2026-05-30 | Claude | Benchmark harness multi-provider: judge routes through the provider (`--judge anthropic:*` works, no local Ollama needed when agent+judge are both cloud); fail-fast guard when an `anthropic:*` model is requested without `ANTHROPIC_API_KEY`. Documented running Opus 4.8 on the `count-lines-tool`/`extract-print-help` ceiling tasks. |
 
 ---
 
