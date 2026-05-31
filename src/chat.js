@@ -788,7 +788,10 @@ function parseTextToolCalls(text) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function extractExactBashCommand(text) {
-  const match = String(text ?? '').match(/Call bash with EXACTLY this command \(copy character-for-character, do not modify anything\):\n([\s\S]+)/);
+  // Accept either a space or a newline after the colon: when the prompt is fed
+  // over stdin, readline splits on embedded newlines, so the command must be
+  // able to ride on the same line as the instruction.
+  const match = String(text ?? '').match(/Call bash with EXACTLY this command \(copy character-for-character, do not modify anything\):\s+([\s\S]+)/);
   return match?.[1]?.trim() || null;
 }
 
