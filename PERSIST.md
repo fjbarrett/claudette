@@ -41,6 +41,9 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-04-17 | Codex | Added Ollama no-tools fallback + structured benchmark-task execution shortcuts, then benchmarked `qwen3.5:0.8b` with all task scores above 9. |
 | 2026-04-17 | Claude | Benchmarked `deepseek-coder-v2:16b` (avg 9.25) and `qwen2.5-coder:14b` (avg 9.12) on all 6 tasks via remote g5.xlarge; both already installed. `add-new-tool` scores 8.9 on both — judge penalty only (edit succeeds but verification cmd fails). |
 | 2026-04-18 | Claude | Full benchmark round on 8 tasks × 2 models. Committed `claudette.js` to git (was untracked, causing ENOENT in all worktrees). Hardened system prompt (thoroughness/editing/reliability sections, str_replace recovery hints). Added agent loop RECOVERY hints on tool errors. Final scores: tool-roundtrip=10, edit-two-timeouts=10, health-check=10, add-no-color-flag=10 (both models). count-lines-tool=3.6/5.3, extract-print-help=4.3/4.3 — hard ceiling for 14-16B models on multi-step exact-reproduction tasks. |
+| 2026-04-18 | Codex | Restarted the AWS Ollama g5.xlarge, verified installed models (`deepseek-coder-v2:16b`, `qwen2.5-coder:14b`, `qwen2.5-coder:7b`), and ran a fresh 3-task comparison. All three hit the same 5.3 hard-score ceiling on `count-lines-tool`; `extract-print-help` stayed weak (DeepSeek 4.0, Qwen 14B/7B 3.2); `add-no-color-flag` passed strongly (DeepSeek 10, Qwen 14B 9.2, Qwen 7B 8.8). |
+| 2026-04-18 | Codex | Added `bench/leaderboard.js`, `npm run bench:leaderboard`, and generated `bench/LEADERBOARD.md` from the latest benchmark report per model/task pair. |
+| 2026-04-18 | Claude | Added live token streaming (`onDelta` in agentLoop), `read_file` offset/limit line-range params, and context-size warning at ~25k tokens. Inspired by Claude Code reference. |
 
 ---
 
@@ -60,6 +63,7 @@ test/test.js      Comprehensive test suite + config coverage
 | `npm run bench -- --task <id> --model gemma4:latest --repeat 3` | Stress-test a task N times |
 | `npm run bench -- --task <id> --model gemma4:latest --keep` | Keep worktree for post-mortem |
 | `npm run bench:list` | List all benchmark tasks |
+| `npm run bench:leaderboard` | Regenerate `bench/LEADERBOARD.md` from the latest report file for each model/task pair |
 | `node bench/run.js --all --model qwen3.5:0.8b` | Run the full installed-model benchmark sweep used for the current passing scores |
 
 ---

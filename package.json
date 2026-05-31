@@ -1,16 +1,19 @@
 {
-  "name": "ollama-code",
+  "name": "claudette",
   "version": "1.0.0",
-  "description": "Claude Code-style AI coding assistant backed by Ollama.",
+  "description": "Claudette is a terminal-first AI coding assistant backed by Ollama.",
   "type": "module",
   "bin": {
-    "ollama-code": "./ollama-code.js"
+    "claudette": "./claudette.js"
   },
   "scripts": {
     "start": "node server.js",
-    "cli": "node ollama-code.js",
-    "dev": "node ollama-code.js",
+    "cli": "node claudette.js",
+    "dev": "node claudette.js",
     "bench": "node bench/run.js",
-    "bench:list": "node bench/run.js --list"
+    "bench:leaderboard": "node bench/leaderboard.js --write",
+    "bench:list": "node bench/run.js --list",
+    "bench:all": "node bench/run.js --all --model gemma4:latest",
+    "bench:gemma": "node bench/run.js --all --model gemma4:latest --verbose"
   }
 }

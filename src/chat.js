@@ -129,6 +129,21 @@ async function handleMessage(text, rl) {
   if (session.title === 'New Session') session.title = text.slice(0, 60);
   void scheduleSessionSave(session);
 
+  const exactCommand = extractExactBashCommand(expandedText);
+  if (exactCommand) {
+    await runExactBashShortcut(exactCommand);
+    return;
+  }
+
+  // Warn when context is getting large
+  const approxTokens = session.messages.reduce((acc, m) => {
+    const len = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
+    return acc + Math.ceil(len / 4);
+  }, 0);
+  if (approxTokens > 25_000) {
+    ui.printWarning(`Context ~${Math.round(approxTokens / 1000)}k tokens — type /compact to compress history`);
+  }
+
   // Load CLAUDE.md context
   const claudeMd = await loadClaudeMd(workspace);
 
@@ -139,6 +154,36 @@ async function handleMessage(text, rl) {
   ];
 
   await agentLoop(messages, rl);
+}
+
+async function runExactBashShortcut(command) {
+  ui.printToolCall('bash', { command });
+  try {
+    const output = await executeTool('bash', { command }, { cwd: workspace, workspace });
+    ui.printToolResult('bash', output);
+    const assistantMsg = 'Executed the exact bash command from the prompt.';
+    session.messages.push({ role: 'assistant', content: assistantMsg });
+    session.messages.push({ role: 'tool', content: output, name: 'bash' });
+    await flushSessionSave(session);
+  } catch (err) {
+    ui.printToolResult('bash', err.message, true);
+    session.messages.push({
+      role: 'tool',
+      content: `Exact-command shortcut failed: ${err.message}`,
+      name: 'bash',
+    });
+
+    const claudeMd = await loadClaudeMd(workspace);
+    const messages = [
+      { role: 'system', content: buildSystemPrompt(claudeMd) },
+      ...session.messages,
+      {
+        role: 'user',
+        content: `The exact bash command from the prompt failed.\nCommand:\n${command}\n\nError:\n${err.message}\n\nInspect the relevant file(s), repair the issue, and verify the task.`,
+      },
+    ];
+    await agentLoop(messages, nullReadline());
+  }
 }
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
@@ -171,6 +216,17 @@ async function agentLoop(messages, rl) {
     process.stdin.resume();
     process.stdin.on('data', ctrlCHandler);
 
+    // Live streaming: stop spinner on first token, write deltas directly
+    let streamStarted = false;
+    const onDelta = (delta) => {
+      if (!streamStarted) {
+        streamStarted = true;
+        ui.stopSpinner();
+        ui.printAssistantStart();
+      }
+      stdout.write(delta);
+    };
+
     let result;
     try {
       result = await chatStream({
@@ -178,7 +234,7 @@ async function agentLoop(messages, rl) {
         messages,
         tools,
         signal: ac.signal,
-        onDelta: () => {},
+        onDelta,
       });
     } catch (err) {
       ui.stopSpinner();
@@ -191,7 +247,7 @@ async function agentLoop(messages, rl) {
       rl.resume(); // restore readline after streaming
     }
 
-    ui.stopSpinner();
+    if (!streamStarted) ui.stopSpinner();
 
     // ── Merge text-parsed tool calls with API tool calls ─────────────────────
     // Some models (qwen2.5-coder) emit some calls via API and others as JSON
@@ -213,9 +269,12 @@ async function agentLoop(messages, rl) {
 
     // ── No tool calls → normal response, done ──────────────────────────────
     if (!result.toolCalls?.length) {
-      if (result.content) {
+      if (!streamStarted && result.content) {
+        // Nothing was streamed (e.g. empty onDelta path) — render with markdown
         ui.printAssistantStart();
         ui.printAssistantMessage(result.content);
+      } else if (streamStarted) {
+        stdout.write('\n'); // newline after raw streamed text
       }
       ui.printAssistantEnd({
         model,
@@ -227,10 +286,13 @@ async function agentLoop(messages, rl) {
     }
 
     // ── Tool calls ─────────────────────────────────────────────────────────
-    if (result.content) {
+    if (!streamStarted && result.content) {
+      // Content wasn't streamed yet — render it before tool blocks
       ui.printAssistantStart();
       ui.printAssistantMessage(result.content);
       stdout.write('\n');
+    } else if (streamStarted) {
+      stdout.write('\n'); // newline after streamed text before tool blocks
     }
 
     // Record assistant turn with tool_calls
@@ -546,8 +608,8 @@ const TOOL_ALIASES = {
   edit: 'str_replace', replace: 'str_replace', modify: 'str_replace', patch: 'str_replace',
   // glob aliases
   list: 'glob', find: 'glob', find_files: 'glob', list_files: 'glob', search_files: 'glob',
-  // grep aliases
-  search: 'grep', find_in_files: 'grep', grep_files: 'grep',
+  // search aliases
+  search: 'search_code', grep: 'search_code', find_in_files: 'search_code', grep_files: 'search_code',
 };
 
 // Tools that are really interpreters — map to bash and prepend interpreter name
@@ -675,6 +737,21 @@ function parseTextToolCalls(text) {
   for (const candidate of candidates) {
     try {
       const obj = JSON.parse(sanitizeJsonControls(candidate));
+      const wrappedCalls = obj.tool_calls ?? obj.calls;
+      if (Array.isArray(wrappedCalls)) {
+        for (const wrapped of wrappedCalls) {
+          const inner = wrapped.function ?? wrapped.tool ?? wrapped;
+          if (typeof inner?.name !== 'string') continue;
+          const toolName = normalizeToolName(inner.name);
+          const rawArgs = inner.arguments ?? inner.parameters ?? inner.args ?? {};
+          const args = typeof rawArgs === 'object' && rawArgs !== null
+            ? normalizeArgs(rawArgs, toolName)
+            : rawArgs;
+          calls.push({ function: { name: toolName, arguments: args } });
+        }
+        continue;
+      }
+
       // Must have a name field and arguments or parameters
       if (typeof obj.name !== 'string') continue;
       const rawArgs = obj.arguments ?? obj.parameters ?? obj.args ?? {};
@@ -706,6 +783,11 @@ function parseTextToolCalls(text) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function extractExactBashCommand(text) {
+  const match = String(text ?? '').match(/Call bash with EXACTLY this command \(copy character-for-character, do not modify anything\):\n([\s\S]+)/);
+  return match?.[1]?.trim() || null;
+}
+
 function buildSystemPrompt(claudeMd) {
   const lines = [
     'You are Ollama Code, an AI coding assistant running in the terminal.',
@@ -719,14 +801,30 @@ function buildSystemPrompt(claudeMd) {
     '- All file paths must be relative to the workspace root — never use /tmp or absolute paths outside the workspace.',
     '- To run a file, use bash with e.g. {"command": "python3 fizzbuzz.py"} — run it in the workspace, not a copy.',
     '- Never describe or summarize a file\'s contents without reading it first with read_file. Do not guess.',
+    '- For large files, use read_file with offset and limit to read specific line ranges (e.g. {"path":"foo.js","offset":100,"limit":50}).',
     '- When asked about a directory or project, read README.md or key source files — do not invent descriptions.',
     '- Use list_dir for directory inspection and search_code for repo-wide searches when possible.',
+    '- If the prompt says to call bash with EXACTLY a given command, do that first without modifying the command.',
+    '- Do not read or edit CLAUDE.md, PERSIST.md, or docs unless the prompt explicitly asks for those files.',
+    '- Do not run git add, git commit, git push, or create branches unless the prompt explicitly asks for git actions.',
+    '- If a tool call fails because a file is missing, use the filenames named in the prompt before trying unrelated files.',
   ];
   if (claudeMd) {
     lines.push('', '--- Project Instructions ---', claudeMd);
   }
   return lines.join('\n');
 }
+
+function nullReadline() {
+  return {
+    pause() {},
+    resume() {},
+    async question() { return 'n'; },
+  };
+}
+
+export const __test_parseTextToolCalls = parseTextToolCalls;
+export const __test_extractExactBashCommand = extractExactBashCommand;
 
 async function summariseMessages(messages) {
   const transcript = messages

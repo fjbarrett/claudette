@@ -17,6 +17,13 @@ export async function loadClaudeMd(cwd) {
       parts.unshift(`[${label}]\n${content.trim()}`);
     } catch { /* not found at this level */ }
 
+    // Stop at git repository roots so we don't bleed into parent repos.
+    const gitEntry = path.join(dir, '.git');
+    try {
+      await fsp.access(gitEntry);
+      break; // .git exists here — this is a repo root, stop walking up
+    } catch { /* no .git here, keep walking */ }
+
     const parent = path.dirname(dir);
     if (parent === dir) break; // reached filesystem root
     dir = parent;

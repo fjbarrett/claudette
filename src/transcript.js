@@ -13,6 +13,7 @@ await fsp.mkdir(TRANSCRIPTS_DIR, { recursive: true });
  * Skips sessions with no messages.
  */
 export async function saveTranscript(session) {
+  if (process.env.NODE_ENV === 'test') return;
   if (!session.messages?.length) return;
   const file = path.join(TRANSCRIPTS_DIR, `${session.id}.txt`);
   await fsp.writeFile(file, formatTranscript(session), 'utf8');

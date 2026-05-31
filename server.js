@@ -5,16 +5,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { saveTranscript } from "./src/transcript.js";
+import { resolveOllamaBaseUrl } from "./src/config.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const PORT = Number(process.env.PORT ?? 4321);
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL ?? "http://127.0.0.1:11434";
+const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT ?? __dirname);
 const DATA_DIR = path.join(__dirname, "data");
 const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const BENCH_REPORTS_DIR = path.join(__dirname, "bench", "runs", "reports");
 const DEFAULT_SYSTEM_PROMPT = [
   "You are a local coding assistant running through a terminal-first interface.",
   "Prioritize direct, technically correct answers, concise plans, code, and debugging help.",
@@ -40,7 +42,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Ollama Code Console listening on http://${HOST}:${PORT}`);
+  console.log(`Claudette listening on http://${HOST}:${PORT}`);
 });
 
 async function handleApi(req, res, url) {
@@ -93,6 +95,12 @@ async function handleApi(req, res, url) {
     const sessionId = getSessionId(url.pathname);
     const session = await loadSession(sessionId);
     sendJson(res, 200, { session });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/bench") {
+    const reports = await loadBenchReports();
+    sendJson(res, 200, { reports });
     return;
   }
 
@@ -344,6 +352,42 @@ async function saveSession(session) {
   const filePath = path.join(SESSIONS_DIR, `${session.id}.json`);
   await fsp.writeFile(filePath, `${JSON.stringify(session, null, 2)}\n`, "utf8");
   await saveTranscript(session);
+}
+
+async function loadBenchReports() {
+  try {
+    await fsp.mkdir(BENCH_REPORTS_DIR, { recursive: true });
+    const files = await fsp.readdir(BENCH_REPORTS_DIR);
+    const reports = await Promise.all(
+      files
+        .filter(f => f.endsWith(".json"))
+        .sort()
+        .reverse()
+        .map(async f => {
+          try {
+            const raw = await fsp.readFile(path.join(BENCH_REPORTS_DIR, f), "utf8");
+            const r = JSON.parse(raw);
+            return {
+              file: f,
+              taskId: r.task?.id,
+              taskTitle: r.task?.title,
+              category: r.task?.category,
+              model: r.model,
+              judgeModel: r.judgeModel,
+              startedAt: r.startedAt,
+              completedAt: r.completedAt,
+              summary: r.summary,
+              hardChecks: r.hardChecks,
+              verification: r.verification,
+              llmJudgment: r.llmJudgment,
+              workflow: r.workflow,
+              git: { diffStat: r.git?.diffStat },
+            };
+          } catch { return null; }
+        })
+    );
+    return reports.filter(Boolean);
+  } catch { return []; }
 }
 
 async function expandPromptContext(text, cwd) {

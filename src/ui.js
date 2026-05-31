@@ -45,7 +45,7 @@ export function cols() {
 
 export function printBanner({ model, cwd, sessionId }) {
   const sep = `${GR}${'─'.repeat(cols())}${R}`;
-  console.log(`\n${B}${P}  ◆ Ollama Code${R}  ${GR}— Claude Code for local models${R}`);
+  console.log(`\n${B}${P}  ◆ Claudette${R}  ${GR}— local coding assistant for Ollama${R}`);
   console.log(sep);
   console.log(`  ${GR}model   ${R}${C}${model}${R}`);
   console.log(`  ${GR}session ${R}${GR}${sessionId?.slice(0, 8) ?? '–'}${R}`);
@@ -86,7 +86,8 @@ export function printToolCall(name, args) {
     args.pattern   ? args.pattern :
     args.content   ? `${String(args.content).split('\n').length} lines` :
     truncate(JSON.stringify(args), cols() - 20);
-  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${GR}(${truncate(primary, cols() - displayName.length - 4)})${R}\n`);
+  const alias = displayName === name ? '' : ` ${GR}[${name}]${R}`;
+  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${alias}${GR}(${truncate(primary, cols() - displayName.length - name.length - 8)})${R}\n`);
 }
 
 export function printToolResult(name, output, isError = false) {
@@ -149,7 +150,8 @@ export function printPermissionPrompt(toolName, detail) {
   const truncated = detailLines.length > 8;
   // Show the call like a tool call line, then the detail block
   const primary = truncate(detail.split('\n')[0], cols() - displayName.length - 4);
-  console.log(`\n${B}${Y}⏺ ${displayName}${R}${GR}(${primary})${R}`);
+  const alias = displayName === toolName ? '' : ` ${GR}[${toolName}]${R}`;
+  console.log(`\n${B}${Y}⏺ ${displayName}${R}${alias}${GR}(${primary})${R}`);
   if (detailLines.length > 1) {
     preview.slice(1).forEach(l => console.log(`   ${GR}${l}${R}`));
     if (truncated) console.log(`   ${GR}… (truncated)${R}`);
