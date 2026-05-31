@@ -1,1 +1,6 @@
+node_modules/
 bench/runs/
+bench/scratch/
+data/sessions/
+data/transcripts/
+.ship-worktree/

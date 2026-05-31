@@ -1,9 +1,0 @@
-{
-  "id": "0462f709-8c86-485c-8314-4dc42765c1c3",
-  "model": "llama3.2:latest",
-  "cwd": "/home/frank/Code/test",
-  "title": "New Session",
-  "createdAt": "2026-04-08T22:50:55.177Z",
-  "updatedAt": "2026-04-08T22:50:55.177Z",
-  "messages": []
-}
