@@ -841,6 +841,180 @@ describe('ollama.js', async () => {
   });
 });
 
+// ─── Anthropic provider tests ─────────────────────────────────────────────────
+
+describe('anthropic.js', async () => {
+  test('toAnthropicMessages extracts system and maps tool_use/tool_result', async () => {
+    const { toAnthropicMessages } = await import('../src/anthropic.js');
+    const { system, messages } = toAnthropicMessages([
+      { role: 'system', content: 'You are a coding assistant.' },
+      { role: 'user', content: 'read the readme' },
+      { role: 'assistant', content: 'On it.', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'README.md' } } }] },
+      { role: 'tool', name: 'read_file', content: '# Title' },
+    ]);
+    assert.equal(system, 'You are a coding assistant.');
+    assert.equal(messages.length, 3, 'user, assistant(tool_use), user(tool_result)');
+    assert.equal(messages[0].role, 'user');
+    const assistant = messages[1];
+    assert.equal(assistant.role, 'assistant');
+    const toolUse = assistant.content.find(b => b.type === 'tool_use');
+    assert.ok(toolUse, 'has tool_use block');
+    assert.equal(toolUse.name, 'read_file');
+    assert.deepEqual(toolUse.input, { path: 'README.md' });
+    const toolResult = messages[2];
+    assert.equal(toolResult.role, 'user');
+    assert.equal(toolResult.content[0].type, 'tool_result');
+    assert.equal(toolResult.content[0].tool_use_id, toolUse.id, 'tool_result id matches synthesized tool_use id');
+    assert.equal(toolResult.content[0].content, '# Title');
+  });
+
+  test('toAnthropicMessages merges consecutive tool results into one user turn', async () => {
+    const { toAnthropicMessages } = await import('../src/anthropic.js');
+    const { messages } = toAnthropicMessages([
+      { role: 'assistant', content: '', tool_calls: [
+        { function: { name: 'read_file', arguments: { path: 'a' } } },
+        { function: { name: 'read_file', arguments: { path: 'b' } } },
+      ] },
+      { role: 'tool', content: 'A' },
+      { role: 'tool', content: 'B' },
+    ]);
+    const last = messages[messages.length - 1];
+    assert.equal(last.role, 'user');
+    assert.equal(last.content.length, 2, 'both tool_results in one user turn');
+    assert.equal(last.content[0].tool_use_id, messages[0].content[0].id);
+    assert.equal(last.content[1].tool_use_id, messages[0].content[1].id);
+  });
+
+  test('toAnthropicTools converts function defs to input_schema form', async () => {
+    const { toAnthropicTools } = await import('../src/anthropic.js');
+    const out = toAnthropicTools([
+      { type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+    ]);
+    assert.equal(out[0].name, 'bash');
+    assert.equal(out[0].description, 'run');
+    assert.deepEqual(out[0].input_schema.required, ['command']);
+  });
+
+  test('getModels returns anthropic:* models only when ANTHROPIC_API_KEY is set', async () => {
+    const { getModels } = await import('../src/anthropic.js');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    try {
+      delete process.env.ANTHROPIC_API_KEY;
+      assert.deepEqual(await getModels(), []);
+      process.env.ANTHROPIC_API_KEY = 'test-key';
+      const models = await getModels();
+      assert.ok(models.length >= 1);
+      assert.ok(models.every(m => m.name.startsWith('anthropic:')));
+      assert.ok(models.some(m => m.name === 'anthropic:claude-opus-4-8'));
+    } finally {
+      if (prev == null) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
+
+  test('chatStream parses SSE text deltas and tool_use blocks', async () => {
+    const events = [
+      { type: 'message_start', message: { usage: { input_tokens: 11 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello ' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'world' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'read_file' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '"README.md"}' } },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 22 } },
+      { type: 'message_stop' },
+    ];
+    let receivedAuth = null;
+    let receivedBody = null;
+    const mockServer = http.createServer((req, res) => {
+      if (req.url !== '/v1/messages') { res.writeHead(404).end(); return; }
+      receivedAuth = req.headers['x-api-key'];
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        for (const e of events) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        res.end();
+      });
+    });
+    await new Promise(r => mockServer.listen(0, '127.0.0.1', r));
+    const { port } = mockServer.address();
+    const prevBase = process.env.ANTHROPIC_BASE_URL;
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+    const deltas = [];
+    try {
+      const { chatStream } = await import('../src/anthropic.js');
+      const result = await chatStream({
+        model: 'anthropic:claude-opus-4-8',
+        messages: [
+          { role: 'system', content: 'be brief' },
+          { role: 'user', content: 'hi' },
+        ],
+        tools: [{ type: 'function', function: { name: 'read_file', description: 'read', parameters: { type: 'object', properties: {} } } }],
+        onDelta: d => deltas.push(d),
+      });
+      assert.equal(result.content, 'Hello world');
+      assert.equal(deltas.join(''), 'Hello world');
+      assert.equal(result.toolCalls.length, 1);
+      assert.equal(result.toolCalls[0].function.name, 'read_file');
+      assert.deepEqual(result.toolCalls[0].function.arguments, { path: 'README.md' });
+      assert.equal(result.promptTokens, 11);
+      assert.equal(result.completionTokens, 22);
+      assert.equal(result.toolMode, 'native');
+      assert.equal(receivedAuth, 'test-key');
+      assert.equal(receivedBody.model, 'claude-opus-4-8', 'anthropic: prefix stripped');
+      assert.equal(receivedBody.system, 'be brief', 'system pulled to top level');
+      assert.ok(receivedBody.tools, 'tools forwarded');
+    } finally {
+      if (prevBase == null) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+      await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('chatStream throws without credentials', async () => {
+    const { chatStream } = await import('../src/anthropic.js');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    try {
+      delete process.env.ANTHROPIC_API_KEY;
+      await assert.rejects(
+        () => chatStream({ model: 'anthropic:claude-opus-4-8', messages: [{ role: 'user', content: 'hi' }] }),
+        /ANTHROPIC_API_KEY/
+      );
+    } finally {
+      if (prev == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
+});
+
+describe('provider.js', async () => {
+  test('providerFor routes by model prefix', async () => {
+    const { providerFor } = await import('../src/provider.js');
+    const anthropic = await import('../src/anthropic.js');
+    const ollama = await import('../src/ollama.js');
+    assert.equal(providerFor('anthropic:claude-opus-4-8').chatStream, anthropic.chatStream);
+    assert.equal(providerFor('qwen2.5-coder:14b').chatStream, ollama.chatStream);
+  });
+
+  test('getModels includes anthropic models when ANTHROPIC_API_KEY is set', async () => {
+    const { getModels } = await import('../src/provider.js');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+    try {
+      const models = await getModels();
+      assert.ok(models.some(m => m.name === 'anthropic:claude-opus-4-8'),
+        'anthropic models present in merged list even if Ollama contributes none');
+    } finally {
+      if (prev == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
+});
+
 // ─── Server integration tests ─────────────────────────────────────────────────
 
 describe('server.js HTTP API', async () => {

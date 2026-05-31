@@ -13,7 +13,7 @@ import { promisify } from 'node:util';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-import { getModels, chatStream } from './ollama.js';
+import { getModels, chatStream } from './provider.js';
 import { TOOL_DEFS, executeTool } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
 import { loadClaudeMd, expandFiles } from './context.js';
@@ -48,9 +48,13 @@ export async function start() {
   let models;
   try {
     models = await getModels();
-    if (!models.length) throw new Error('No models installed');
+    if (!models.length) throw new Error('No models available');
   } catch (err) {
-    ui.printError(`Cannot reach Ollama at ${process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434'}\n  ${err.message}`);
+    ui.printError(
+      `No models available.\n` +
+      `  Start Ollama (${process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'}) ` +
+      `or set ANTHROPIC_API_KEY to use anthropic:* models.\n  ${err.message}`
+    );
     exit(1);
   }
   // Prefer models known to support proper tool calling — iterate PREFERENCE order, not model list order
@@ -383,7 +387,7 @@ async function handleCommand(line, rl) {
       ui.table('Commands', [
         ['Setup & Config'],
         ['/model [name]',    'Show or switch the active model'],
-        ['/models',          'List all available Ollama models'],
+        ['/models',          'List all available models (Ollama + anthropic:*)'],
         ['/config',          'Show current configuration'],
         ['/tools',           'Toggle tool calling on/off'],
 
@@ -425,7 +429,7 @@ async function handleCommand(line, rl) {
     // eslint-disable-next-line no-fallthrough
     case '/models': {
       const list = await getModels().catch(err => { ui.printError(err.message); return []; });
-      ui.table('Ollama Models', list.map(m => [m.name, `${m.paramSize.padEnd(8)} ${m.family}`]));
+      ui.table('Available Models', list.map(m => [m.name, `${m.paramSize.padEnd(8)} ${m.family}`]));
       if (cmd === '/model') ui.printInfo(`Current: ${model}  |  /model <name> to switch`);
       return true;
     }

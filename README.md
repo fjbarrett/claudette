@@ -33,6 +33,24 @@ Inside the CLI, the main git workflow commands are:
 /update               pull latest changes with --ff-only
 ```
 
+## Cloud models (Anthropic)
+
+Claudette can route to Anthropic's API alongside local Ollama models. Set an
+API key and address a model with the `anthropic:` prefix:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+node claudette.js --model anthropic:claude-opus-4-8
+```
+
+The provider is selected by the model id: `anthropic:*` ids go to the Anthropic
+Messages API, everything else goes to Ollama. `/models` lists both, and the web
+UI dropdown includes the Claude models when a key is set. If Ollama is not
+running, Claudette still works with `anthropic:*` models.
+
+Available ids: `anthropic:claude-opus-4-8`, `anthropic:claude-sonnet-4-6`,
+`anthropic:claude-haiku-4-5`.
+
 ## Environment
 
 - `PORT`: server port, default `4321`
@@ -41,4 +59,7 @@ Inside the CLI, the main git workflow commands are:
 - `OLLAMA_HOST`: alternate Ollama API base URL env var, also supported
 - `OPENAI_BASE_URL`: accepted for compatibility; if it ends with `/v1`, the app strips that and uses the native Ollama routes
 - `OPENAI_API_BASE`: accepted for compatibility; if it ends with `/v1`, the app strips that and uses the native Ollama routes
+- `ANTHROPIC_API_KEY`: enables `anthropic:*` models (Claude via the Messages API)
+- `ANTHROPIC_BASE_URL`: override the Anthropic API base, default `https://api.anthropic.com`
+- `ANTHROPIC_MAX_TOKENS`: max output tokens for Anthropic responses, default `4096`
 - `WORKSPACE_ROOT`: allowed root for `@file` expansion, default repo root

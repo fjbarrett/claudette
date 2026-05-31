@@ -5,7 +5,7 @@
 ## Context
 
 **Last Updated:** 2026-04-18
-**Stage:** Benchmark harness tuned; system prompt hardened; ceiling reached on 14-16B models for complex refactor tasks
+**Stage:** Multi-provider — added Anthropic (Claude/Opus 4.8) alongside local Ollama via a provider router; benchmark harness tuned; ceiling reached on 14-16B local models for complex refactor tasks
 **Purpose:** Claudette is a local AI coding assistant CLI + web server backed by Ollama
 **Structure:**
 ```
@@ -19,6 +19,8 @@ src/
   session.js      Session CRUD (data/sessions/*.json)
   context.js      CLAUDE.md loader, @file expansion
   ollama.js       Ollama API client (getModels, chatStream)
+  anthropic.js    Anthropic Messages API client (same chatStream contract)
+  provider.js     Routes models to Ollama or Anthropic by `anthropic:` prefix
   ui.js           ANSI terminal rendering, spinner
 bench/            Benchmark harness + isolated worktree runs + reports
 data/sessions/    Persisted session JSON files
@@ -44,6 +46,7 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-04-18 | Codex | Restarted the AWS Ollama g5.xlarge, verified installed models (`deepseek-coder-v2:16b`, `qwen2.5-coder:14b`, `qwen2.5-coder:7b`), and ran a fresh 3-task comparison. All three hit the same 5.3 hard-score ceiling on `count-lines-tool`; `extract-print-help` stayed weak (DeepSeek 4.0, Qwen 14B/7B 3.2); `add-no-color-flag` passed strongly (DeepSeek 10, Qwen 14B 9.2, Qwen 7B 8.8). |
 | 2026-04-18 | Codex | Added `bench/leaderboard.js`, `npm run bench:leaderboard`, and generated `bench/LEADERBOARD.md` from the latest benchmark report per model/task pair. |
 | 2026-04-18 | Claude | Added live token streaming (`onDelta` in agentLoop), `read_file` offset/limit line-range params, and context-size warning at ~25k tokens. Inspired by Claude Code reference. |
+| 2026-05-30 | Claude | Added Anthropic provider: `src/anthropic.js` (Messages API client w/ SSE streaming, tool_use/tool_result translation, synthesized tool ids) + `src/provider.js` router (`anthropic:` prefix → Anthropic, else Ollama). Wired CLI + web server through the router; `--model anthropic:claude-opus-4-8` now works. +10 tests. |
 
 ---
 
