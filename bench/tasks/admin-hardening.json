@@ -1,0 +1,13 @@
+{
+  "id": "admin-hardening",
+  "title": "System administrator hardening pass",
+  "category": "admin",
+  "prompt": "Act as a system administrator for this local coding app. Inspect the project, identify one or two operational risks in startup or runtime behavior, implement reasonable hardening changes, and verify the affected files or commands.",
+  "verify": [
+    "node --check server.js",
+    "node --check src/chat.js",
+    "node --check src/tools.js"
+  ],
+  "timeoutSec": 240,
+  "judgeFocus": "Did the agent gather evidence before changing behavior, choose safe operational fixes, and verify them in a way that fits the actual risk?"
+}
