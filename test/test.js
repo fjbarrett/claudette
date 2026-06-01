@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Ollama Code — comprehensive test suite
+ * Claudette — comprehensive test suite
  * Covers: unit (tools, session, context, ui, parser), server integration, Ollama stress loop
  */
 import { test, describe, before, after, beforeEach, afterEach } from 'node:test';
@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -20,7 +21,7 @@ const ROOT = path.resolve(__dirname, '..');
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function makeTmpDir() {
-  return fsp.mkdtemp(path.join(os.tmpdir(), 'ollama-code-test-'));
+  return fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-test-'));
 }
 
 async function cleanDir(dir) {
@@ -95,12 +96,26 @@ function createNdjsonResponse(res, chunks) {
   res.end();
 }
 
+function getFreePort(host = '127.0.0.1') {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.listen(0, host, () => {
+      const address = server.address();
+      const port = typeof address === 'object' && address ? address.port : null;
+      server.close(err => err ? reject(err) : resolve(port));
+    });
+    server.on('error', reject);
+  });
+}
+
 // ─── Stats tracker ────────────────────────────────────────────────────────────
 
 const stats = { pass: 0, fail: 0, errors: [], startTime: Date.now() };
 
 function pass(name) { stats.pass++; }
 function fail(name, err) { stats.fail++; stats.errors.push({ name, err: String(err) }); }
+
+// ─── config.js tests ─────────────────────────────────────────────────────────
 
 describe('config.js', async () => {
   test('resolveOllamaBaseUrl defaults to localhost tunnel endpoint', async () => {
@@ -110,8 +125,14 @@ describe('config.js', async () => {
 
   test('resolveOllamaBaseUrl strips /v1 from OpenAI-compatible env vars', async () => {
     const { resolveOllamaBaseUrl } = await import('../src/config.js');
-    assert.equal(resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'http://localhost:11434/v1/' }), 'http://localhost:11434');
-    assert.equal(resolveOllamaBaseUrl({ OPENAI_API_BASE: 'http://localhost:11434/v1' }), 'http://localhost:11434');
+    assert.equal(
+      resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'http://localhost:11434/v1/' }),
+      'http://localhost:11434'
+    );
+    assert.equal(
+      resolveOllamaBaseUrl({ OPENAI_API_BASE: 'http://localhost:11434/v1' }),
+      'http://localhost:11434'
+    );
   });
 });
 
@@ -495,6 +516,15 @@ describe('tools.js', async () => {
     assert.equal(content, 'keep this');
   });
 
+  test('executeTool str_replace: throws when replacement is a no-op', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'noop.txt'), 'same text');
+    await assert.rejects(
+      () => executeTool('str_replace', { path: 'noop.txt', old_str: 'same', new_str: 'same' }, { cwd: tmpDir, workspace: tmpDir }),
+      /no changes|identical/
+    );
+  });
+
   test('executeTool glob: finds files by pattern', async () => {
     const { executeTool } = await import('../src/tools.js');
     await fsp.writeFile(path.join(tmpDir, 'alpha.js'), '');
@@ -518,26 +548,157 @@ describe('tools.js', async () => {
     assert.ok(out.includes('Error'), 'error for missing pattern');
   });
 
-  test('executeTool grep: finds matching lines', async () => {
+  test('executeTool search_code: finds matching lines with line numbers', async () => {
     const { executeTool } = await import('../src/tools.js');
     await fsp.writeFile(path.join(tmpDir, 'search.txt'), 'the quick brown fox\njumps over the lazy dog\nfox trot');
-    const out = await executeTool('grep', { pattern: 'fox', path: '.' }, { cwd: tmpDir, workspace: tmpDir });
+    const out = await executeTool('search_code', { pattern: 'fox', path: '.' }, { cwd: tmpDir, workspace: tmpDir });
     assert.ok(out.includes('fox'), 'finds matches');
   });
 
-  test('executeTool grep: returns no matches message', async () => {
+  test('executeTool search_code: returns no matches message', async () => {
     const { executeTool } = await import('../src/tools.js');
-    await fsp.writeFile(path.join(tmpDir, 'empty_match.txt'), 'nothing to find here');
-    const out = await executeTool('grep', { pattern: 'ZZZNOMATCHZZZ' }, { cwd: tmpDir, workspace: tmpDir });
+    const out = await executeTool('search_code', { pattern: 'ZZZNOMATCHZZZ', path: '.' }, { cwd: tmpDir, workspace: tmpDir });
     assert.equal(out, '(no matches)');
   });
 
-  test('executeTool grep: filters by include glob', async () => {
+  test('executeTool search_code: filters by include glob', async () => {
     const { executeTool } = await import('../src/tools.js');
-    await fsp.writeFile(path.join(tmpDir, 'match.js'), 'const target = 1;');
-    await fsp.writeFile(path.join(tmpDir, 'nomatch.txt'), 'const target = 2;');
-    const out = await executeTool('grep', { pattern: 'target', path: '.', include: '*.js' }, { cwd: tmpDir, workspace: tmpDir });
+    await fsp.writeFile(path.join(tmpDir, 'match.js'), 'const searchTarget = 1;');
+    await fsp.writeFile(path.join(tmpDir, 'nomatch.txt'), 'const searchTarget = 2;');
+    const out = await executeTool('search_code', { pattern: 'searchTarget', path: '.', include: '*.js' }, { cwd: tmpDir, workspace: tmpDir });
     assert.ok(out.includes('match.js'), 'includes .js file');
+    assert.ok(!out.includes('nomatch.txt'), 'excludes .txt file');
+  });
+
+  test('executeTool list_dir: lists files in a directory', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.mkdir(path.join(tmpDir, 'listme'), { recursive: true });
+    await fsp.writeFile(path.join(tmpDir, 'listme', 'a.js'), '');
+    await fsp.writeFile(path.join(tmpDir, 'listme', 'b.txt'), '');
+    const out = await executeTool('list_dir', { path: 'listme' }, { cwd: tmpDir, workspace: tmpDir });
+    assert.ok(out.includes('a.js'), 'lists a.js');
+    assert.ok(out.includes('b.txt'), 'lists b.txt');
+  });
+
+  test('executeTool list_dir: defaults to workspace root when no path given', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const out = await executeTool('list_dir', {}, { cwd: tmpDir, workspace: tmpDir });
+    assert.ok(out.includes('Directory:'), 'returns directory listing');
+  });
+
+  test('executeTool list_dir: rejects paths outside workspace', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await assert.rejects(
+      () => executeTool('list_dir', { path: '../../etc' }, { cwd: tmpDir, workspace: tmpDir }),
+      /outside the workspace/
+    );
+  });
+
+  test('executeTool list_dir: respects depth parameter', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.mkdir(path.join(tmpDir, 'deep', 'nested'), { recursive: true });
+    await fsp.writeFile(path.join(tmpDir, 'deep', 'nested', 'leaf.txt'), '');
+    const shallow = await executeTool('list_dir', { path: '.', depth: 1 }, { cwd: tmpDir, workspace: tmpDir });
+    const deep    = await executeTool('list_dir', { path: '.', depth: 2 }, { cwd: tmpDir, workspace: tmpDir });
+    assert.ok(!shallow.includes('leaf.txt'), 'depth 1 does not show grandchild');
+    assert.ok(deep.includes('leaf.txt'), 'depth 2 shows grandchild');
+  });
+
+  test('executeTool fetch_url: strips HTML and returns text', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    // Use a local http server to avoid network dependency
+    const miniServer = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><body><p>Hello fetch world</p></body></html>');
+    });
+    await new Promise(resolve => miniServer.listen(0, '127.0.0.1', resolve));
+    const { port } = miniServer.address();
+    try {
+      const out = await executeTool('fetch_url', { url: `http://127.0.0.1:${port}/` }, { cwd: tmpDir, workspace: tmpDir });
+      assert.ok(out.includes('Hello fetch world'), 'extracts text from HTML');
+    } finally {
+      await new Promise(resolve => miniServer.close(resolve));
+    }
+  });
+
+  test('executeTool fetch_url: throws for invalid URL', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await assert.rejects(
+      () => executeTool('fetch_url', { url: 'not-a-url' }, { cwd: tmpDir, workspace: tmpDir }),
+      /Invalid URL/
+    );
+  });
+
+  test('executeTool fetch_url: throws for non-http protocol', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await assert.rejects(
+      () => executeTool('fetch_url', { url: 'ftp://example.com' }, { cwd: tmpDir, workspace: tmpDir }),
+      /Only http/
+    );
+  });
+
+  test('executeTool fetch_url: throws on missing url arg', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const out = await executeTool('fetch_url', {}, { cwd: tmpDir, workspace: tmpDir });
+    assert.ok(out.includes('Error'), 'error for missing url');
+  });
+
+  test('executeTool patch_file: applies a single patch', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch1.txt'), 'foo bar baz');
+    await executeTool('patch_file', { path: 'patch1.txt', old_str: 'bar', new_str: 'PATCHED' }, { cwd: tmpDir, workspace: tmpDir });
+    const content = await fsp.readFile(path.join(tmpDir, 'patch1.txt'), 'utf8');
+    assert.equal(content, 'foo PATCHED baz');
+  });
+
+  test('executeTool patch_file: applies multiple patches via patches[]', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch2.txt'), 'alpha beta gamma');
+    await executeTool('patch_file', {
+      path: 'patch2.txt',
+      patches: [
+        { old_str: 'alpha', new_str: 'A' },
+        { old_str: 'gamma', new_str: 'G' },
+      ],
+    }, { cwd: tmpDir, workspace: tmpDir });
+    const content = await fsp.readFile(path.join(tmpDir, 'patch2.txt'), 'utf8');
+    assert.equal(content, 'A beta G');
+  });
+
+  test('executeTool patch_file: throws when old_str not found', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch3.txt'), 'some content');
+    await assert.rejects(
+      () => executeTool('patch_file', { path: 'patch3.txt', old_str: 'MISSING', new_str: 'x' }, { cwd: tmpDir, workspace: tmpDir }),
+      /not found/
+    );
+  });
+
+  test('executeTool patch_file: throws when old_str matches multiple times', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch4.txt'), 'dup dup dup');
+    await assert.rejects(
+      () => executeTool('patch_file', { path: 'patch4.txt', old_str: 'dup', new_str: 'x' }, { cwd: tmpDir, workspace: tmpDir }),
+      /appears \d+ times/
+    );
+  });
+
+  test('executeTool patch_file: throws when no old_str provided', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch5.txt'), 'content');
+    await assert.rejects(
+      () => executeTool('patch_file', { path: 'patch5.txt' }, { cwd: tmpDir, workspace: tmpDir }),
+      /requires/
+    );
+  });
+
+  test('executeTool patch_file: throws when replacement is a no-op', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch6.txt'), 'same content');
+    await assert.rejects(
+      () => executeTool('patch_file', { path: 'patch6.txt', old_str: 'same', new_str: 'same' }, { cwd: tmpDir, workspace: tmpDir }),
+      /no changes|identical/
+    );
   });
 
   test('executeTool throws for unknown tool', async () => {
@@ -565,9 +726,10 @@ describe('tools.js', async () => {
       assert.ok(def.function.parameters, 'each has parameters');
     }
     const names = TOOL_DEFS.map(d => d.function.name);
-    for (const expected of ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'grep']) {
+    for (const expected of ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'list_dir', 'search_code', 'fetch_url', 'patch_file']) {
       assert.ok(names.includes(expected), `includes tool ${expected}`);
     }
+    assert.ok(!names.includes('grep'), 'grep is not exposed to the model');
   });
 });
 
@@ -626,6 +788,231 @@ describe('ollama.js', async () => {
       await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
     }
   });
+
+  test('chatStream retries without tools when Ollama rejects tool support', async () => {
+    const requestBodies = [];
+    const mockServer = http.createServer((req, res) => {
+      if (req.url !== '/api/chat') {
+        res.writeHead(404).end();
+        return;
+      }
+
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        requestBodies.push(JSON.parse(body));
+        if (requestBodies.length === 1) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'test-model does not support tools' }));
+          return;
+        }
+
+        createNdjsonResponse(res, [
+          { message: { content: '{"name":"read_file","arguments":{"path":"README.md"}}' } },
+          { done: true, prompt_eval_count: 4, eval_count: 7 },
+        ]);
+      });
+    });
+
+    await new Promise(resolve => mockServer.listen(0, '127.0.0.1', resolve));
+    const { port } = mockServer.address();
+    const originalBaseUrl = process.env.OLLAMA_BASE_URL;
+    process.env.OLLAMA_BASE_URL = `http://127.0.0.1:${port}`;
+
+    try {
+      const moduleUrl = `${pathToFileURL(path.join(ROOT, 'src', 'ollama.js')).href}?t=${Date.now()}`;
+      const { chatStream } = await import(moduleUrl);
+      const result = await chatStream({
+        model: 'test-model',
+        messages: [{ role: 'user', content: 'read README.md' }],
+        tools: [{ type: 'function', function: { name: 'read_file' } }],
+      });
+
+      assert.equal(requestBodies.length, 2);
+      assert.ok(requestBodies[0].tools, 'first request sends tools');
+      assert.ok(!requestBodies[1].tools, 'fallback request omits tools');
+      assert.equal(result.toolMode, 'text');
+      assert.equal(result.content, '{"name":"read_file","arguments":{"path":"README.md"}}');
+    } finally {
+      if (originalBaseUrl == null) delete process.env.OLLAMA_BASE_URL;
+      else process.env.OLLAMA_BASE_URL = originalBaseUrl;
+      await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
+    }
+  });
+});
+
+// ─── Anthropic provider tests ─────────────────────────────────────────────────
+
+describe('anthropic.js', async () => {
+  test('toAnthropicMessages extracts system and maps tool_use/tool_result', async () => {
+    const { toAnthropicMessages } = await import('../src/anthropic.js');
+    const { system, messages } = toAnthropicMessages([
+      { role: 'system', content: 'You are a coding assistant.' },
+      { role: 'user', content: 'read the readme' },
+      { role: 'assistant', content: 'On it.', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'README.md' } } }] },
+      { role: 'tool', name: 'read_file', content: '# Title' },
+    ]);
+    assert.equal(system, 'You are a coding assistant.');
+    assert.equal(messages.length, 3, 'user, assistant(tool_use), user(tool_result)');
+    assert.equal(messages[0].role, 'user');
+    const assistant = messages[1];
+    assert.equal(assistant.role, 'assistant');
+    const toolUse = assistant.content.find(b => b.type === 'tool_use');
+    assert.ok(toolUse, 'has tool_use block');
+    assert.equal(toolUse.name, 'read_file');
+    assert.deepEqual(toolUse.input, { path: 'README.md' });
+    const toolResult = messages[2];
+    assert.equal(toolResult.role, 'user');
+    assert.equal(toolResult.content[0].type, 'tool_result');
+    assert.equal(toolResult.content[0].tool_use_id, toolUse.id, 'tool_result id matches synthesized tool_use id');
+    assert.equal(toolResult.content[0].content, '# Title');
+  });
+
+  test('toAnthropicMessages merges consecutive tool results into one user turn', async () => {
+    const { toAnthropicMessages } = await import('../src/anthropic.js');
+    const { messages } = toAnthropicMessages([
+      { role: 'assistant', content: '', tool_calls: [
+        { function: { name: 'read_file', arguments: { path: 'a' } } },
+        { function: { name: 'read_file', arguments: { path: 'b' } } },
+      ] },
+      { role: 'tool', content: 'A' },
+      { role: 'tool', content: 'B' },
+    ]);
+    const last = messages[messages.length - 1];
+    assert.equal(last.role, 'user');
+    assert.equal(last.content.length, 2, 'both tool_results in one user turn');
+    assert.equal(last.content[0].tool_use_id, messages[0].content[0].id);
+    assert.equal(last.content[1].tool_use_id, messages[0].content[1].id);
+  });
+
+  test('toAnthropicTools converts function defs to input_schema form', async () => {
+    const { toAnthropicTools } = await import('../src/anthropic.js');
+    const out = toAnthropicTools([
+      { type: 'function', function: { name: 'bash', description: 'run', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+    ]);
+    assert.equal(out[0].name, 'bash');
+    assert.equal(out[0].description, 'run');
+    assert.deepEqual(out[0].input_schema.required, ['command']);
+  });
+
+  test('getModels returns anthropic:* models only when ANTHROPIC_API_KEY is set', async () => {
+    const { getModels } = await import('../src/anthropic.js');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    try {
+      delete process.env.ANTHROPIC_API_KEY;
+      assert.deepEqual(await getModels(), []);
+      process.env.ANTHROPIC_API_KEY = 'test-key';
+      const models = await getModels();
+      assert.ok(models.length >= 1);
+      assert.ok(models.every(m => m.name.startsWith('anthropic:')));
+      assert.ok(models.some(m => m.name === 'anthropic:claude-opus-4-8'));
+    } finally {
+      if (prev == null) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
+
+  test('chatStream parses SSE text deltas and tool_use blocks', async () => {
+    const events = [
+      { type: 'message_start', message: { usage: { input_tokens: 11 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello ' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'world' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'read_file' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":' } },
+      { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '"README.md"}' } },
+      { type: 'content_block_stop', index: 1 },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 22 } },
+      { type: 'message_stop' },
+    ];
+    let receivedAuth = null;
+    let receivedBody = null;
+    const mockServer = http.createServer((req, res) => {
+      if (req.url !== '/v1/messages') { res.writeHead(404).end(); return; }
+      receivedAuth = req.headers['x-api-key'];
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        for (const e of events) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        res.end();
+      });
+    });
+    await new Promise(r => mockServer.listen(0, '127.0.0.1', r));
+    const { port } = mockServer.address();
+    const prevBase = process.env.ANTHROPIC_BASE_URL;
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+    const deltas = [];
+    try {
+      const { chatStream } = await import('../src/anthropic.js');
+      const result = await chatStream({
+        model: 'anthropic:claude-opus-4-8',
+        messages: [
+          { role: 'system', content: 'be brief' },
+          { role: 'user', content: 'hi' },
+        ],
+        tools: [{ type: 'function', function: { name: 'read_file', description: 'read', parameters: { type: 'object', properties: {} } } }],
+        onDelta: d => deltas.push(d),
+      });
+      assert.equal(result.content, 'Hello world');
+      assert.equal(deltas.join(''), 'Hello world');
+      assert.equal(result.toolCalls.length, 1);
+      assert.equal(result.toolCalls[0].function.name, 'read_file');
+      assert.deepEqual(result.toolCalls[0].function.arguments, { path: 'README.md' });
+      assert.equal(result.promptTokens, 11);
+      assert.equal(result.completionTokens, 22);
+      assert.equal(result.toolMode, 'native');
+      assert.equal(receivedAuth, 'test-key');
+      assert.equal(receivedBody.model, 'claude-opus-4-8', 'anthropic: prefix stripped');
+      assert.equal(receivedBody.system, 'be brief', 'system pulled to top level');
+      assert.ok(receivedBody.tools, 'tools forwarded');
+    } finally {
+      if (prevBase == null) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+      await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('chatStream throws without credentials', async () => {
+    const { chatStream } = await import('../src/anthropic.js');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    try {
+      delete process.env.ANTHROPIC_API_KEY;
+      await assert.rejects(
+        () => chatStream({ model: 'anthropic:claude-opus-4-8', messages: [{ role: 'user', content: 'hi' }] }),
+        /ANTHROPIC_API_KEY/
+      );
+    } finally {
+      if (prev == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
+});
+
+describe('provider.js', async () => {
+  test('providerFor routes by model prefix', async () => {
+    const { providerFor } = await import('../src/provider.js');
+    const anthropic = await import('../src/anthropic.js');
+    const ollama = await import('../src/ollama.js');
+    assert.equal(providerFor('anthropic:claude-opus-4-8').chatStream, anthropic.chatStream);
+    assert.equal(providerFor('qwen2.5-coder:14b').chatStream, ollama.chatStream);
+  });
+
+  test('getModels includes anthropic models when ANTHROPIC_API_KEY is set', async () => {
+    const { getModels } = await import('../src/provider.js');
+    const prev = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+    try {
+      const models = await getModels();
+      assert.ok(models.some(m => m.name === 'anthropic:claude-opus-4-8'),
+        'anthropic models present in merged list even if Ollama contributes none');
+    } finally {
+      if (prev == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prev;
+    }
+  });
 });
 
 // ─── Server integration tests ─────────────────────────────────────────────────
@@ -639,7 +1026,7 @@ describe('server.js HTTP API', async () => {
     // Start server on a test port
     serverProcess = spawn('node', ['server.js'], {
       cwd: ROOT,
-      env: { ...process.env, PORT: String(TEST_PORT), HOST: '127.0.0.1' },
+      env: { ...process.env, PORT: String(TEST_PORT), HOST: '127.0.0.1', NODE_ENV: 'test' },
       stdio: 'pipe',
     });
 
@@ -742,7 +1129,7 @@ describe('server.js HTTP API', async () => {
       cwd: ROOT,
     });
     assert.equal(status, 200);
-    assert.ok(body.text.includes('Ollama Code'), 'expanded README.md');
+    assert.ok(body.text.includes('Claudette'), 'expanded README.md');
     assert.ok(body.files.length > 0, 'tracked expanded file');
   });
 
@@ -780,13 +1167,26 @@ describe('server.js HTTP API', async () => {
     const meta = lines.find(l => l.type === 'meta');
     assert.ok(meta, 'has meta chunk');
     assert.ok(meta.model, 'meta has model');
+    assert.ok(meta.traceTurn, 'meta has traceTurn');
+    assert.equal(meta.traceTurn.status, 'running', 'traceTurn starts as running');
 
     const deltas = lines.filter(l => l.type === 'delta');
     assert.ok(deltas.length > 0, 'has at least one delta');
 
+    const traceEvents = lines.filter(l => l.type === 'trace');
+    assert.ok(traceEvents.length > 0, 'has trace events');
+    const eventTypes = traceEvents.map(e => e.event.type);
+    assert.ok(eventTypes.includes('input_received'), 'has input_received event');
+    assert.ok(eventTypes.includes('system_prompt_built'), 'has system_prompt_built event');
+    assert.ok(eventTypes.includes('model_request_started'), 'has model_request_started event');
+
     const done = lines.find(l => l.type === 'done');
     assert.ok(done, 'has done chunk');
     assert.ok(done.sessionId, 'done has sessionId');
+    assert.ok(done.traceTurn, 'done has completed traceTurn');
+    assert.equal(done.traceTurn.status, 'completed', 'traceTurn status is completed');
+    assert.ok(done.traceTurn.metrics.durationMs >= 0, 'traceTurn has durationMs');
+    assert.ok(done.traceTurn.metrics.totalTokens >= 0, 'traceTurn has totalTokens');
 
     // Check session was saved with the assistant message
     const { body: loaded } = await httpGet(`${BASE}/api/sessions/${sid}`);
@@ -828,7 +1228,7 @@ describe('server.js HTTP API', async () => {
 
 // ─── CLI process tests ────────────────────────────────────────────────────────
 
-describe('CLI (ollama-code.js)', async () => {
+describe('CLI (claudette.js)', async () => {
   function runCliWithInput(inputs, options = {}) {
     const {
       timeout = 30_000,
@@ -839,7 +1239,7 @@ describe('CLI (ollama-code.js)', async () => {
       finalDelayMs = 500,
     } = options;
     return new Promise((resolve, reject) => {
-      const proc = spawn('node', ['ollama-code.js', ...args], {
+      const proc = spawn('node', ['claudette.js', ...args], {
         cwd,
         env: { ...process.env, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -877,7 +1277,7 @@ describe('CLI (ollama-code.js)', async () => {
 
   test('CLI starts and shows banner', async () => {
     const { stdout } = await runCliWithInput([]);
-    assert.ok(stdout.includes('Ollama Code') || stdout.includes('ollama'), 'shows banner');
+    assert.ok(stdout.includes('Claudette') || stdout.includes('claudette'), 'shows banner');
   });
 
   test('CLI /help lists commands', async () => {
@@ -893,6 +1293,37 @@ describe('CLI (ollama-code.js)', async () => {
       arguments: { pattern: 'needle', path: 'src' },
     }));
     assert.equal(calls[0]?.function?.name, 'search_code');
+  });
+
+  test('CLI parser extracts wrapped and batched text tool calls', async () => {
+    const { __test_parseTextToolCalls } = await import('../src/chat.js');
+    const calls = __test_parseTextToolCalls(JSON.stringify({
+      tool_calls: [
+        { function: { name: 'read', arguments: { path: 'README.md' } } },
+        { tool: { name: 'bash', arguments: { cmd: 'node --check src/chat.js' } } },
+      ],
+    }));
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0]?.function?.name, 'read_file');
+    assert.equal(calls[1]?.function?.name, 'bash');
+    assert.equal(calls[1]?.function?.arguments?.command, 'node --check src/chat.js');
+  });
+
+  test('CLI extracts exact benchmark bash command verbatim', async () => {
+    const { __test_extractExactBashCommand } = await import('../src/chat.js');
+    const prompt = [
+      'Call bash with EXACTLY this command (copy character-for-character, do not modify anything):',
+      'node -e \'console.log("hi")\' && node --check src/chat.js',
+    ].join('\n');
+    assert.equal(
+      __test_extractExactBashCommand(prompt),
+      'node -e \'console.log("hi")\' && node --check src/chat.js'
+    );
+  });
+
+  test('CLI exact benchmark bash extractor ignores normal prompts', async () => {
+    const { __test_extractExactBashCommand } = await import('../src/chat.js');
+    assert.equal(__test_extractExactBashCommand('Please inspect src/chat.js and fix /help.'), null);
   });
 
   test('CLI /models lists available models', async () => {
@@ -947,11 +1378,6 @@ describe('CLI (ollama-code.js)', async () => {
     assert.ok(stdout.includes('token') || stdout.includes('message'), 'shows cost estimate');
   });
 
-  test('CLI /vim shows vim mode message', async () => {
-    const { stdout } = await runCliWithInput(['/vim\n']);
-    assert.ok(stdout.includes('Vim') || stdout.includes('vim'), 'shows vim info');
-  });
-
   test('CLI unknown command prints warning', async () => {
     const { stdout } = await runCliWithInput(['/notacommand\n']);
     assert.ok(stdout.includes('Unknown') || stdout.includes('unknown'), 'shows unknown command warning');
@@ -965,11 +1391,6 @@ describe('CLI (ollama-code.js)', async () => {
   test('CLI /clear also creates fresh session', async () => {
     const { stdout } = await runCliWithInput(['/clear\n']);
     assert.ok(stdout.includes('session') || stdout.includes('New'), '/clear creates session');
-  });
-
-  test('CLI /add-dir without arg shows usage', async () => {
-    const { stdout } = await runCliWithInput(['/add-dir\n']);
-    assert.ok(stdout.includes('Usage') || stdout.includes('usage') || stdout.includes('add-dir'), 'shows usage');
   });
 
   test('CLI /resume without arg shows usage', async () => {
@@ -1004,7 +1425,7 @@ describe('CLI tool loop with mock Ollama', async () => {
       finalDelayMs = 500,
     } = options;
     return new Promise((resolve, reject) => {
-      const proc = spawn('node', ['ollama-code.js', ...args], {
+      const proc = spawn('node', ['claudette.js', ...args], {
         cwd,
         env: { ...process.env, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -1165,7 +1586,6 @@ describe('CLI tool loop with mock Ollama', async () => {
     const { stdout, timedOut } = await runCliWithInput(
       ['inspect the file\n'],
       {
-        cwd: tmpDir,
         args: ['-y', '--cwd', tmpDir, '--model', 'mock-coder:latest'],
         env: { OLLAMA_BASE_URL: mockBaseUrl },
         timeout: 15_000,
@@ -1187,7 +1607,6 @@ describe('CLI tool loop with mock Ollama', async () => {
     const { stdout, timedOut } = await runCliWithInput(
       ['try to read outside the workspace\n'],
       {
-        cwd: tmpDir,
         args: ['-y', '--cwd', tmpDir, '--model', 'mock-coder:latest'],
         env: { OLLAMA_BASE_URL: mockBaseUrl },
         timeout: 15_000,
@@ -1203,7 +1622,6 @@ describe('CLI tool loop with mock Ollama', async () => {
     const { stdout, timedOut } = await runCliWithInput(
       ['run pwd\n'],
       {
-        cwd: tmpDir,
         args: ['-y', '--cwd', tmpDir, '--model', 'mock-coder:latest'],
         env: { OLLAMA_BASE_URL: mockBaseUrl },
         timeout: 15_000,
@@ -1380,30 +1798,53 @@ console.log(JSON.stringify(r));
 // ─── Stress loop: Ollama integration ─────────────────────────────────────────
 
 describe('Stress: Ollama message stream', async () => {
-  const TEST_PORT2 = 14323;
-  const BASE2 = `http://127.0.0.1:${TEST_PORT2}`;
+  let testPort2;
+  let base2;
   let serverProcess;
 
   before(async () => {
+    testPort2 = await getFreePort();
+    base2 = `http://127.0.0.1:${testPort2}`;
     serverProcess = spawn('node', ['server.js'], {
       cwd: ROOT,
-      env: { ...process.env, PORT: String(TEST_PORT2), HOST: '127.0.0.1' },
+      env: { ...process.env, PORT: String(testPort2), HOST: '127.0.0.1', NODE_ENV: 'test' },
       stdio: 'pipe',
     });
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Server2 start timeout')), 10_000);
-      serverProcess.stdout.on('data', data => {
+      const onReady = data => {
         if (data.toString().includes('listening')) {
           clearTimeout(timeout);
+          cleanup();
           setTimeout(resolve, 100);
         }
-      });
-      serverProcess.on('error', err => { clearTimeout(timeout); reject(err); });
+      };
+      const onErrorOutput = data => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`Server2 failed to start: ${data.toString().trim()}`));
+      };
+      const onExit = (code, signal) => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`Server2 exited before start (code=${code}, signal=${signal})`));
+      };
+      const cleanup = () => {
+        serverProcess.stdout.off('data', onReady);
+        serverProcess.stderr.off('data', onErrorOutput);
+        serverProcess.off('exit', onExit);
+      };
+      serverProcess.stdout.on('data', onReady);
+      serverProcess.stderr.on('data', onErrorOutput);
+      serverProcess.on('error', err => { clearTimeout(timeout); cleanup(); reject(err); });
+      serverProcess.on('exit', onExit);
     });
   });
 
   after(async () => {
-    if (serverProcess) serverProcess.kill();
+    if (!serverProcess) return;
+    serverProcess.kill();
+    await new Promise(resolve => serverProcess.once('exit', resolve));
   });
 
   const PROMPTS = [
@@ -1422,14 +1863,14 @@ describe('Stress: Ollama message stream', async () => {
   let sessionId;
 
   before(async () => {
-    const { body } = await httpPost(`${BASE2}/api/sessions`, { model: 'llama3.2:latest' });
+    const { body } = await httpPost(`${base2}/api/sessions`, { model: 'llama3.2:latest' });
     sessionId = body.session.id;
   });
 
   for (const prompt of PROMPTS) {
     test(`Stress: "${prompt.slice(0, 40)}"`, async () => {
       const { status, lines } = await httpPostStream(
-        `${BASE2}/api/sessions/${sessionId}/messages`,
+        `${base2}/api/sessions/${sessionId}/messages`,
         { content: prompt, model: 'llama3.2:latest' }
       );
       assert.equal(status, 200, `HTTP 200 for: ${prompt}`);
@@ -1441,14 +1882,14 @@ describe('Stress: Ollama message stream', async () => {
   }
 
   test('Stress: multi-turn conversation maintains history', async () => {
-    const { body: s } = await httpPost(`${BASE2}/api/sessions`, { model: 'llama3.2:latest' });
+    const { body: s } = await httpPost(`${base2}/api/sessions`, { model: 'llama3.2:latest' });
     const sid = s.session.id;
 
-    await httpPostStream(`${BASE2}/api/sessions/${sid}/messages`, {
+    await httpPostStream(`${base2}/api/sessions/${sid}/messages`, {
       content: 'Hypothetical coding context: remember that the bug is in src/ollama.js and the failing test is test/test.js.',
       model: 'llama3.2:latest',
     });
-    const { lines } = await httpPostStream(`${BASE2}/api/sessions/${sid}/messages`, {
+    const { lines } = await httpPostStream(`${base2}/api/sessions/${sid}/messages`, {
       content: 'What file did I say contains the bug, and what file contains the failing test?',
       model: 'llama3.2:latest',
     });
@@ -1456,7 +1897,7 @@ describe('Stress: Ollama message stream', async () => {
     // The model may or may not remember perfectly, but it should respond
     assert.ok(response.length > 0, 'got multi-turn response');
 
-    const { body: loaded } = await httpGet(`${BASE2}/api/sessions/${sid}`);
+    const { body: loaded } = await httpGet(`${base2}/api/sessions/${sid}`);
     assert.ok(loaded.session.messages.length >= 4, 'session has 4+ messages (2 user + 2 assistant)');
     try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${sid}.json`)); } catch {}
   });
@@ -1469,8 +1910,8 @@ describe('Stress: Ollama message stream', async () => {
     ];
     const results = await Promise.all(
       prompts.map(async (p) => {
-        const { body: s } = await httpPost(`${BASE2}/api/sessions`, { model: 'llama3.2:latest' });
-        const r = await httpPostStream(`${BASE2}/api/sessions/${s.session.id}/messages`, {
+        const { body: s } = await httpPost(`${base2}/api/sessions`, { model: 'llama3.2:latest' });
+        const r = await httpPostStream(`${base2}/api/sessions/${s.session.id}/messages`, {
           content: p,
           model: 'llama3.2:latest',
         });

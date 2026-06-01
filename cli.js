@@ -39,7 +39,7 @@ while (true) {
 rl.close();
 
 function printBanner() {
-  console.log("Ollama Code Console CLI");
+  console.log("Claudette CLI");
   console.log(`workspace: ${cwd}`);
   console.log("commands: /help /models /model <name> /new /sessions /use <id> /clear /exit");
 }

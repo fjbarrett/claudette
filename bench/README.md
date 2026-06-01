@@ -5,10 +5,11 @@ This harness runs repeatable coding/admin tasks against the local CLI agent in i
 ## What it does
 
 - Creates a temporary git branch and worktree for each run
-- Executes the local CLI agent (`ollama-code.js`) with a task prompt
+- Executes the local CLI agent (`claudette.js`) with a task prompt
 - Captures the workflow transcript, git diff, and verification results
 - Runs an LLM judge over the workflow and outcome
 - Writes JSON and Markdown reports under `bench/runs/`
+- Generates a latest-per-model leaderboard in `bench/LEADERBOARD.md`
 
 ## Usage
 
@@ -18,31 +19,85 @@ List tasks:
 npm run bench:list
 ```
 
-Run one task against one model:
+Regenerate the leaderboard from the latest report files:
 
 ```bash
-npm run bench -- --task permission-prompt-shortcut --model gemma4:latest
+npm run bench:leaderboard
+```
+
+Run one task against gemma4 with live output:
+
+```bash
+npm run bench -- --task write-and-run --model gemma4:latest --verbose
+```
+
+Run all tasks against gemma4 (the default testing loop):
+
+```bash
+npm run bench:gemma
+```
+
+Repeat a task 3 times to check consistency:
+
+```bash
+npm run bench -- --task targeted-edit --model gemma4:latest --repeat 3 --verbose
 ```
 
 Run one task against several models:
 
 ```bash
-npm run bench -- --task admin-hardening --model gemma4:latest --model deepseek-coder-v2:16b
+npm run bench -- --task add-new-tool --model gemma4:latest --model qwen2.5-coder:latest
 ```
 
-Keep the worktree/branch for inspection:
+Keep the worktree/branch for post-mortem inspection:
 
 ```bash
-npm run bench -- --task admin-hardening --model gemma4:latest --keep
+npm run bench -- --task subdir-workflow --model gemma4:latest --keep --verbose
 ```
 
 Choose a different judge model:
 
 ```bash
-npm run bench -- --task admin-hardening --model gemma4:latest --judge qwen3.5:latest
+npm run bench -- --task admin-hardening --model gemma4:latest --judge qwen2.5:latest
 ```
 
-## Task Files
+### Cloud models (Anthropic / Opus 4.8)
+
+Both the agent model (`--model`) and the judge (`--judge`) route through the
+provider, so `anthropic:*` ids work anywhere a model id is accepted. Set a key
+first; the harness fails fast if an `anthropic:*` model is requested without one.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Run Opus 4.8 on the two tasks where local 14–16B models hit a ceiling,
+# judged by Sonnet so the judge doesn't depend on a local Ollama:
+npm run bench -- --task count-lines-tool --model anthropic:claude-opus-4-8 \
+  --judge anthropic:claude-sonnet-4-6 --verbose
+npm run bench -- --task extract-print-help --model anthropic:claude-opus-4-8 \
+  --judge anthropic:claude-sonnet-4-6 --verbose
+
+# Head-to-head against a local model on the same task:
+npm run bench -- --task count-lines-tool \
+  --model anthropic:claude-opus-4-8 --model qwen2.5-coder:14b \
+  --judge anthropic:claude-sonnet-4-6
+```
+
+This needs no local Ollama when both `--model` and `--judge` are `anthropic:*`.
+After a run, refresh the leaderboard with `npm run bench:leaderboard`.
+
+## Tasks
+
+| ID | Category | What it tests |
+|----|----------|---------------|
+| `write-and-run` | coding | Write a function with self-tests, run it, iterate until clean |
+| `targeted-edit` | coding | Read a file, make a minimal str_replace edit, verify the result |
+| `add-new-tool` | coding | Add a tool to an existing registry, keep TOOL_DEFS and switch in sync |
+| `subdir-workflow` | coding | Create a project in a subdirectory and run it with the right cwd |
+| `permission-prompt-shortcut` | coding | Find and fix a specific UI string |
+| `admin-hardening` | admin | Inspect and harden operational risks |
+
+## Task File Format
 
 Task definitions live in `bench/tasks/*.json`.
 
@@ -52,12 +107,13 @@ Each task supports:
 - `title`
 - `category`
 - `prompt`
-- `verify`: array of shell commands run after the agent finishes
+- `verify`: array of shell commands run after the agent finishes (exit 0 = pass)
 - `timeoutSec`
-- `judgeFocus`
+- `judgeFocus`: guidance for the LLM judge
 
 ## Notes
 
 - The harness runs the real CLI agent with `-y`, so tool calls are auto-approved during benchmark runs.
 - Reports are ignored by git.
+- `npm run bench:leaderboard` snapshots the most recent result for each `(model, task)` pair.
 - Models that do not support tools may still perform well on pure generation tasks, but they will score poorly on tool-using tasks.

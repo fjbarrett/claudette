@@ -26,21 +26,33 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
     model,
     messages,
     stream: true,
-    options: { temperature: 0.7 },
+    options: { temperature: 0, num_ctx: 32768 },
   };
-  // Only attach tools if provided — some older Ollama versions reject unknown fields
-  if (tools.length) body.tools = tools;
-
-  const res = await fetch(`${BASE}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+  let toolMode = tools.length ? 'native' : 'none';
+  let res = await postChat({
+    body: tools.length ? { ...body, tools } : body,
     signal,
   });
 
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`Ollama chat (${res.status}): ${txt}`);
+    const unsupportedTools = tools.length
+      && res.status === 400
+      && /does not support tools/i.test(txt);
+    if (!unsupportedTools) {
+      throw new Error(`Ollama chat (${res.status}): ${txt}`);
+    }
+
+    toolMode = 'text';
+    const fallbackMessages = injectFallbackToolPrompt(messages);
+    res = await postChat({
+      body: { ...body, messages: fallbackMessages },
+      signal,
+    });
+    if (!res.ok) {
+      const fallbackText = await res.text().catch(() => '');
+      throw new Error(`Ollama chat (${res.status}): ${fallbackText}`);
+    }
   }
 
   const reader = res.body.getReader();
@@ -82,9 +94,45 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
   }
 
   return {
-    content: fullContent,
+    content: stripSpecialTokens(fullContent),
     toolCalls: toolCalls.length ? toolCalls : null,
+    hadApiToolCalls: toolCalls.length > 0,
     promptTokens,
     completionTokens,
+    toolMode,
   };
+}
+
+function stripSpecialTokens(text) {
+  // Remove model-internal tokens (DeepSeek BOS/EOS, etc.) that sometimes leak into output
+  return text.replace(/<｜[^｜]*｜>/g, '').trim();
+}
+
+async function postChat({ body, signal }) {
+  return fetch(`${BASE}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal,
+  });
+}
+
+function injectFallbackToolPrompt(messages) {
+  const fallback = {
+    role: 'system',
+    content: [
+      'Native tool calling is unavailable for this model.',
+      'When you need a tool, respond with ONLY one compact JSON object and nothing else.',
+      'Format: {"name":"read_file","arguments":{"path":"src/app.js"}}',
+      'Do not use markdown fences. Do not explain your plan. After each tool result, emit the next JSON tool call or the final answer.',
+    ].join('\n'),
+  };
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return [fallback];
+  }
+  if (messages[0]?.role === 'system') {
+    return [messages[0], fallback, ...messages.slice(1)];
+  }
+  return [fallback, ...messages];
 }

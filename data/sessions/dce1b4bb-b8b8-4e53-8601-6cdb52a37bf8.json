@@ -1,9 +1,0 @@
-{
-  "id": "dce1b4bb-b8b8-4e53-8601-6cdb52a37bf8",
-  "title": "test-session",
-  "createdAt": "2026-04-09T13:25:07.488Z",
-  "updatedAt": "2026-04-09T13:25:07.488Z",
-  "model": "qwen2.5-coder:14b",
-  "cwd": "/home/frank/Code/test",
-  "messages": []
-}

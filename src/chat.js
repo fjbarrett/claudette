@@ -13,15 +13,13 @@ import { promisify } from 'node:util';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-import { resolveOllamaBaseUrl } from './config.js';
-import { getModels, chatStream } from './ollama.js';
+import { getModels, chatStream } from './provider.js';
 import { TOOL_DEFS, executeTool } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
 import { loadClaudeMd, expandFiles } from './context.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
-const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
 
 // ─── Mutable app state ────────────────────────────────────────────────────────
 let model      = null;
@@ -50,9 +48,13 @@ export async function start() {
   let models;
   try {
     models = await getModels();
-    if (!models.length) throw new Error('No models installed');
+    if (!models.length) throw new Error('No models available');
   } catch (err) {
-    ui.printError(`Cannot reach Ollama at ${OLLAMA_BASE_URL}\n  ${err.message}`);
+    ui.printError(
+      `No models available.\n` +
+      `  Start Ollama (${process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'}) ` +
+      `or set ANTHROPIC_API_KEY to use anthropic:* models.\n  ${err.message}`
+    );
     exit(1);
   }
   // Prefer models known to support proper tool calling — iterate PREFERENCE order, not model list order
@@ -131,6 +133,21 @@ async function handleMessage(text, rl) {
   if (session.title === 'New Session') session.title = text.slice(0, 60);
   void scheduleSessionSave(session);
 
+  const exactCommand = extractExactBashCommand(expandedText);
+  if (exactCommand) {
+    await runExactBashShortcut(exactCommand);
+    return;
+  }
+
+  // Warn when context is getting large
+  const approxTokens = session.messages.reduce((acc, m) => {
+    const len = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
+    return acc + Math.ceil(len / 4);
+  }, 0);
+  if (approxTokens > 25_000) {
+    ui.printWarning(`Context ~${Math.round(approxTokens / 1000)}k tokens — type /compact to compress history`);
+  }
+
   // Load CLAUDE.md context
   const claudeMd = await loadClaudeMd(workspace);
 
@@ -141,6 +158,36 @@ async function handleMessage(text, rl) {
   ];
 
   await agentLoop(messages, rl);
+}
+
+async function runExactBashShortcut(command) {
+  ui.printToolCall('bash', { command });
+  try {
+    const output = await executeTool('bash', { command }, { cwd: workspace, workspace });
+    ui.printToolResult('bash', output);
+    const assistantMsg = 'Executed the exact bash command from the prompt.';
+    session.messages.push({ role: 'assistant', content: assistantMsg });
+    session.messages.push({ role: 'tool', content: output, name: 'bash' });
+    await flushSessionSave(session);
+  } catch (err) {
+    ui.printToolResult('bash', err.message, true);
+    session.messages.push({
+      role: 'tool',
+      content: `Exact-command shortcut failed: ${err.message}`,
+      name: 'bash',
+    });
+
+    const claudeMd = await loadClaudeMd(workspace);
+    const messages = [
+      { role: 'system', content: buildSystemPrompt(claudeMd) },
+      ...session.messages,
+      {
+        role: 'user',
+        content: `The exact bash command from the prompt failed.\nCommand:\n${command}\n\nError:\n${err.message}\n\nInspect the relevant file(s), repair the issue, and verify the task.`,
+      },
+    ];
+    await agentLoop(messages, nullReadline());
+  }
 }
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
@@ -173,6 +220,17 @@ async function agentLoop(messages, rl) {
     process.stdin.resume();
     process.stdin.on('data', ctrlCHandler);
 
+    // Live streaming: stop spinner on first token, write deltas directly
+    let streamStarted = false;
+    const onDelta = (delta) => {
+      if (!streamStarted) {
+        streamStarted = true;
+        ui.stopSpinner();
+        ui.printAssistantStart();
+      }
+      stdout.write(delta);
+    };
+
     let result;
     try {
       result = await chatStream({
@@ -180,7 +238,7 @@ async function agentLoop(messages, rl) {
         messages,
         tools,
         signal: ac.signal,
-        onDelta: () => {},
+        onDelta,
       });
     } catch (err) {
       ui.stopSpinner();
@@ -193,7 +251,7 @@ async function agentLoop(messages, rl) {
       rl.resume(); // restore readline after streaming
     }
 
-    ui.stopSpinner();
+    if (!streamStarted) ui.stopSpinner();
 
     // ── Merge text-parsed tool calls with API tool calls ─────────────────────
     // Some models (qwen2.5-coder) emit some calls via API and others as JSON
@@ -215,9 +273,12 @@ async function agentLoop(messages, rl) {
 
     // ── No tool calls → normal response, done ──────────────────────────────
     if (!result.toolCalls?.length) {
-      if (result.content) {
+      if (!streamStarted && result.content) {
+        // Nothing was streamed (e.g. empty onDelta path) — render with markdown
         ui.printAssistantStart();
         ui.printAssistantMessage(result.content);
+      } else if (streamStarted) {
+        stdout.write('\n'); // newline after raw streamed text
       }
       ui.printAssistantEnd({
         model,
@@ -229,10 +290,13 @@ async function agentLoop(messages, rl) {
     }
 
     // ── Tool calls ─────────────────────────────────────────────────────────
-    if (result.content) {
+    if (!streamStarted && result.content) {
+      // Content wasn't streamed yet — render it before tool blocks
       ui.printAssistantStart();
       ui.printAssistantMessage(result.content);
       stdout.write('\n');
+    } else if (streamStarted) {
+      stdout.write('\n'); // newline after streamed text before tool blocks
     }
 
     // Record assistant turn with tool_calls
@@ -289,7 +353,7 @@ async function agentLoop(messages, rl) {
 // ─── Permission check ─────────────────────────────────────────────────────────
 async function checkPermission(toolName, args, rl) {
   // Read-only ops always allowed
-  if (['read_file', 'list_dir', 'glob', 'search_code', 'fetch_url'].includes(toolName)) return true;
+  if (['read_file', 'list_dir', 'glob', 'grep', 'search_code', 'fetch_url'].includes(toolName)) return true;
   if (autoApprove) return true;
 
   const key = toolName === 'bash' ? `bash:${args.command}` : toolName;
@@ -323,7 +387,7 @@ async function handleCommand(line, rl) {
       ui.table('Commands', [
         ['Setup & Config'],
         ['/model [name]',    'Show or switch the active model'],
-        ['/models',          'List all available Ollama models'],
+        ['/models',          'List all available models (Ollama + anthropic:*)'],
         ['/config',          'Show current configuration'],
         ['/tools',           'Toggle tool calling on/off'],
 
@@ -341,10 +405,6 @@ async function handleCommand(line, rl) {
         ['Git & Code'],
         ['/diff',            'Show git diff of workspace'],
         ['/status',          'Show git status'],
-        ['/feature <name>',  'Create and switch to feature/<name>'],
-        ['/save <message>',  'Stage all tracked changes and commit them'],
-        ['/publish',         'Push the current branch to origin'],
-        ['/update',          'Pull latest changes with --ff-only'],
         ['/commit',          'Ask Claude to write and run a git commit'],
         ['/review',          'Review staged changes'],
 
@@ -369,7 +429,7 @@ async function handleCommand(line, rl) {
     // eslint-disable-next-line no-fallthrough
     case '/models': {
       const list = await getModels().catch(err => { ui.printError(err.message); return []; });
-      ui.table('Ollama Models', list.map(m => [m.name, `${m.paramSize.padEnd(8)} ${m.family}`]));
+      ui.table('Available Models', list.map(m => [m.name, `${m.paramSize.padEnd(8)} ${m.family}`]));
       if (cmd === '/model') ui.printInfo(`Current: ${model}  |  /model <name> to switch`);
       return true;
     }
@@ -382,7 +442,7 @@ async function handleCommand(line, rl) {
         ['session',     session.id.slice(0, 8)],
         ['tools',       toolsOn ? 'enabled' : 'disabled'],
         ['auto-approve', String(autoApprove)],
-        ['ollama',      OLLAMA_BASE_URL],
+        ['ollama',      process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434'],
       ]);
       return true;
 
@@ -486,8 +546,8 @@ async function handleCommand(line, rl) {
     // ── Git ──────────────────────────────────────────────────────────────────
     case '/status': {
       try {
-        const status = await getGitStatus();
-        console.log('\n' + status);
+        const { stdout: out } = await execFile('git', ['status', '--short'], { cwd: workspace });
+        console.log('\n' + (out.trim() || '(clean working tree)'));
       } catch { ui.printError('Not a git repo or git unavailable.'); }
       return true;
     }
@@ -497,57 +557,6 @@ async function handleCommand(line, rl) {
         const { stdout: out } = await execFile('git', ['diff'], { cwd: workspace });
         console.log('\n' + (out.trim() || '(no unstaged changes)'));
       } catch { ui.printError('Not a git repo or git unavailable.'); }
-      return true;
-    }
-
-    case '/feature': {
-      if (!arg) {
-        ui.printWarning('Usage: /feature <name>');
-        return true;
-      }
-      try {
-        const branchName = `feature/${slugifyBranchName(arg)}`;
-        await execFile('git', ['checkout', '-b', branchName], { cwd: workspace });
-        ui.printSuccess(`Branch → ${branchName}`);
-      } catch (err) {
-        ui.printError(err.stderr?.trim() || err.message);
-      }
-      return true;
-    }
-
-    case '/save': {
-      if (!arg) {
-        ui.printWarning('Usage: /save <commit message>');
-        return true;
-      }
-      try {
-        await execFile('git', ['add', '-A'], { cwd: workspace });
-        const { stdout } = await execFile('git', ['commit', '-m', arg], { cwd: workspace });
-        console.log('\n' + stdout.trim());
-      } catch (err) {
-        ui.printError(err.stderr?.trim() || err.message);
-      }
-      return true;
-    }
-
-    case '/publish': {
-      try {
-        const branch = await getCurrentBranch();
-        const { stdout, stderr } = await execFile('git', ['push', '-u', 'origin', branch], { cwd: workspace });
-        console.log('\n' + [stdout, stderr].filter(Boolean).join('\n').trim());
-      } catch (err) {
-        ui.printError(err.stderr?.trim() || err.message);
-      }
-      return true;
-    }
-
-    case '/update': {
-      try {
-        const { stdout, stderr } = await execFile('git', ['pull', '--ff-only'], { cwd: workspace });
-        console.log('\n' + [stdout, stderr].filter(Boolean).join('\n').trim());
-      } catch (err) {
-        ui.printError(err.stderr?.trim() || err.message);
-      }
       return true;
     }
 
@@ -603,8 +612,8 @@ const TOOL_ALIASES = {
   edit: 'str_replace', replace: 'str_replace', modify: 'str_replace', patch: 'str_replace',
   // glob aliases
   list: 'glob', find: 'glob', find_files: 'glob', list_files: 'glob', search_files: 'glob',
-  // code search aliases
-  search: 'search_code', find_in_files: 'search_code', grep_files: 'search_code', grep: 'search_code',
+  // search aliases
+  search: 'search_code', grep: 'search_code', find_in_files: 'search_code', grep_files: 'search_code',
 };
 
 // Tools that are really interpreters — map to bash and prepend interpreter name
@@ -617,7 +626,7 @@ function normalizeToolName(raw) {
   const lower = raw.toLowerCase().replace(/[\s-]/g, '_');
   if (TOOL_ALIASES[lower]) return TOOL_ALIASES[lower];
   // Fuzzy: if any known tool name is a substring match
-  const known = ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'search_code', 'fetch_url', 'patch_file', 'list_dir'];
+  const known = ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'grep'];
   for (const t of known) if (lower.includes(t.replace('_', '')) || lower.includes(t)) return t;
   // Fuzzy against aliases keys
   for (const [alias, tool] of Object.entries(TOOL_ALIASES)) {
@@ -637,7 +646,7 @@ const PARAM_ALIASES_BY_TOOL = {
                  new: 'new_str', new_string: 'new_str', replacement: 'new_str', replace: 'new_str', r: 'new_str' },
   bash:       { cmd: 'command', shell_command: 'command', bash_command: 'command' },
   glob:       { glob_pattern: 'pattern', file_pattern: 'pattern' },
-  search_code:{ regex: 'pattern', query: 'pattern', dir: 'path', directory: 'path' },
+  grep:       { regex: 'pattern', query: 'pattern', dir: 'path', directory: 'path' },
 };
 // Fallback aliases applied when no tool-specific entry matches
 const PARAM_ALIASES_COMMON = {
@@ -732,6 +741,21 @@ function parseTextToolCalls(text) {
   for (const candidate of candidates) {
     try {
       const obj = JSON.parse(sanitizeJsonControls(candidate));
+      const wrappedCalls = obj.tool_calls ?? obj.calls;
+      if (Array.isArray(wrappedCalls)) {
+        for (const wrapped of wrappedCalls) {
+          const inner = wrapped.function ?? wrapped.tool ?? wrapped;
+          if (typeof inner?.name !== 'string') continue;
+          const toolName = normalizeToolName(inner.name);
+          const rawArgs = inner.arguments ?? inner.parameters ?? inner.args ?? {};
+          const args = typeof rawArgs === 'object' && rawArgs !== null
+            ? normalizeArgs(rawArgs, toolName)
+            : rawArgs;
+          calls.push({ function: { name: toolName, arguments: args } });
+        }
+        continue;
+      }
+
       // Must have a name field and arguments or parameters
       if (typeof obj.name !== 'string') continue;
       const rawArgs = obj.arguments ?? obj.parameters ?? obj.args ?? {};
@@ -763,13 +787,18 @@ function parseTextToolCalls(text) {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+function extractExactBashCommand(text) {
+  // Accept either a space or a newline after the colon: when the prompt is fed
+  // over stdin, readline splits on embedded newlines, so the command must be
+  // able to ride on the same line as the instruction.
+  const match = String(text ?? '').match(/Call bash with EXACTLY this command \(copy character-for-character, do not modify anything\):\s+([\s\S]+)/);
+  return match?.[1]?.trim() || null;
+}
+
 function buildSystemPrompt(claudeMd) {
   const lines = [
     'You are Ollama Code, an AI coding assistant running in the terminal.',
-    'You have access to tools: bash, read_file, write_file, str_replace, patch_file, list_dir, glob, search_code, fetch_url.',
-    '',
-    'CRITICAL: You are actively completing a task the user gave you. Always refer back to the original user request and make concrete progress toward it with every response. Never stop after only reading project instructions or context files.',
-    '',
+    'You have access to tools: bash, read_file, write_file, str_replace, patch_file, list_dir, glob, grep, search_code, fetch_url.',
     'Guidelines:',
     '- Always read files before editing them.',
     '- Prefer patch_file or str_replace for targeted edits over rewriting whole files.',
@@ -777,20 +806,32 @@ function buildSystemPrompt(claudeMd) {
     '- Use tools proactively to explore the codebase before making changes.',
     '- Run tests or linters after making changes when they exist.',
     '- All file paths must be relative to the workspace root — never use /tmp or absolute paths outside the workspace.',
-    '- This project uses ESM (package.json type:module). Use import/export syntax. Never use require() or module.exports.',
-    '- When writing file content with write_file, write the raw content — never wrap it in markdown code fences (no ``` blocks).',
-    '- For str_replace, copy the exact old_str from the file, including spaces, punctuation, and numeric separators like 30_000. If a replacement fails, read the file again and retry with a smaller exact snippet.',
-    '- To run a file, use bash with the full relative path from the workspace root, e.g. node bench/scratch/stats.js.',
-    '- When a bash command fails, read the error, diagnose the cause, fix it, and retry. Do not stop after the first failure.',
-    '- Never describe or summarize a file\'s contents without reading it first. Do not guess.',
+    '- To run a file, use bash with e.g. {"command": "python3 fizzbuzz.py"} — run it in the workspace, not a copy.',
+    '- Never describe or summarize a file\'s contents without reading it first with read_file. Do not guess.',
+    '- For large files, use read_file with offset and limit to read specific line ranges (e.g. {"path":"foo.js","offset":100,"limit":50}).',
+    '- When asked about a directory or project, read README.md or key source files — do not invent descriptions.',
     '- Use list_dir for directory inspection and search_code for repo-wide searches when possible.',
-    '- When working inside a git repository, inspect git status before and after changes, keep work on a feature branch when appropriate, and use git diff to verify edits.',
+    '- If the prompt says to call bash with EXACTLY a given command, do that first without modifying the command.',
+    '- Do not read or edit CLAUDE.md, PERSIST.md, or docs unless the prompt explicitly asks for those files.',
+    '- Do not run git add, git commit, git push, or create branches unless the prompt explicitly asks for git actions.',
+    '- If a tool call fails because a file is missing, use the filenames named in the prompt before trying unrelated files.',
   ];
   if (claudeMd) {
-    lines.push('', '--- Project Instructions ---', 'Treat these as constraints and required context loading steps, not as a substitute for the active task.', claudeMd);
+    lines.push('', '--- Project Instructions ---', claudeMd);
   }
   return lines.join('\n');
 }
+
+function nullReadline() {
+  return {
+    pause() {},
+    resume() {},
+    async question() { return 'n'; },
+  };
+}
+
+export const __test_parseTextToolCalls = parseTextToolCalls;
+export const __test_extractExactBashCommand = extractExactBashCommand;
 
 async function summariseMessages(messages) {
   const transcript = messages
@@ -817,24 +858,3 @@ async function summariseMessages(messages) {
   });
   return summary.trim();
 }
-
-async function getGitStatus() {
-  const branch = await getCurrentBranch();
-  const { stdout } = await execFile('git', ['status', '--short'], { cwd: workspace });
-  const status = stdout.trim() || '(clean working tree)';
-  return `On ${branch}\n${status}`;
-}
-
-async function getCurrentBranch() {
-  const { stdout } = await execFile('git', ['branch', '--show-current'], { cwd: workspace });
-  return stdout.trim() || 'HEAD';
-}
-
-function slugifyBranchName(value) {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'work';
-}
-
-export const __test_parseTextToolCalls = parseTextToolCalls;

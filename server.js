@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { saveTranscript } from "./src/transcript.js";
 import { resolveOllamaBaseUrl } from "./src/config.js";
+import { chatStream, getModels as getProviderModels } from "./src/provider.js";
+import { getModels as getAnthropicModels } from "./src/anthropic.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +18,7 @@ const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT ?? __dirname);
 const DATA_DIR = path.join(__dirname, "data");
 const SESSIONS_DIR = path.join(DATA_DIR, "sessions");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const BENCH_REPORTS_DIR = path.join(__dirname, "bench", "runs", "reports");
 const DEFAULT_SYSTEM_PROMPT = [
   "You are a local coding assistant running through a terminal-first interface.",
   "Prioritize direct, technically correct answers, concise plans, code, and debugging help.",
@@ -41,7 +44,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`Ollama Code Console listening on http://${HOST}:${PORT}`);
+  console.log(`Claudette listening on http://${HOST}:${PORT}`);
 });
 
 async function handleApi(req, res, url) {
@@ -55,14 +58,28 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "GET" && url.pathname === "/api/models") {
-    const tags = await ollamaRequest("/api/tags", { method: "GET" });
-    const models = (tags.models ?? []).map((model) => ({
-      name: model.name,
-      size: model.size,
-      family: model.details?.family ?? "unknown",
-      parameterSize: model.details?.parameter_size ?? "unknown",
-      modifiedAt: model.modified_at
-    }));
+    const models = [];
+    try {
+      const tags = await ollamaRequest("/api/tags", { method: "GET" });
+      models.push(...(tags.models ?? []).map((model) => ({
+        name: model.name,
+        size: model.size,
+        family: model.details?.family ?? "unknown",
+        parameterSize: model.details?.parameter_size ?? "unknown",
+        modifiedAt: model.modified_at
+      })));
+    } catch {
+      // Ollama unreachable — still offer any configured cloud models below.
+    }
+    for (const m of await getAnthropicModels()) {
+      models.push({
+        name: m.name,
+        size: m.size,
+        family: m.family,
+        parameterSize: m.paramSize,
+        modifiedAt: m.modified
+      });
+    }
     sendJson(res, 200, { models });
     return;
   }
@@ -94,6 +111,12 @@ async function handleApi(req, res, url) {
     const sessionId = getSessionId(url.pathname);
     const session = await loadSession(sessionId);
     sendJson(res, 200, { session });
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/bench") {
+    const reports = await loadBenchReports();
+    sendJson(res, 200, { reports });
     return;
   }
 
@@ -217,60 +240,21 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
   });
   pushTraceEvent(res, traceTurn, "model_request_started", { model });
 
-  const ollamaResponse = await fetch(`${OLLAMA_BASE_URL}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      stream: true,
-      messages: conversation
-    })
-  });
-
-  if (!ollamaResponse.ok || !ollamaResponse.body) {
-    const failureText = await ollamaResponse.text();
-    throw new Error(`Ollama chat failed: ${ollamaResponse.status} ${failureText}`);
-  }
-
   pushTraceEvent(res, traceTurn, "assistant_stream_started", {});
 
-  const reader = ollamaResponse.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let assistantText = "";
-  let promptTokens = 0;
-  let completionTokens = 0;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
+  const result = await chatStream({
+    model,
+    messages: conversation,
+    onDelta: (delta) => {
+      assistantText += delta;
+      writeNdjson(res, { type: "delta", content: delta });
     }
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.trim()) {
-        continue;
-      }
-
-      let chunk;
-      try { chunk = JSON.parse(line); } catch { continue; }
-      const delta = chunk.message?.content ?? "";
-      if (delta) {
-        assistantText += delta;
-        writeNdjson(res, { type: "delta", content: delta });
-      }
-
-      if (chunk.done) {
-        promptTokens = chunk.prompt_eval_count ?? 0;
-        completionTokens = chunk.eval_count ?? 0;
-        break;
-      }
-    }
-  }
+  });
+  // result.content is the cleaned/full text; prefer it for the saved record.
+  assistantText = result.content || assistantText;
+  const promptTokens = result.promptTokens ?? 0;
+  const completionTokens = result.completionTokens ?? 0;
 
   const assistantMessage = { role: "assistant", content: assistantText };
   session.messages.push(assistantMessage);
@@ -347,6 +331,42 @@ async function saveSession(session) {
   await saveTranscript(session);
 }
 
+async function loadBenchReports() {
+  try {
+    await fsp.mkdir(BENCH_REPORTS_DIR, { recursive: true });
+    const files = await fsp.readdir(BENCH_REPORTS_DIR);
+    const reports = await Promise.all(
+      files
+        .filter(f => f.endsWith(".json"))
+        .sort()
+        .reverse()
+        .map(async f => {
+          try {
+            const raw = await fsp.readFile(path.join(BENCH_REPORTS_DIR, f), "utf8");
+            const r = JSON.parse(raw);
+            return {
+              file: f,
+              taskId: r.task?.id,
+              taskTitle: r.task?.title,
+              category: r.task?.category,
+              model: r.model,
+              judgeModel: r.judgeModel,
+              startedAt: r.startedAt,
+              completedAt: r.completedAt,
+              summary: r.summary,
+              hardChecks: r.hardChecks,
+              verification: r.verification,
+              llmJudgment: r.llmJudgment,
+              workflow: r.workflow,
+              git: { diffStat: r.git?.diffStat },
+            };
+          } catch { return null; }
+        })
+    );
+    return reports.filter(Boolean);
+  } catch { return []; }
+}
+
 async function expandPromptContext(text, cwd) {
   const files = [];
   let expandedText = text;
@@ -392,8 +412,14 @@ function normalizeWorkspacePath(inputPath) {
 }
 
 async function getDefaultModel() {
-  const tags = await ollamaRequest("/api/tags", { method: "GET" });
-  return tags.models?.[0]?.name || "llama3.2:latest";
+  try {
+    const tags = await ollamaRequest("/api/tags", { method: "GET" });
+    if (tags.models?.[0]?.name) return tags.models[0].name;
+  } catch {
+    // Ollama unreachable — fall back to a configured cloud model if present.
+  }
+  const all = await getProviderModels().catch(() => []);
+  return all[0]?.name || "llama3.2:latest";
 }
 
 function writeNdjson(res, payload) {

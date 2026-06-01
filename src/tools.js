@@ -40,11 +40,13 @@ export const TOOL_DEFS = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read a file\'s contents. Returns the full text. Prefer this before editing.',
+      description: 'Read a file\'s contents. Returns the full text. Prefer this before editing. Use offset/limit to read specific line ranges of large files.',
       parameters: {
         type: 'object',
         properties: {
-          path: { type: 'string', description: 'File path relative to workspace root' },
+          path:   { type: 'string',  description: 'File path relative to workspace root' },
+          offset: { type: 'integer', description: 'First line to return (1-based). Omit to start at line 1.' },
+          limit:  { type: 'integer', description: 'Maximum number of lines to return. Omit for the full file.' },
         },
         required: ['path'],
       },
@@ -128,22 +130,6 @@ export const TOOL_DEFS = [
   {
     type: 'function',
     function: {
-      name: 'grep',
-      description: 'Search for a regex pattern in files. Returns matching lines with file:line context.',
-      parameters: {
-        type: 'object',
-        properties: {
-          pattern: { type: 'string', description: 'Regex search pattern' },
-          path:    { type: 'string', description: 'File or directory to search (default: .)' },
-          include: { type: 'string', description: 'Glob to filter files, e.g. "*.js"' },
-        },
-        required: ['pattern'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
       name: 'fetch_url',
       description: 'Fetch a URL and return the readable text content.',
       parameters: {
@@ -205,7 +191,7 @@ export async function executeTool(name, args, { cwd, workspace }) {
     }
     case 'read_file': {
       if (!args.path) return 'Error: read_file requires {"path": "relative/path/to/file"}';
-      return readFile(args.path, cwd, workspace);
+      return readFile(args.path, cwd, workspace, { offset: args.offset, limit: args.limit });
     }
     case 'write_file': {
       if (!args.path) return 'Error: write_file requires {"path": "relative/path/to/file", "content": "..."}';
@@ -262,7 +248,7 @@ async function runBash(command, cwd) {
   }
 }
 
-async function readFile(filePath, cwd, workspace) {
+async function readFile(filePath, cwd, workspace, { offset, limit } = {}) {
   const abs = guardPath(filePath, cwd, workspace);
   const stat = await fsp.stat(abs);
   if (stat.isDirectory()) {
@@ -274,6 +260,17 @@ async function readFile(filePath, cwd, workspace) {
     return `Directory: ${filePath}\n${lines.join('\n')}`;
   }
   const content = await fsp.readFile(abs, 'utf8');
+  const allLines = content.split('\n');
+  const totalLines = allLines.length;
+
+  if (offset != null || limit != null) {
+    const startLine = offset != null ? Math.max(1, Number(offset)) : 1;
+    const endLine   = limit  != null ? startLine + Number(limit) - 1 : totalLines;
+    const slice = allLines.slice(startLine - 1, endLine);
+    const note  = endLine < totalLines ? `\n\n[lines ${startLine}–${Math.min(endLine, totalLines)} of ${totalLines}]` : '';
+    return slice.join('\n') + note;
+  }
+
   const LIMIT = 80_000;
   if (content.length > LIMIT) {
     return content.slice(0, LIMIT) + `\n\n[truncated — showing first ${LIMIT} of ${content.length} chars]`;
@@ -303,63 +300,30 @@ async function writeFile(filePath, content, cwd, workspace) {
 async function strReplace(filePath, oldStr, newStr, cwd, workspace) {
   const abs = guardPath(filePath, cwd, workspace);
   const current = await fsp.readFile(abs, 'utf8');
+  if (oldStr === newStr) {
+    throw new Error(`No changes: old_str and new_str are identical in ${filePath}`);
+  }
   if (!current.includes(oldStr)) {
-    const hint = buildReplaceHint(current, oldStr, newStr);
-    throw new Error(`old_str not found in ${filePath}${hint ? `\n${hint}` : ''}`);
+    throw new Error(`old_str not found in ${filePath}.${similarLinesHint(current, oldStr)}`);
   }
   const occurrences = current.split(oldStr).length - 1;
   if (occurrences > 1) {
-    const hint = buildReplaceHint(current, oldStr, newStr);
-    throw new Error(`old_str appears ${occurrences} times in ${filePath} — make it more specific${hint ? `\n${hint}` : ''}`);
+    throw new Error(`old_str appears ${occurrences} times in ${filePath} — make it more specific`);
   }
   await fsp.writeFile(abs, current.replace(oldStr, newStr), 'utf8');
   return `Replaced 1 occurrence in ${filePath}`;
 }
 
-function buildReplaceHint(content, oldStr, newStr) {
-  const snippets = findRelevantLines(content, [oldStr, newStr]).slice(0, 3);
-  if (!snippets.length) return '';
-  return [
-    'Read the file and retry with an exact old_str copied from it.',
-    'Possible matching lines:',
-    ...snippets.map(line => `- ${line}`),
-  ].join('\n');
-}
-
-function findRelevantLines(content, candidates) {
-  const lines = String(content).split('\n');
-  const wanted = new Set();
-  for (const candidate of candidates) {
-    for (const token of extractSearchTokens(candidate)) {
-      wanted.add(token);
-    }
-  }
-  if (!wanted.size) return [];
-
-  return lines.filter(line => {
-    const normalized = normalizeSearchText(line);
-    for (const token of wanted) {
-      if (normalized.includes(token)) return true;
-    }
-    return false;
-  });
-}
-
-function extractSearchTokens(value) {
-  const raw = String(value ?? '');
-  const tokens = raw
-    .split(/[^a-zA-Z0-9_]+/)
-    .map(token => token.trim())
-    .filter(token => token.length >= 3)
-    .map(normalizeSearchText);
-
-  const compact = normalizeSearchText(raw);
-  if (compact.length >= 3) tokens.push(compact);
-  return [...new Set(tokens)];
-}
-
-function normalizeSearchText(value) {
-  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+// On a failed match, surface file lines sharing old_str's first token so the model can recover.
+function similarLinesHint(content, oldStr) {
+  const firstToken = String(oldStr).trim().split(/\s+/)[0];
+  if (!firstToken || firstToken.length < 2) return '';
+  const matches = content.split('\n')
+    .map((line, i) => ({ line, n: i + 1 }))
+    .filter(({ line }) => line.includes(firstToken))
+    .slice(0, 5);
+  if (!matches.length) return '';
+  return '\nPossible matching lines:\n' + matches.map(m => `  ${m.n}: ${m.line}`).join('\n');
 }
 
 async function runGlob(pattern, cwd) {
@@ -481,6 +445,9 @@ async function patchFile(filePath, args, cwd, workspace) {
   let applied = 0;
   for (const patch of patches) {
     const { old_str: oldStr, new_str: newStr = '' } = patch;
+    if (oldStr === newStr) {
+      throw new Error(`Patch ${applied + 1}: no changes — old_str and new_str are identical in ${filePath}`);
+    }
     if (!content.includes(oldStr)) {
       throw new Error(`Patch ${applied + 1}: old_str not found in ${filePath}`);
     }

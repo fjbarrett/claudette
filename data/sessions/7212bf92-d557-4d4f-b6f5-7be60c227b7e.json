@@ -1,9 +1,0 @@
-{
-  "id": "7212bf92-d557-4d4f-b6f5-7be60c227b7e",
-  "model": "gemma4:latest",
-  "cwd": "/tmp",
-  "title": "New Session",
-  "createdAt": "2026-04-09T13:37:41.681Z",
-  "updatedAt": "2026-04-09T13:37:41.681Z",
-  "messages": []
-}
