@@ -4,8 +4,8 @@
 
 ## Context
 
-**Last Updated:** 2026-04-18
-**Stage:** Multi-provider — added Anthropic (Claude/Opus 4.8) alongside local Ollama via a provider router; benchmark harness tuned; ceiling reached on 14-16B local models for complex refactor tasks
+**Last Updated:** 2026-06-01
+**Stage:** Multi-provider trunk landed on `main` — Anthropic (Claude/Opus 4.8) alongside local Ollama via a provider router; benchmark harness tuned; ceiling reached on 14-16B local models for complex refactor tasks. `main` now == the active trunk (the parallel `ed429f4` line was superseded).
 **Purpose:** Claudette is a local AI coding assistant CLI + web server backed by Ollama
 **Structure:**
 ```
@@ -48,6 +48,7 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-04-18 | Claude | Added live token streaming (`onDelta` in agentLoop), `read_file` offset/limit line-range params, and context-size warning at ~25k tokens. Inspired by Claude Code reference. |
 | 2026-05-30 | Claude | Added Anthropic provider: `src/anthropic.js` (Messages API client w/ SSE streaming, tool_use/tool_result translation, synthesized tool ids) + `src/provider.js` router (`anthropic:` prefix → Anthropic, else Ollama). Wired CLI + web server through the router; `--model anthropic:claude-opus-4-8` now works. +10 tests. |
 | 2026-05-30 | Claude | Benchmark harness multi-provider: judge routes through the provider (`--judge anthropic:*` works, no local Ollama needed when agent+judge are both cloud); fail-fast guard when an `anthropic:*` model is requested without `ANTHROPIC_API_KEY`. Documented running Opus 4.8 on the `count-lines-tool`/`extract-print-help` ceiling tasks. |
+| 2026-06-01 | Claude | Landed the floating feature stack into `main` (PR #6). `main` had diverged onto a parallel, superseded line (`ed429f4`); merged it with `-s ours` so the active trunk's tree wins and `main` becomes an ancestor, then preserved its 3 unique artifacts (`Changelog.md` + `admin-hardening`/`permission-prompt-shortcut` bench tasks). Closed superseded PR #5; removed the stale `.ship-worktree` pinning old `main`. Tests pass except the env-dependent `GET /api/models` (needs a live provider). |
 
 ---
 
