@@ -15,10 +15,13 @@ import * as openai from './openai.js';
 import * as deepseek from './deepseek.js';
 import * as groq from './groq.js';
 import * as huggingface from './huggingface.js';
+import { catalogProviders } from './providers.js';
 
 // Cloud providers, in /models display order. Each exposes the same contract:
 // handles() · getModels() · chatStream() · hasCredentials() · KEY_ENV · LABEL.
-const CLOUD = [anthropic, openai, deepseek, groq, huggingface];
+// The bespoke modules come first; the catalog (OpenRouter, Together, Fireworks,
+// Google, xAI, Mistral, Cohere, Perplexity) supplies the long tail.
+const CLOUD = [anthropic, openai, deepseek, groq, huggingface, ...catalogProviders];
 
 // Explicit `ollama/` prefix → strip it before hitting the Ollama API.
 const OLLAMA_PREFIX = 'ollama/';

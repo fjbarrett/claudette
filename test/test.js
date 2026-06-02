@@ -123,14 +123,22 @@ describe('config.js', async () => {
     assert.equal(resolveOllamaBaseUrl({}), 'http://localhost:11434');
   });
 
-  test('resolveOllamaBaseUrl strips /v1 from OpenAI-compatible env vars', async () => {
+  test('resolveOllamaBaseUrl honours OLLAMA_HOST and strips a trailing /v1', async () => {
     const { resolveOllamaBaseUrl } = await import('../src/config.js');
     assert.equal(
-      resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'http://localhost:11434/v1/' }),
-      'http://localhost:11434'
+      resolveOllamaBaseUrl({ OLLAMA_BASE_URL: 'http://box:11434/v1/' }),
+      'http://box:11434'
     );
     assert.equal(
-      resolveOllamaBaseUrl({ OPENAI_API_BASE: 'http://localhost:11434/v1' }),
+      resolveOllamaBaseUrl({ OLLAMA_HOST: 'http://box:11434' }),
+      'http://box:11434'
+    );
+  });
+
+  test('resolveOllamaBaseUrl no longer consumes OPENAI_* (those configure the OpenAI provider)', async () => {
+    const { resolveOllamaBaseUrl } = await import('../src/config.js');
+    assert.equal(
+      resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'https://api.openai.com/v1' }),
       'http://localhost:11434'
     );
   });
@@ -1197,6 +1205,102 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
     assert.ok(handles('hf/meta-llama/Llama-3.3-70B-Instruct'));
     assert.ok(handles('huggingface/meta-llama/Llama-3.3-70B-Instruct'));
     assert.equal(stripPrefix('hf/meta-llama/Llama-3.3-70B-Instruct'), 'meta-llama/Llama-3.3-70B-Instruct');
+  });
+});
+
+describe('provider catalog (openrouter/google/xai/mistral/together/fireworks/cohere/perplexity)', async () => {
+  test('every catalog prefix routes to its catalog provider', async () => {
+    const { providerFor } = await import('../src/provider.js');
+    const { catalogProviders } = await import('../src/providers.js');
+    const byId = Object.fromEntries(catalogProviders.map(p => [p.id, p]));
+    const cases = [
+      ['openrouter/anthropic/claude-3.7-sonnet', 'openrouter'],
+      ['together/meta-llama/Llama-3.3-70B-Instruct-Turbo', 'together'],
+      ['fireworks/accounts/fireworks/models/deepseek-v3', 'fireworks'],
+      ['google/gemini-2.5-pro', 'google'],
+      ['gemini/gemini-2.5-flash', 'google'],
+      ['xai/grok-4', 'xai'],
+      ['grok/grok-3', 'xai'],
+      ['mistral/mistral-large-latest', 'mistral'],
+      ['cohere/command-a-03-2025', 'cohere'],
+      ['perplexity/sonar-pro', 'perplexity'],
+    ];
+    for (const [model, id] of cases) {
+      assert.equal(providerFor(model), byId[id], `${model} → ${id}`);
+    }
+  });
+
+  test('catalog stripPrefix removes only the leading provider segment', async () => {
+    const { catalogProviders } = await import('../src/providers.js');
+    const openrouter = catalogProviders.find(p => p.id === 'openrouter');
+    assert.equal(
+      openrouter.stripPrefix('openrouter/anthropic/claude-3.7-sonnet'),
+      'anthropic/claude-3.7-sonnet',
+    );
+  });
+
+  test('catalog models appear in the merged list only when their key is set', async () => {
+    const { getModels } = await import('../src/provider.js');
+    const prev = process.env.OPENROUTER_API_KEY;
+    try {
+      delete process.env.OPENROUTER_API_KEY;
+      let names = (await getModels()).map(m => m.name);
+      assert.ok(!names.some(n => n.startsWith('openrouter/')), 'absent without key');
+      process.env.OPENROUTER_API_KEY = 'or-test';
+      names = (await getModels()).map(m => m.name);
+      assert.ok(names.some(n => n.startsWith('openrouter/')), 'present with key');
+    } finally {
+      if (prev == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prev;
+    }
+  });
+
+  test('missingCredential flags a catalog provider without its key', async () => {
+    const { missingCredential } = await import('../src/provider.js');
+    const prev = process.env.GEMINI_API_KEY;
+    const prevAlt = process.env.GOOGLE_API_KEY;
+    try {
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.GOOGLE_API_KEY;
+      const miss = missingCredential(['google/gemini-2.5-pro']);
+      assert.equal(miss.env, 'GEMINI_API_KEY');
+      assert.equal(miss.label, 'Google Gemini');
+    } finally {
+      if (prev == null) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = prev;
+      if (prevAlt == null) delete process.env.GOOGLE_API_KEY; else process.env.GOOGLE_API_KEY = prevAlt;
+    }
+  });
+
+  test('a catalog provider streams through the shared transport (mock)', async () => {
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        const parsed = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: parsed.model } }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const prevBase = process.env.OPENROUTER_BASE_URL;
+    const prevKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    try {
+      const { chatStream } = await import('../src/provider.js');
+      const result = await chatStream({
+        model: 'openrouter/meta-llama/llama-3.3-70b-instruct',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      // The mock echoes back the model it received → confirms prefix stripped.
+      assert.equal(result.content, 'meta-llama/llama-3.3-70b-instruct');
+    } finally {
+      if (prevBase == null) delete process.env.OPENROUTER_BASE_URL; else process.env.OPENROUTER_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevKey;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
   });
 });
 

@@ -5,22 +5,27 @@
 ## Context
 
 **Last Updated:** 2026-06-01
-**Stage:** Multi-provider trunk landed on `main` — Anthropic (Claude/Opus 4.8) alongside local Ollama via a provider router; benchmark harness tuned; ceiling reached on 14-16B local models for complex refactor tasks. `main` now == the active trunk (the parallel `ed429f4` line was superseded).
-**Purpose:** Claudette is a local AI coding assistant CLI + web server backed by Ollama
+**Stage:** Cloud-first multi-provider — models addressed `provider/model`; backends for OpenAI/Anthropic/DeepSeek/Groq/HuggingFace (bespoke) + catalog (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity) over one OpenAI-compatible transport. Runs with no local Ollama. Bench harness tuned; 14-16B local ceiling on complex refactors.
+**Purpose:** Claudette is a multi-provider AI coding assistant CLI + web server (any major LLM provider or hosting platform; local Ollama optional)
 **Structure:**
 ```
 claudette.js      CLI entry point
 server.js         HTTP API + static server
 cli.js            Legacy CLI (uses server as backend)
 src/
-  config.js       Ollama base URL resolver (`localhost:11434`, OLLAMA_HOST, OpenAI-style env fallback)
+  config.js       Ollama base URL resolver (OLLAMA_BASE_URL/OLLAMA_HOST; OPENAI_* no longer routed here)
   chat.js         Main REPL, agent loop, text tool-call parser
   tools.js        Tool definitions + executors (bash/read_file/write_file/str_replace/list_dir/search_code/fetch_url/patch_file)
   session.js      Session CRUD (data/sessions/*.json)
   context.js      CLAUDE.md loader, @file expansion
   ollama.js       Ollama API client (getModels, chatStream)
-  anthropic.js    Anthropic Messages API client (same chatStream contract)
-  provider.js     Routes models to Ollama or Anthropic by `anthropic:` prefix
+  anthropic.js    Anthropic Messages API client (native; anthropic/ + legacy anthropic:)
+  openai.js       OpenAI adapter + shared OpenAI-compatible Chat Completions transport + provider factory
+  deepseek.js     DeepSeek adapter (deepseek/) — reuses openai.js transport
+  groq.js         Groq adapter (groq/, hosted Llama) — reuses openai.js transport
+  huggingface.js  HuggingFace router adapter (hf/) — reuses openai.js transport
+  providers.js    Catalog of OpenAI-compatible providers (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity)
+  provider.js     Registry router: provider/model -> backend; bare/ollama/ -> Ollama; missingCredential()
   ui.js           ANSI terminal rendering, spinner
 bench/            Benchmark harness + isolated worktree runs + reports
 data/sessions/    Persisted session JSON files
@@ -49,6 +54,7 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-05-30 | Claude | Added Anthropic provider: `src/anthropic.js` (Messages API client w/ SSE streaming, tool_use/tool_result translation, synthesized tool ids) + `src/provider.js` router (`anthropic:` prefix → Anthropic, else Ollama). Wired CLI + web server through the router; `--model anthropic:claude-opus-4-8` now works. +10 tests. |
 | 2026-05-30 | Claude | Benchmark harness multi-provider: judge routes through the provider (`--judge anthropic:*` works, no local Ollama needed when agent+judge are both cloud); fail-fast guard when an `anthropic:*` model is requested without `ANTHROPIC_API_KEY`. Documented running Opus 4.8 on the `count-lines-tool`/`extract-print-help` ceiling tasks. |
 | 2026-06-01 | Claude | Landed the floating feature stack into `main` (PR #6). `main` had diverged onto a parallel, superseded line (`ed429f4`); merged it with `-s ours` so the active trunk's tree wins and `main` becomes an ancestor, then preserved its 3 unique artifacts (`Changelog.md` + `admin-hardening`/`permission-prompt-shortcut` bench tasks). Closed superseded PR #5; removed the stale `.ship-worktree` pinning old `main`. Tests pass except the env-dependent `GET /api/models` (needs a live provider). |
+| 2026-06-01 | Claude | Multi-provider expansion: `provider/model` slash addressing; bespoke OpenAI/DeepSeek/Groq/HuggingFace adapters over one OpenAI-compatible transport (`src/openai.js`) + catalog (`src/providers.js`: OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity). Registry router; `missingCredential()` guard. `OPENAI_BASE_URL` no longer routes Ollama (collision fix in config.js). Cloud-first (no Ollama needed). +18 tests. Researched terminal-bench, lm-eval-harness, HELM, KIRA, opencode for design (see TODO). |
 
 ---
 
@@ -60,7 +66,7 @@ test/test.js      Comprehensive test suite + config coverage
 | `node claudette.js --model <name>` | Start CLI with specific model |
 | `node claudette.js -y` | Start CLI with auto-approve for all tool calls |
 | `node server.js` | Start web server on port 4321 |
-| `NODE_ENV=test node --test test/test.js` | Run full test suite (~45s, no transcripts written) |
+| `NODE_ENV=test node --test test/test.js` | Run full test suite (~45-90s; spawns server+CLI subprocesses. Run ONE at a time — server tests bind fixed port 14322, so concurrent runs conflict) |
 | `OLLAMA_BASE_URL=http://localhost:11434 node claudette.js --model gemma4:latest` | Point CLI at the SSH-tunneled Ollama endpoint explicitly |
 | `npm run bench:gemma` | Run all benchmark tasks against gemma4 with live output |
 | `npm run bench -- --task <id> --model gemma4:latest --verbose` | Run one task with live output |
@@ -81,3 +87,13 @@ test/test.js      Comprehensive test suite + config coverage
 - Re-run full benchmark matrix after any model upgrade.
 
 ### Feature Ideas
+
+**Multi-provider roadmap (from terminal-bench / lm-eval-harness / HELM / KIRA / opencode research):**
+- _Highest leverage (opencode):_ consider building the model layer on the Vercel AI SDK provider packages + Models.dev metadata, with `@ai-sdk/openai-compatible` as the generic BYO-endpoint path — collapses most hand-maintained provider code and gives 75+ providers + model limits/cost for ~free.
+- Split secrets out of env/config into a credentials store + interactive `claudette auth login` (provider menu, OAuth *and* pasted keys). Anthropic Claude-subscription OAuth worth supporting.
+- `$schema` JSONC config, deep-merged global→project, with `{env:VAR}` substitution; `small_model` slot for cheap auxiliary calls (judge titles/summaries) to cut bench cost.
+- Per-provider config: `baseURL`/`apiKey`/`headers` + capability flags (`supportsTools`, `chatOnly`, pricing) + `concurrency`/`maxRetries`/`timeout` with exponential backoff (lm-eval).
+- Permissions map (`allow`/`ask`/`deny`, glob-matched bash, last-match-wins, per-agent merge) + `external_directory` guard (opencode).
+- **Bench harness upgrades:** request cache keyed on the full request (model+messages+params+tools) for cheap deterministic reruns + offline re-judging (HELM/lm-eval); declarative YAML tasks auto-registered + versioned, with `tag`/`group` suites; resumable run dirs (skip-completed, continue-on-error); separate `summarize` step → versioned leaderboard JSON the web UI reads; multi-metric result vector (correctness + tokens + cost + tool-calls + safety/diff-discipline), not one score.
+- **Agent loop (KIRA):** per-step token+cost trajectory; two-phase "are you sure?" completion gate with a test/QA/user checklist (reusable as a judge rubric); graceful context-overflow fallback (summarize → minimal-context retry); structured `analysis`/`plan` fields inside the action tool schema.
+- Adopt opencode's one-server-many-clients shape: OpenAPI spec + SSE events; `--attach` a warm server for the bench harness to skip per-prompt boot.

@@ -7,11 +7,12 @@ function stripOpenAiSuffix(value) {
 }
 
 export function resolveOllamaBaseUrl(env = process.env) {
+  // Ollama-only. The OpenAI-compatible env vars (OPENAI_BASE_URL/OPENAI_API_BASE)
+  // used to fall through here, but they now configure the dedicated OpenAI
+  // provider (src/openai.js) — routing both to one base would collide.
   const raw =
     env.OLLAMA_BASE_URL ??
     env.OLLAMA_HOST ??
-    env.OPENAI_BASE_URL ??
-    env.OPENAI_API_BASE ??
     'http://localhost:11434';
 
   const cleaned = trimTrailingSlash(String(raw).trim());

@@ -100,6 +100,71 @@ export async function chatCompletionsStream({
   return result;
 }
 
+// ─── Provider factory ────────────────────────────────────────────────────────
+
+/**
+ * Build a provider module (same shape as the bespoke adapters) for any
+ * OpenAI-compatible, Bearer-authenticated endpoint. Used by src/providers.js to
+ * register the long tail of frontier providers and hosting platforms from a
+ * single catalog table. Any row can be promoted to a bespoke file later if it
+ * grows provider-specific quirks.
+ *
+ *   prefixes   — addressing prefixes, e.g. ['openrouter/'] (first is canonical)
+ *   keyEnv     — primary API-key env var; altKeyEnvs are accepted fallbacks
+ *   baseUrl    — default endpoint incl. version segment (…/v1); /chat/completions
+ *                is appended. Overridable via baseUrlEnv (handy for tests/proxies)
+ *   models     — starter ids surfaced in /models (non-authoritative)
+ */
+export function makeOpenAICompatibleProvider({
+  id, label, prefixes, keyEnv, altKeyEnvs = [], baseUrl, baseUrlEnv, family, models = [],
+}) {
+  const pres = Array.isArray(prefixes) ? prefixes : [prefixes];
+  const keyEnvs = [keyEnv, ...altKeyEnvs];
+  const readKey = () => {
+    for (const k of keyEnvs) if (process.env[k]) return process.env[k];
+    return '';
+  };
+  const readBase = () =>
+    ((baseUrlEnv && process.env[baseUrlEnv]) || baseUrl).replace(/\/+$/, '');
+
+  const handles = m => typeof m === 'string' && pres.some(p => m.startsWith(p));
+  const stripPrefix = m => {
+    const p = typeof m === 'string' && pres.find(pre => m.startsWith(pre));
+    return p ? m.slice(p.length) : m;
+  };
+  const hasCredentials = () => Boolean(readKey());
+
+  return {
+    id,
+    LABEL: label,
+    KEY_ENV: keyEnv,
+    handles,
+    stripPrefix,
+    hasCredentials,
+    async getModels() {
+      if (!hasCredentials()) return [];
+      return models.map(idStr => ({
+        name: `${pres[0]}${idStr}`,
+        size: 0,
+        family: family ?? id,
+        paramSize: 'cloud',
+        modified: null,
+      }));
+    },
+    async chatStream({ model, messages, tools = [], onDelta, signal }) {
+      if (!hasCredentials()) {
+        throw new Error(`${keyEnv} is not set — cannot reach ${label}`);
+      }
+      return chatCompletionsStream({
+        baseUrl: readBase(),
+        apiKey: readKey(),
+        model: stripPrefix(model),
+        messages, tools, onDelta, signal, label,
+      });
+    },
+  };
+}
+
 // ─── Format translation ──────────────────────────────────────────────────────
 
 function asText(content) {
