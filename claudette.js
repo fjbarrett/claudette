@@ -8,6 +8,7 @@
  *   node claudette.js --model qwen2.5-coder:32b
  *   node claudette.js -y                      # auto-approve all tool calls
  */
+import './src/env-autoload.js'; // load .env before anything reads process.env
 import { start } from './src/chat.js';
 
 start().catch(err => {

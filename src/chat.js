@@ -51,10 +51,12 @@ export async function start() {
     if (!models.length) throw new Error('No models available');
   } catch (err) {
     ui.printError(
-      `No models available.\n` +
-      `  Start Ollama (${process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'}) ` +
-      `or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ` +
-      `GROQ_API_KEY, HF_TOKEN) to use cloud models.\n  ${err.message}`
+      `No models available — add a provider key to get started:\n` +
+      `  1. cp .env.example .env\n` +
+      `  2. put one key in .env  (OPENROUTER_API_KEY is easiest — one key, every provider)\n` +
+      `  3. claudette --model openrouter/anthropic/claude-3.7-sonnet\n` +
+      `Or run a local model with Ollama (${process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'}).\n` +
+      `  ${err.message}`
     );
     exit(1);
   }

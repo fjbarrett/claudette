@@ -12,6 +12,20 @@ Fireworks, Groq, HuggingFace), or local models via Ollama. No local GPU required
 - Persistent JSON session storage in `data/sessions`
 - `@relative/path` file expansion so prompts can inline workspace files
 
+## Setup
+
+You need one provider key. Copy the example env file and add a key — `.env` is
+autoloaded on start (and gitignored), so you don't re-export anything:
+
+```bash
+cp .env.example .env
+# edit .env — the easiest is OPENROUTER_API_KEY (one key, every major provider)
+```
+
+A real shell env var still overrides `.env`. No key? Run a local model with
+Ollama instead (bare model ids like `qwen2.5-coder:14b`). See
+[Models & providers](#models--providers) for the full list.
+
 ## Run
 
 ```bash

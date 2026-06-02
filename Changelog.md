@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- First-run setup via a gitignored `.env`: a zero-dependency loader (`src/env.js`)
+  autoloads `.env` (package root → cwd → `~/.config/claudette`) before any module
+  reads `process.env`; a real shell var always wins. Ships `.env.example`
+  cataloging every provider key, and the "no models" message now walks you through
+  `cp .env.example .env` + OpenRouter.
 - Multi-provider model layer addressed `provider/model` (LiteLLM / terminal-bench
   style). New backends: OpenAI, DeepSeek, Groq, HuggingFace (bespoke modules) plus
   a provider catalog (`src/providers.js`) for OpenRouter, Together, Fireworks,

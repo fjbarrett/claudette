@@ -144,6 +144,50 @@ describe('config.js', async () => {
   });
 });
 
+describe('env.js (.env loader)', async () => {
+  test('parseEnv handles export, quotes, comments, spaces, and = in values', async () => {
+    const { parseEnv } = await import('../src/env.js');
+    const parsed = parseEnv([
+      '# a comment',
+      '',
+      'export A=1',
+      'B = "two words"',
+      "C='single'",
+      'D=a=b=c',
+      'EMPTY=',
+      'NOEQUALS',
+    ].join('\n'));
+    assert.deepEqual(parsed, { A: '1', B: 'two words', C: 'single', D: 'a=b=c', EMPTY: '' });
+  });
+
+  test('loadEnv applies file keys, never overrides real env, earlier file wins', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-env-'));
+    const high = path.join(dir, 'high.env');
+    const low = path.join(dir, 'low.env');
+    await fsp.writeFile(high, 'SHARED=from_high\nONLY_HIGH=h\n');
+    await fsp.writeFile(low, 'SHARED=from_low\nONLY_LOW=l\nPRESET=should_not_win\n');
+    const { loadEnv } = await import('../src/env.js');
+    const env = { PRESET: 'real' };
+    const applied = loadEnv({ env, files: [high, low] });
+    try {
+      assert.equal(env.SHARED, 'from_high', 'earlier file wins');
+      assert.equal(env.ONLY_HIGH, 'h');
+      assert.equal(env.ONLY_LOW, 'l');
+      assert.equal(env.PRESET, 'real', 'real env not overridden');
+      assert.ok(applied.includes('SHARED') && applied.includes('ONLY_LOW'));
+      assert.ok(!applied.includes('PRESET'), 'preset not reported as applied');
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('loadEnv skips missing files without throwing', async () => {
+    const { loadEnv } = await import('../src/env.js');
+    const applied = loadEnv({ env: {}, files: ['/no/such/path/.env'] });
+    assert.deepEqual(applied, []);
+  });
+});
+
 // ─── Session module tests ─────────────────────────────────────────────────────
 
 describe('session.js', async () => {
