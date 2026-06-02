@@ -5,8 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { resolveOllamaBaseUrl } from '../src/config.js';
-import { chatStream } from '../src/provider.js';
-import { isAnthropicModel } from '../src/anthropic.js';
+import { chatStream, missingCredential } from '../src/provider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -43,8 +42,9 @@ async function main() {
 
   // Fail fast (before spinning up worktrees) if a cloud model is requested
   // without credentials, rather than erroring mid-run.
-  if ([...models, judgeModel].some(isAnthropicModel) && !process.env.ANTHROPIC_API_KEY) {
-    throw new Error('An anthropic:* model was requested but ANTHROPIC_API_KEY is not set.');
+  const missing = missingCredential([...models, judgeModel]);
+  if (missing) {
+    throw new Error(`A ${missing.label} model (${missing.model}) was requested but ${missing.env} is not set.`);
   }
 
   await fs.mkdir(WORKTREES_DIR, { recursive: true });

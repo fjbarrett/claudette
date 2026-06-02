@@ -2,11 +2,18 @@
 //
 // Mirrors the ollama.js chatStream() contract so the agent loop, server, and
 // benchmark harness can stream from Claude models transparently. Models are
-// addressed with an `anthropic:` prefix (e.g. `anthropic:claude-opus-4-8`);
-// the prefix is stripped before hitting the API.
+// addressed `anthropic/claude-opus-4-8` (legacy `anthropic:` colon form still
+// accepted); the prefix is stripped before hitting the API.
 
-const PREFIX = 'anthropic:';
+// Canonical addressing is `anthropic/<id>`; the legacy `anthropic:<id>` colon
+// form is still accepted as an input alias.
+const PREFIX = 'anthropic/';
+const LEGACY_PREFIX = 'anthropic:';
 const API_VERSION = '2023-06-01';
+
+export const KEY_ENV = 'ANTHROPIC_API_KEY';
+export const LABEL = 'Anthropic';
+export const id = 'anthropic';
 
 // Current Claude models surfaced when ANTHROPIC_API_KEY is set.
 const KNOWN_MODELS = [
@@ -24,12 +31,18 @@ function apiKey() {
   return process.env.ANTHROPIC_API_KEY ?? '';
 }
 
-export function isAnthropicModel(model) {
-  return typeof model === 'string' && model.startsWith(PREFIX);
+export function handles(model) {
+  return typeof model === 'string'
+    && (model.startsWith(PREFIX) || model.startsWith(LEGACY_PREFIX));
 }
+// Back-compat alias for the original export name.
+export const isAnthropicModel = handles;
 
 export function stripPrefix(model) {
-  return isAnthropicModel(model) ? model.slice(PREFIX.length) : model;
+  if (typeof model !== 'string') return model;
+  if (model.startsWith(PREFIX)) return model.slice(PREFIX.length);
+  if (model.startsWith(LEGACY_PREFIX)) return model.slice(LEGACY_PREFIX.length);
+  return model;
 }
 
 export function hasCredentials() {
@@ -39,7 +52,7 @@ export function hasCredentials() {
 export async function getModels() {
   if (!hasCredentials()) return [];
   return KNOWN_MODELS.map(m => ({
-    name: `${PREFIX}${m.id}`,
+    name: `${PREFIX}${m.id}`,   // canonical `anthropic/<id>`
     size: 0,
     family: 'anthropic',
     paramSize: m.paramSize,
