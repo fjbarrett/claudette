@@ -4,3 +4,6 @@ bench/scratch/
 data/sessions/
 data/transcripts/
 .ship-worktree/
+.env
+.env.*
+!.env.example

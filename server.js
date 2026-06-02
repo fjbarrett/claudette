@@ -1,3 +1,4 @@
+import "./src/env-autoload.js"; // load .env before anything reads process.env
 import http from "node:http";
 import fs from "node:fs";
 import fsp from "node:fs/promises";

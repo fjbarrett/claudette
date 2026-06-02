@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import '../src/env-autoload.js'; // load .env before anything reads process.env
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
