@@ -53,7 +53,8 @@ export async function start() {
     ui.printError(
       `No models available.\n` +
       `  Start Ollama (${process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'}) ` +
-      `or set ANTHROPIC_API_KEY to use anthropic:* models.\n  ${err.message}`
+      `or set a provider key (ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY, ` +
+      `GROQ_API_KEY, HF_TOKEN) to use cloud models.\n  ${err.message}`
     );
     exit(1);
   }
@@ -387,7 +388,7 @@ async function handleCommand(line, rl) {
       ui.table('Commands', [
         ['Setup & Config'],
         ['/model [name]',    'Show or switch the active model'],
-        ['/models',          'List all available models (Ollama + anthropic:*)'],
+        ['/models',          'List all available models (Ollama + cloud providers)'],
         ['/config',          'Show current configuration'],
         ['/tools',           'Toggle tool calling on/off'],
 

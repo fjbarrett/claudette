@@ -61,29 +61,32 @@ Choose a different judge model:
 npm run bench -- --task admin-hardening --model gemma4:latest --judge qwen2.5:latest
 ```
 
-### Cloud models (Anthropic / Opus 4.8)
+### Cloud models (any provider)
 
 Both the agent model (`--model`) and the judge (`--judge`) route through the
-provider, so `anthropic:*` ids work anywhere a model id is accepted. Set a key
-first; the harness fails fast if an `anthropic:*` model is requested without one.
+provider layer, so any `provider/model` id works anywhere a model id is accepted
+(`anthropic/…`, `openai/…`, `openrouter/…`, `groq/…`, …). Set the matching key
+first; the harness fails fast (before spinning up worktrees) if a cloud model is
+requested without its key.
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Run Opus 4.8 on the two tasks where local 14–16B models hit a ceiling,
 # judged by Sonnet so the judge doesn't depend on a local Ollama:
-npm run bench -- --task count-lines-tool --model anthropic:claude-opus-4-8 \
-  --judge anthropic:claude-sonnet-4-6 --verbose
-npm run bench -- --task extract-print-help --model anthropic:claude-opus-4-8 \
-  --judge anthropic:claude-sonnet-4-6 --verbose
+npm run bench -- --task count-lines-tool --model anthropic/claude-opus-4-8 \
+  --judge anthropic/claude-sonnet-4-6 --verbose
+npm run bench -- --task extract-print-help --model anthropic/claude-opus-4-8 \
+  --judge anthropic/claude-sonnet-4-6 --verbose
 
-# Head-to-head against a local model on the same task:
+# Head-to-head across providers on the same task (no local GPU needed):
 npm run bench -- --task count-lines-tool \
-  --model anthropic:claude-opus-4-8 --model qwen2.5-coder:14b \
-  --judge anthropic:claude-sonnet-4-6
+  --model anthropic/claude-opus-4-8 --model openai/gpt-4o \
+  --model openrouter/meta-llama/llama-3.3-70b-instruct \
+  --judge anthropic/claude-sonnet-4-6
 ```
 
-This needs no local Ollama when both `--model` and `--judge` are `anthropic:*`.
+This needs no local Ollama when `--model` and `--judge` are all cloud ids.
 After a run, refresh the leaderboard with `npm run bench:leaderboard`.
 
 ## Tasks

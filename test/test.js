@@ -123,14 +123,22 @@ describe('config.js', async () => {
     assert.equal(resolveOllamaBaseUrl({}), 'http://localhost:11434');
   });
 
-  test('resolveOllamaBaseUrl strips /v1 from OpenAI-compatible env vars', async () => {
+  test('resolveOllamaBaseUrl honours OLLAMA_HOST and strips a trailing /v1', async () => {
     const { resolveOllamaBaseUrl } = await import('../src/config.js');
     assert.equal(
-      resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'http://localhost:11434/v1/' }),
-      'http://localhost:11434'
+      resolveOllamaBaseUrl({ OLLAMA_BASE_URL: 'http://box:11434/v1/' }),
+      'http://box:11434'
     );
     assert.equal(
-      resolveOllamaBaseUrl({ OPENAI_API_BASE: 'http://localhost:11434/v1' }),
+      resolveOllamaBaseUrl({ OLLAMA_HOST: 'http://box:11434' }),
+      'http://box:11434'
+    );
+  });
+
+  test('resolveOllamaBaseUrl no longer consumes OPENAI_* (those configure the OpenAI provider)', async () => {
+    const { resolveOllamaBaseUrl } = await import('../src/config.js');
+    assert.equal(
+      resolveOllamaBaseUrl({ OPENAI_BASE_URL: 'https://api.openai.com/v1' }),
       'http://localhost:11434'
     );
   });
@@ -895,7 +903,7 @@ describe('anthropic.js', async () => {
     assert.deepEqual(out[0].input_schema.required, ['command']);
   });
 
-  test('getModels returns anthropic:* models only when ANTHROPIC_API_KEY is set', async () => {
+  test('getModels returns anthropic/* models only when ANTHROPIC_API_KEY is set', async () => {
     const { getModels } = await import('../src/anthropic.js');
     const prev = process.env.ANTHROPIC_API_KEY;
     try {
@@ -904,12 +912,21 @@ describe('anthropic.js', async () => {
       process.env.ANTHROPIC_API_KEY = 'test-key';
       const models = await getModels();
       assert.ok(models.length >= 1);
-      assert.ok(models.every(m => m.name.startsWith('anthropic:')));
-      assert.ok(models.some(m => m.name === 'anthropic:claude-opus-4-8'));
+      assert.ok(models.every(m => m.name.startsWith('anthropic/')), 'canonical slash form');
+      assert.ok(models.some(m => m.name === 'anthropic/claude-opus-4-8'));
     } finally {
       if (prev == null) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = prev;
     }
+  });
+
+  test('handles accepts both anthropic/ and legacy anthropic: forms', async () => {
+    const { handles, stripPrefix } = await import('../src/anthropic.js');
+    assert.ok(handles('anthropic/claude-opus-4-8'));
+    assert.ok(handles('anthropic:claude-opus-4-8'), 'legacy colon alias');
+    assert.equal(handles('qwen2.5-coder:14b'), false);
+    assert.equal(stripPrefix('anthropic/claude-opus-4-8'), 'claude-opus-4-8');
+    assert.equal(stripPrefix('anthropic:claude-opus-4-8'), 'claude-opus-4-8');
   });
 
   test('chatStream parses SSE text deltas and tool_use blocks', async () => {
@@ -993,24 +1010,296 @@ describe('anthropic.js', async () => {
 });
 
 describe('provider.js', async () => {
-  test('providerFor routes by model prefix', async () => {
+  test('providerFor routes provider/model prefixes to the right backend', async () => {
     const { providerFor } = await import('../src/provider.js');
     const anthropic = await import('../src/anthropic.js');
+    const openai = await import('../src/openai.js');
+    const deepseek = await import('../src/deepseek.js');
+    const groq = await import('../src/groq.js');
+    const huggingface = await import('../src/huggingface.js');
     const ollama = await import('../src/ollama.js');
-    assert.equal(providerFor('anthropic:claude-opus-4-8').chatStream, anthropic.chatStream);
+
+    assert.equal(providerFor('anthropic/claude-opus-4-8').chatStream, anthropic.chatStream);
+    assert.equal(providerFor('anthropic:claude-opus-4-8').chatStream, anthropic.chatStream, 'legacy colon');
+    assert.equal(providerFor('openai/gpt-4o').chatStream, openai.chatStream);
+    assert.equal(providerFor('deepseek/deepseek-reasoner').chatStream, deepseek.chatStream);
+    assert.equal(providerFor('groq/llama-3.3-70b-versatile').chatStream, groq.chatStream);
+    assert.equal(providerFor('hf/meta-llama/Llama-3.3-70B-Instruct').chatStream, huggingface.chatStream);
+    // Bare names and explicit ollama/ prefix → Ollama. So do unknown org/model
+    // ids (e.g. a HuggingFace-style local Ollama pull) that lack a known prefix.
     assert.equal(providerFor('qwen2.5-coder:14b').chatStream, ollama.chatStream);
+    assert.equal(providerFor('ollama/llama3.2').chatStream, ollama.chatStream);
+    assert.equal(providerFor('some-org/some-model').chatStream, ollama.chatStream);
   });
 
-  test('getModels includes anthropic models when ANTHROPIC_API_KEY is set', async () => {
+  test('getModels merges cloud providers (only those with a key set)', async () => {
     const { getModels } = await import('../src/provider.js');
-    const prev = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = 'test-key';
+    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'GROQ_API_KEY', 'HF_TOKEN'];
+    const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+    process.env.ANTHROPIC_API_KEY = 'k';
+    process.env.OPENAI_API_KEY = 'k';
+    delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.GROQ_API_KEY;
+    delete process.env.HF_TOKEN;
     try {
       const models = await getModels();
-      assert.ok(models.some(m => m.name === 'anthropic:claude-opus-4-8'),
-        'anthropic models present in merged list even if Ollama contributes none');
+      const names = models.map(m => m.name);
+      assert.ok(names.includes('anthropic/claude-opus-4-8'), 'anthropic present');
+      assert.ok(names.includes('openai/gpt-4o'), 'openai present');
+      assert.ok(!names.some(n => n.startsWith('deepseek/')), 'deepseek absent without key');
+      assert.ok(!names.some(n => n.startsWith('groq/')), 'groq absent without key');
     } finally {
-      if (prev == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prev;
+      for (const k of keys) { if (prev[k] == null) delete process.env[k]; else process.env[k] = prev[k]; }
+    }
+  });
+
+  test('missingCredential flags the first cloud model without a key, ignores Ollama', async () => {
+    const { missingCredential } = await import('../src/provider.js');
+    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY'];
+    const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+    process.env.ANTHROPIC_API_KEY = 'k';
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    try {
+      assert.equal(missingCredential(['qwen2.5-coder:14b', 'anthropic/claude-opus-4-8']), null,
+        'all reachable → null');
+      const miss = missingCredential(['ollama/llama3.2', 'openai/gpt-4o']);
+      assert.equal(miss.model, 'openai/gpt-4o');
+      assert.equal(miss.env, 'OPENAI_API_KEY');
+      assert.equal(miss.label, 'OpenAI');
+    } finally {
+      for (const k of keys) { if (prev[k] == null) delete process.env[k]; else process.env[k] = prev[k]; }
+    }
+  });
+});
+
+describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async () => {
+  // Build a one-shot mock /chat/completions SSE server. Returns { url, get() }.
+  function mockChatServer(events) {
+    let captured = { auth: null, body: null, path: null };
+    const server = http.createServer((req, res) => {
+      captured.path = req.url;
+      captured.auth = req.headers['authorization'];
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        captured.body = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        for (const e of events) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    return { server, captured };
+  }
+
+  // Helpers keep the Chat Completions SSE nesting unambiguous.
+  const txt = content => ({ choices: [{ index: 0, delta: { content } }] });
+  const tc = partial => ({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, ...partial }] } }] });
+  const SSE_EVENTS = [
+    txt('Hello '),
+    txt('world'),
+    tc({ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '' } }),
+    tc({ function: { arguments: '{"path":' } }),
+    tc({ function: { arguments: '"README.md"}' } }),
+    { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 11, completion_tokens: 22 } },
+  ];
+
+  test('openai chatStream streams text + tool_calls and strips the prefix', async () => {
+    const { server, captured } = mockChatServer(SSE_EVENTS);
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const prevBase = process.env.OPENAI_BASE_URL;
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.OPENAI_API_KEY = 'sk-test';
+    const deltas = [];
+    try {
+      const { chatStream } = await import('../src/openai.js');
+      const result = await chatStream({
+        model: 'openai/gpt-4o',
+        messages: [
+          { role: 'system', content: 'be brief' },
+          { role: 'user', content: 'hi' },
+        ],
+        tools: [{ type: 'function', function: { name: 'read_file', description: 'read', parameters: { type: 'object', properties: {} } } }],
+        onDelta: d => deltas.push(d),
+      });
+      assert.equal(result.content, 'Hello world');
+      assert.equal(deltas.join(''), 'Hello world');
+      assert.equal(result.toolCalls.length, 1);
+      assert.equal(result.toolCalls[0].function.name, 'read_file');
+      assert.deepEqual(result.toolCalls[0].function.arguments, { path: 'README.md' });
+      assert.equal(result.promptTokens, 11);
+      assert.equal(result.completionTokens, 22);
+      assert.equal(result.toolMode, 'native');
+      assert.equal(captured.path, '/chat/completions');
+      assert.equal(captured.auth, 'Bearer sk-test');
+      assert.equal(captured.body.model, 'gpt-4o', 'openai/ prefix stripped');
+      assert.equal(captured.body.messages[0].role, 'system');
+      assert.ok(captured.body.tools, 'tools forwarded');
+    } finally {
+      if (prevBase == null) delete process.env.OPENAI_BASE_URL; else process.env.OPENAI_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('deepseek chatStream reuses the transport with its own base/key/prefix', async () => {
+    const { server, captured } = mockChatServer([
+      { choices: [{ index: 0, delta: { content: 'ok' } }] },
+    ]);
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const prevBase = process.env.DEEPSEEK_BASE_URL;
+    const prevKey = process.env.DEEPSEEK_API_KEY;
+    process.env.DEEPSEEK_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.DEEPSEEK_API_KEY = 'ds-test';
+    try {
+      const { chatStream } = await import('../src/deepseek.js');
+      const result = await chatStream({
+        model: 'deepseek/deepseek-reasoner',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(result.content, 'ok');
+      assert.equal(captured.auth, 'Bearer ds-test');
+      assert.equal(captured.body.model, 'deepseek-reasoner', 'deepseek/ prefix stripped');
+    } finally {
+      if (prevBase == null) delete process.env.DEEPSEEK_BASE_URL; else process.env.DEEPSEEK_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prevKey;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('chatStream throws without credentials', async () => {
+    const { chatStream } = await import('../src/openai.js');
+    const prev = process.env.OPENAI_API_KEY;
+    try {
+      delete process.env.OPENAI_API_KEY;
+      await assert.rejects(
+        () => chatStream({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'hi' }] }),
+        /OPENAI_API_KEY/
+      );
+    } finally {
+      if (prev == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prev;
+    }
+  });
+
+  test('toOpenAIMessages aligns tool_call_id positionally and stringifies args', async () => {
+    const { toOpenAIMessages } = await import('../src/openai.js');
+    const out = toOpenAIMessages([
+      { role: 'user', content: 'read it' },
+      { role: 'assistant', content: '', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'a.js' } } }] },
+      { role: 'tool', content: 'file body' },
+    ]);
+    const asst = out.find(m => m.role === 'assistant');
+    const tool = out.find(m => m.role === 'tool');
+    assert.equal(asst.tool_calls.length, 1);
+    assert.equal(typeof asst.tool_calls[0].function.arguments, 'string', 'args serialised');
+    assert.equal(asst.tool_calls[0].function.arguments, '{"path":"a.js"}');
+    assert.equal(tool.tool_call_id, asst.tool_calls[0].id, 'result id matches the call id');
+  });
+
+  test('huggingface strips only the leading hf/ segment (ids keep their slash)', async () => {
+    const { stripPrefix, handles } = await import('../src/huggingface.js');
+    assert.ok(handles('hf/meta-llama/Llama-3.3-70B-Instruct'));
+    assert.ok(handles('huggingface/meta-llama/Llama-3.3-70B-Instruct'));
+    assert.equal(stripPrefix('hf/meta-llama/Llama-3.3-70B-Instruct'), 'meta-llama/Llama-3.3-70B-Instruct');
+  });
+});
+
+describe('provider catalog (openrouter/google/xai/mistral/together/fireworks/cohere/perplexity)', async () => {
+  test('every catalog prefix routes to its catalog provider', async () => {
+    const { providerFor } = await import('../src/provider.js');
+    const { catalogProviders } = await import('../src/providers.js');
+    const byId = Object.fromEntries(catalogProviders.map(p => [p.id, p]));
+    const cases = [
+      ['openrouter/anthropic/claude-3.7-sonnet', 'openrouter'],
+      ['together/meta-llama/Llama-3.3-70B-Instruct-Turbo', 'together'],
+      ['fireworks/accounts/fireworks/models/deepseek-v3', 'fireworks'],
+      ['google/gemini-2.5-pro', 'google'],
+      ['gemini/gemini-2.5-flash', 'google'],
+      ['xai/grok-4', 'xai'],
+      ['grok/grok-3', 'xai'],
+      ['mistral/mistral-large-latest', 'mistral'],
+      ['cohere/command-a-03-2025', 'cohere'],
+      ['perplexity/sonar-pro', 'perplexity'],
+    ];
+    for (const [model, id] of cases) {
+      assert.equal(providerFor(model), byId[id], `${model} → ${id}`);
+    }
+  });
+
+  test('catalog stripPrefix removes only the leading provider segment', async () => {
+    const { catalogProviders } = await import('../src/providers.js');
+    const openrouter = catalogProviders.find(p => p.id === 'openrouter');
+    assert.equal(
+      openrouter.stripPrefix('openrouter/anthropic/claude-3.7-sonnet'),
+      'anthropic/claude-3.7-sonnet',
+    );
+  });
+
+  test('catalog models appear in the merged list only when their key is set', async () => {
+    const { getModels } = await import('../src/provider.js');
+    const prev = process.env.OPENROUTER_API_KEY;
+    try {
+      delete process.env.OPENROUTER_API_KEY;
+      let names = (await getModels()).map(m => m.name);
+      assert.ok(!names.some(n => n.startsWith('openrouter/')), 'absent without key');
+      process.env.OPENROUTER_API_KEY = 'or-test';
+      names = (await getModels()).map(m => m.name);
+      assert.ok(names.some(n => n.startsWith('openrouter/')), 'present with key');
+    } finally {
+      if (prev == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prev;
+    }
+  });
+
+  test('missingCredential flags a catalog provider without its key', async () => {
+    const { missingCredential } = await import('../src/provider.js');
+    const prev = process.env.GEMINI_API_KEY;
+    const prevAlt = process.env.GOOGLE_API_KEY;
+    try {
+      delete process.env.GEMINI_API_KEY;
+      delete process.env.GOOGLE_API_KEY;
+      const miss = missingCredential(['google/gemini-2.5-pro']);
+      assert.equal(miss.env, 'GEMINI_API_KEY');
+      assert.equal(miss.label, 'Google Gemini');
+    } finally {
+      if (prev == null) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = prev;
+      if (prevAlt == null) delete process.env.GOOGLE_API_KEY; else process.env.GOOGLE_API_KEY = prevAlt;
+    }
+  });
+
+  test('a catalog provider streams through the shared transport (mock)', async () => {
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        const parsed = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: parsed.model } }] })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const prevBase = process.env.OPENROUTER_BASE_URL;
+    const prevKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    try {
+      const { chatStream } = await import('../src/provider.js');
+      const result = await chatStream({
+        model: 'openrouter/meta-llama/llama-3.3-70b-instruct',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      // The mock echoes back the model it received → confirms prefix stripped.
+      assert.equal(result.content, 'meta-llama/llama-3.3-70b-instruct');
+    } finally {
+      if (prevBase == null) delete process.env.OPENROUTER_BASE_URL; else process.env.OPENROUTER_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevKey;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
   });
 });
