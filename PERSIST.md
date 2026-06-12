@@ -61,6 +61,9 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-06-12 | Claude | Cloud-first bench defaults + SSE hang fix (PR #13): providers declare `DEFAULT_MODELS` (anthropic/claude-opus-4-8 + sonnet judge; openai/gpt-4o + 4o-mini judge); `defaultCloudModels()` in provider.js; bench agent/judge defaults resolve cloud-first, Ollama fallback w/ 3s timeout. Fixed server stream hang: provider error after SSE headers left responses open forever (this is what stalled the test suite ~9min on no-provider machines) — stream now ends with `{type:'error'}` + failed traceTurn; regression test vs dead Ollama port. |
 | 2026-06-12 | Claude | Prompt/tool-usage eval loops (PR #14): `bench/evals.js` runs declarative cases (`bench/evals/*.json`) through an in-process agent loop in a tmp sandbox; expectations = ordered tool-call subsequence w/ arg matchers (string=substring), forbidden tools, file post-state, answer regex; `--repeat` → pass@k/pass^k for flakiness. chatFn injectable → 7 offline tests w/ scripted mock model. `parseTextToolCalls` now a public chat.js export. Suite on no-provider machine: 125 pass / 32 env-dependent fails (live provider needed: /api/models, streaming, interactive CLI, stress). |
 | 2026-06-12 | Claude | TUI fixes from live OpenRouter use (PR #16): streamed responses now render markdown — `createMarkdownStream()` in ui.js line-buffers deltas through the (now stateful, shared) line renderer so fences/bold/bullets style correctly mid-stream (line-by-line, not token-by-token); gated tool calls print once (agentLoop skips its ⏺ line via `needsApproval()` when the permission prompt will render its own). +4 offline tests; verified live vs openrouter/openai/gpt-4o-mini. User runs OpenRouter (`openrouter/anthropic/claude-opus-4.8` — note OpenRouter slugs use dots; bare `anthropic/...` needs ANTHROPIC_API_KEY). |
+| 2026-06-12 | Claude | CLI credential guard (PR #18): explicit `--model` whose provider lacks a key now fails at startup (before the banner) via `missingCredential()`, with `suggestCredentialFix()` pointing at the `openrouter/` route when an OpenRouter key is present. Fixes recurring "anthropic/* needs ANTHROPIC_API_KEY" confusion (cwd is irrelevant — `.env` resolves from code location). +3 tests. |
+| 2026-06-12 | Claude | Reasoning effort + bypass (PR #19): `--effort`/`/effort`/`CLAUDETTE_EFFORT` (low\|medium\|high\|xhigh\|max), plumbed only-when-set → Anthropic `output_config.effort`, OpenRouter catalog nested `reasoning.effort`, OpenAI-compatible flat `reasoning_effort`; shown in banner/`/config` + system prompt so the model can report it. Bypass: `--yolo`/`--bypass`/`--dangerously-skip-permissions`/`-y` + `CLAUDETTE_AUTO_APPROVE` env + `/yolo` toggle; `resolveAutoApprove()` pure helper. +12 tests. |
+| 2026-06-12 | Claude | Project-scale bench tasks (PR #20): new `project` category in bench/tasks — `notes-app-nextauth-postgres` (Next.js+NextAuth Google+Prisma/Postgres), `express-postgres-crud-api`, `fastapi-sqlite-todo`. Structural verify (files + manifest deps + node --check/py_compile + wiring greps, no installs) + LLM judge. `npm run bench:projects`. |
 
 ---
 
@@ -70,7 +73,9 @@ test/test.js      Comprehensive test suite + config coverage
 |---------|-------------|
 | `node claudette.js` | Start CLI (auto-selects best available model) |
 | `node claudette.js --model <name>` | Start CLI with specific model |
-| `node claudette.js -y` | Start CLI with auto-approve for all tool calls |
+| `node claudette.js --model openrouter/anthropic/claude-opus-4.8` | Run latest Opus through OpenRouter (user's key; OR slugs use dots) |
+| `node claudette.js -y` / `--yolo` / `--bypass` | Start CLI with auto-approve for all tool calls (or set `CLAUDETTE_AUTO_APPROVE=1`) |
+| `node claudette.js --effort <low\|medium\|high\|xhigh\|max>` | Set reasoning effort (or `CLAUDETTE_EFFORT`; `/effort` at runtime) |
 | `node server.js` | Start web server on port 4321 |
 | `NODE_ENV=test node --test test/test.js` | Run full test suite (~45-90s; spawns server+CLI subprocesses. Run ONE at a time — server tests bind fixed port 14322, so concurrent runs conflict) |
 | `OLLAMA_BASE_URL=http://localhost:11434 node claudette.js --model gemma4:latest` | Point CLI at the SSH-tunneled Ollama endpoint explicitly |
@@ -80,6 +85,7 @@ test/test.js      Comprehensive test suite + config coverage
 | `npm run bench -- --task <id> --model gemma4:latest --repeat 3` | Stress-test a task N times |
 | `npm run bench -- --task <id> --model gemma4:latest --keep` | Keep worktree for post-mortem |
 | `npm run bench:list` | List all benchmark tasks |
+| `npm run bench:projects -- --model <provider/model>` | Run the project-scale build-a-whole-app suite (notes-app, express CRUD, fastapi, fullstack) |
 | `npm run bench:leaderboard` | Regenerate `bench/LEADERBOARD.md` from the latest report file for each model/task pair |
 | `npm run eval -- --all --model <provider/model>` | Run all prompt/tool-usage eval cases (in-process, fast; no worktree) |
 | `npm run eval -- --case <id> --repeat 5` | Flakiness loop on one eval case (pass@k / pass^k) |
