@@ -13,6 +13,7 @@
     "bench": "node bench/run.js",
     "bench:leaderboard": "node bench/leaderboard.js --write",
     "bench:list": "node bench/run.js --list",
+    "bench:projects": "node bench/run.js --task notes-app-nextauth-postgres --task express-postgres-crud-api --task fastapi-sqlite-todo --task fullstack-nextjs-postgres",
     "eval": "node bench/evals.js",
     "eval:all": "node bench/evals.js --all",
     "eval:list": "node bench/evals.js --list",

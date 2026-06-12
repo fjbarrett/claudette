@@ -100,6 +100,34 @@ After a run, refresh the leaderboard with `npm run bench:leaderboard`.
 | `permission-prompt-shortcut` | coding | Find and fix a specific UI string |
 | `admin-hardening` | admin | Inspect and harden operational risks |
 
+### Project-scale tasks (`category: project`)
+
+End-to-end "build a whole app" tasks for stress-testing the agent on realistic,
+multi-file scaffolding. Each says exactly which files to create in a fresh
+subdirectory; verification is **structural** (files exist, package/manifest deps
+match the stack, `node --check` / `py_compile` parse the code, key wiring strings
+present) so it stays deterministic without network installs — the LLM judge
+scores correctness and wiring quality on top.
+
+| Task | Stack | What it builds |
+|------|-------|----------------|
+| `notes-app-nextauth-postgres` | Next.js + NextAuth + Prisma/Postgres | Note-taking app with Google auth and a Postgres-backed notes API |
+| `express-postgres-crud-api` | Express + pg | REST API with full CRUD over Postgres (parameterized queries) |
+| `fastapi-sqlite-todo` | FastAPI + SQLAlchemy + SQLite | Todo service with list/create/update endpoints |
+| `fullstack-nextjs-postgres` | Next.js + Postgres (Docker) | Containerized Next.js + Postgres scaffold |
+
+Run the whole project suite (pass your own capable model):
+
+```sh
+npm run bench:projects -- --model openrouter/anthropic/claude-opus-4.8
+# or a single one with live output:
+npm run bench -- --task notes-app-nextauth-postgres --model anthropic/claude-opus-4-8 --verbose
+```
+
+These are deliberately demanding — small local models will score poorly. They're
+meant to differentiate capable cloud models and surface where the agent loop
+breaks down on long, multi-file builds.
+
 ## Task File Format
 
 Task definitions live in `bench/tasks/*.json`.
