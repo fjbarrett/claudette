@@ -74,7 +74,7 @@ export async function getModels() {
  * Returns { content, toolCalls, hadApiToolCalls, promptTokens, completionTokens, toolMode }
  * in the same shape as ollama.js chatStream().
  */
-export async function chatStream({ model, messages, tools = [], onDelta, signal }) {
+export async function chatStream({ model, messages, tools = [], onDelta, signal, effort = null }) {
   if (!hasCredentials()) {
     throw new Error('ANTHROPIC_API_KEY is not set — cannot reach the Anthropic API');
   }
@@ -88,6 +88,9 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
   };
   if (system) body.system = system;
   if (tools.length) body.tools = toAnthropicTools(tools);
+  // Reasoning depth on models that support it (Opus 4.5+, Sonnet 4.6). Only
+  // sent when set, so default requests are unchanged.
+  if (effort) body.output_config = { effort };
 
   const res = await fetch(`${apiBase()}/v1/messages`, {
     method: 'POST',

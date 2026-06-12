@@ -43,11 +43,15 @@ export function cols() {
   return Math.min(process.stdout.columns || 80, 88);
 }
 
-export function printBanner({ model, cwd, sessionId }) {
+export function printBanner({ model, cwd, sessionId, effort, autoApprove }) {
   const sep = `${GR}${'─'.repeat(cols())}${R}`;
-  console.log(`\n${B}${P}  ◆ Claudette${R}  ${GR}— local coding assistant for Ollama${R}`);
+  console.log(`\n${B}${P}  ◆ Claudette${R}  ${GR}— multi-provider coding assistant${R}`);
   console.log(sep);
-  console.log(`  ${GR}model   ${R}${C}${model}${R}`);
+  const modelExtra = [
+    effort ? `effort ${effort}` : null,
+    autoApprove ? 'auto-approve' : null,
+  ].filter(Boolean).join('  ·  ');
+  console.log(`  ${GR}model   ${R}${C}${model}${R}${modelExtra ? `  ${GR}${modelExtra}${R}` : ''}`);
   console.log(`  ${GR}session ${R}${GR}${sessionId?.slice(0, 8) ?? '–'}${R}`);
   console.log(`  ${GR}cwd     ${R}${W}${cwd}${R}`);
   console.log(sep);

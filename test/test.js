@@ -1031,6 +1031,49 @@ describe('anthropic.js', async () => {
       assert.equal(receivedBody.model, 'claude-opus-4-8', 'anthropic: prefix stripped');
       assert.equal(receivedBody.system, 'be brief', 'system pulled to top level');
       assert.ok(receivedBody.tools, 'tools forwarded');
+      assert.equal(receivedBody.output_config, undefined, 'no effort sent by default');
+    } finally {
+      if (prevBase == null) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+      await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('chatStream sends output_config.effort only when effort is set', async () => {
+    const events = [
+      { type: 'message_start', message: { usage: { input_tokens: 1 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+      { type: 'message_stop' },
+    ];
+    let receivedBody = null;
+    const mockServer = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        for (const e of events) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        res.end();
+      });
+    });
+    await new Promise(r => mockServer.listen(0, '127.0.0.1', r));
+    const { port } = mockServer.address();
+    const prevBase = process.env.ANTHROPIC_BASE_URL;
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+    try {
+      const { chatStream } = await import('../src/anthropic.js');
+      await chatStream({
+        model: 'anthropic/claude-opus-4-8',
+        messages: [{ role: 'user', content: 'hi' }],
+        effort: 'high',
+        onDelta: () => {},
+      });
+      assert.deepEqual(receivedBody.output_config, { effort: 'high' }, 'effort mapped to output_config');
     } finally {
       if (prevBase == null) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = prevBase;
       if (prevKey == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
@@ -1234,6 +1277,63 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
     } finally {
       if (prevBase == null) delete process.env.DEEPSEEK_BASE_URL; else process.env.DEEPSEEK_BASE_URL = prevBase;
       if (prevKey == null) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prevKey;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('openai effort uses the flat reasoning_effort field (omitted by default)', async () => {
+    const okEvents = [{ choices: [{ index: 0, delta: { content: 'ok' } }] }];
+
+    const noEffort = mockChatServer(okEvents);
+    await new Promise(r => noEffort.server.listen(0, '127.0.0.1', r));
+    const withEffort = mockChatServer(okEvents);
+    await new Promise(r => withEffort.server.listen(0, '127.0.0.1', r));
+    const prevBase = process.env.OPENAI_BASE_URL;
+    const prevKey = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-test';
+    try {
+      const { chatStream } = await import('../src/openai.js');
+
+      process.env.OPENAI_BASE_URL = `http://127.0.0.1:${noEffort.server.address().port}`;
+      await chatStream({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'hi' }], onDelta: () => {} });
+      assert.equal(noEffort.captured.body.reasoning_effort, undefined, 'no effort field by default');
+      assert.equal(noEffort.captured.body.reasoning, undefined);
+
+      process.env.OPENAI_BASE_URL = `http://127.0.0.1:${withEffort.server.address().port}`;
+      await chatStream({ model: 'openai/gpt-4o', messages: [{ role: 'user', content: 'hi' }], effort: 'high', onDelta: () => {} });
+      assert.equal(withEffort.captured.body.reasoning_effort, 'high', 'flat field for OpenAI');
+      assert.equal(withEffort.captured.body.reasoning, undefined, 'not the nested form');
+    } finally {
+      if (prevBase == null) delete process.env.OPENAI_BASE_URL; else process.env.OPENAI_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = prevKey;
+      await new Promise((res, rej) => noEffort.server.close(e => e ? rej(e) : res()));
+      await new Promise((res, rej) => withEffort.server.close(e => e ? rej(e) : res()));
+    }
+  });
+
+  test('OpenRouter (catalog) effort uses the nested reasoning.effort field', async () => {
+    const { server, captured } = mockChatServer([{ choices: [{ index: 0, delta: { content: 'ok' } }] }]);
+    await new Promise(r => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const prevBase = process.env.OPENROUTER_BASE_URL;
+    const prevKey = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    try {
+      const { providerFor } = await import('../src/provider.js');
+      const provider = providerFor('openrouter/anthropic/claude-opus-4.8');
+      await provider.chatStream({
+        model: 'openrouter/anthropic/claude-opus-4.8',
+        messages: [{ role: 'user', content: 'hi' }],
+        effort: 'high',
+        onDelta: () => {},
+      });
+      assert.deepEqual(captured.body.reasoning, { effort: 'high' }, 'nested form for OpenRouter');
+      assert.equal(captured.body.reasoning_effort, undefined, 'not the flat field');
+      assert.equal(captured.body.model, 'anthropic/claude-opus-4.8', 'openrouter/ prefix stripped');
+    } finally {
+      if (prevBase == null) delete process.env.OPENROUTER_BASE_URL; else process.env.OPENROUTER_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prevKey;
       await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
     }
   });
@@ -2166,6 +2266,37 @@ console.log(JSON.stringify(r));
     assert.equal(parsed.old_str, 'find', 's→old_str for str_replace');
     assert.equal(parsed.new_str, 'replace', 'new→new_str for str_replace');
     assert.equal(parsed.path, 'f.txt', 'path preserved');
+  });
+});
+
+// ─── chat.js: effort + bypass settings ────────────────────────────────────────
+
+describe('chat.js (effort + bypass)', async () => {
+  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS } =
+    await import('../src/chat.js');
+
+  test('isValidEffort accepts the documented levels and rejects others', () => {
+    for (const lvl of EFFORT_LEVELS) assert.ok(isValidEffort(lvl), `${lvl} valid`);
+    assert.ok(!isValidEffort('turbo'));
+    assert.ok(!isValidEffort(''));
+    assert.ok(!isValidEffort(undefined));
+    assert.deepEqual(EFFORT_LEVELS, ['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
+  test('resolveAutoApprove fires on any bypass flag', () => {
+    for (const flag of BYPASS_FLAGS) {
+      assert.ok(resolveAutoApprove(['node', 'claudette.js', flag], {}), `${flag} enables`);
+    }
+    assert.ok(!resolveAutoApprove(['node', 'claudette.js'], {}), 'off by default');
+  });
+
+  test('resolveAutoApprove honours CLAUDETTE_AUTO_APPROVE, ignoring falsey values', () => {
+    assert.ok(resolveAutoApprove([], { CLAUDETTE_AUTO_APPROVE: '1' }));
+    assert.ok(resolveAutoApprove([], { CLAUDETTE_AUTO_APPROVE: 'true' }));
+    assert.ok(!resolveAutoApprove([], { CLAUDETTE_AUTO_APPROVE: '0' }));
+    assert.ok(!resolveAutoApprove([], { CLAUDETTE_AUTO_APPROVE: 'false' }));
+    assert.ok(!resolveAutoApprove([], { CLAUDETTE_AUTO_APPROVE: '' }));
+    assert.ok(!resolveAutoApprove([], {}));
   });
 });
 
