@@ -223,15 +223,18 @@ async function agentLoop(messages, rl) {
     process.stdin.resume();
     process.stdin.on('data', ctrlCHandler);
 
-    // Live streaming: stop spinner on first token, write deltas directly
+    // Live streaming: stop spinner on first token, render deltas through the
+    // incremental markdown stream (line-buffered so formatting is correct).
     let streamStarted = false;
+    let mdStream = null;
     const onDelta = (delta) => {
       if (!streamStarted) {
         streamStarted = true;
         ui.stopSpinner();
         ui.printAssistantStart();
+        mdStream = ui.createMarkdownStream();
       }
-      stdout.write(delta);
+      mdStream.write(delta);
     };
 
     let result;
@@ -281,7 +284,8 @@ async function agentLoop(messages, rl) {
         ui.printAssistantStart();
         ui.printAssistantMessage(result.content);
       } else if (streamStarted) {
-        stdout.write('\n'); // newline after raw streamed text
+        mdStream.end(); // flush a trailing partial line
+        stdout.write('\n');
       }
       ui.printAssistantEnd({
         model,
@@ -299,6 +303,7 @@ async function agentLoop(messages, rl) {
       ui.printAssistantMessage(result.content);
       stdout.write('\n');
     } else if (streamStarted) {
+      mdStream.end(); // flush a trailing partial line
       stdout.write('\n'); // newline after streamed text before tool blocks
     }
 
@@ -316,7 +321,9 @@ async function agentLoop(messages, rl) {
         args = { raw: rawArgs };
       }
 
-      ui.printToolCall(name, args);
+      // The permission prompt renders the call itself — printing the normal
+      // tool-call line too showed the same call twice.
+      if (!needsApproval(name, args)) ui.printToolCall(name, args);
 
       // Permission check
       const allowed = await checkPermission(name, args, rl);
@@ -354,13 +361,21 @@ async function agentLoop(messages, rl) {
 }
 
 // ─── Permission check ─────────────────────────────────────────────────────────
-async function checkPermission(toolName, args, rl) {
+
+// True when checkPermission would prompt the user (the prompt renders its own
+// tool-call header, so the caller must not print one too).
+function needsApproval(toolName, args) {
   // Read-only ops always allowed
-  if (['read_file', 'list_dir', 'glob', 'grep', 'search_code', 'fetch_url'].includes(toolName)) return true;
-  if (autoApprove) return true;
+  if (['read_file', 'list_dir', 'glob', 'grep', 'search_code', 'fetch_url'].includes(toolName)) return false;
+  if (autoApprove) return false;
 
   const key = toolName === 'bash' ? `bash:${args.command}` : toolName;
-  if (alwaysAllow.has(key) || alwaysAllow.has(toolName)) return true;
+  if (alwaysAllow.has(key) || alwaysAllow.has(toolName)) return false;
+  return true;
+}
+
+async function checkPermission(toolName, args, rl) {
+  if (!needsApproval(toolName, args)) return true;
 
   const detail = toolName === 'bash' ? args.command : JSON.stringify(args, null, 2);
   ui.printPermissionPrompt(toolName, detail);
