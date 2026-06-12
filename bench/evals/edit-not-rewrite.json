@@ -1,0 +1,19 @@
+{
+  "id": "edit-not-rewrite",
+  "title": "Makes a targeted edit instead of rewriting the file",
+  "prompt": "In src/config.js, change the TIMEOUT value from 30 to 90 using a targeted str_replace edit. Do not rewrite the whole file with write_file.",
+  "files": {
+    "src/config.js": "// app config\nexport const TIMEOUT = 30;\nexport const RETRIES = 3;\n"
+  },
+  "maxTurns": 6,
+  "repeat": 1,
+  "expect": {
+    "tools": [
+      { "name": "str_replace", "args": { "path": "src/config.js" } }
+    ],
+    "forbid": ["write_file"],
+    "files": {
+      "src/config.js": { "includes": "TIMEOUT = 90" }
+    }
+  }
+}

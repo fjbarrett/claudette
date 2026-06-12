@@ -1,0 +1,13 @@
+{
+  "id": "bash-echo",
+  "title": "Runs a bash command and reports its output",
+  "prompt": "Use the bash tool to run exactly this command: echo eval-ok. Then tell me what it printed.",
+  "maxTurns": 4,
+  "repeat": 1,
+  "expect": {
+    "tools": [
+      { "name": "bash", "args": { "command": "echo eval-ok" } }
+    ],
+    "answer": { "matches": "eval-ok" }
+  }
+}

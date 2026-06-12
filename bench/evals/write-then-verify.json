@@ -1,0 +1,15 @@
+{
+  "id": "write-then-verify",
+  "title": "Creates a file with required content",
+  "prompt": "Create a file at greeting.txt containing exactly the line: hello from claudette. Then confirm you created it.",
+  "maxTurns": 4,
+  "repeat": 1,
+  "expect": {
+    "tools": [
+      { "name": "write_file", "args": { "path": "greeting.txt" } }
+    ],
+    "files": {
+      "greeting.txt": { "includes": "hello from claudette" }
+    }
+  }
+}
