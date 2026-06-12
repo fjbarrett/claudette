@@ -4,8 +4,8 @@
 
 ## Context
 
-**Last Updated:** 2026-06-01
-**Stage:** Cloud-first multi-provider — models addressed `provider/model`; backends for OpenAI/Anthropic/DeepSeek/Groq/HuggingFace (bespoke) + catalog (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity) over one OpenAI-compatible transport. Runs with no local Ollama. Bench harness tuned; 14-16B local ceiling on complex refactors.
+**Last Updated:** 2026-06-12
+**Stage:** Cloud-first multi-provider — models addressed `provider/model`; backends for OpenAI/Anthropic/DeepSeek/Groq/HuggingFace (bespoke) + catalog (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity) over one OpenAI-compatible transport. Runs with no local Ollama (bench defaults + judge resolve cloud-first). Bench harness tuned; in-process eval loops for prompt/tool-usage testing; web dashboard for bench reports.
 **Purpose:** Claudette is a multi-provider AI coding assistant CLI + web server (any major LLM provider or hosting platform; local Ollama optional)
 **Structure:**
 ```
@@ -28,9 +28,9 @@ src/
   providers.js    Catalog of OpenAI-compatible providers (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity)
   provider.js     Registry router: provider/model -> backend; bare/ollama/ -> Ollama; missingCredential()
   ui.js           ANSI terminal rendering, spinner
-bench/            Benchmark harness + isolated worktree runs + reports
+bench/            Benchmark harness (run.js, worktree runs, reports) + evals.js in-process eval loops + evals/ cases
 data/sessions/    Persisted session JSON files
-public/           Web UI (index.html, styles.css, app.js)
+public/           Web UI (index.html, styles.css, app.js, bench.html dashboard)
 test/test.js      Comprehensive test suite + config coverage
 ```
 
@@ -57,6 +57,9 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-06-01 | Claude | Landed the floating feature stack into `main` (PR #6). `main` had diverged onto a parallel, superseded line (`ed429f4`); merged it with `-s ours` so the active trunk's tree wins and `main` becomes an ancestor, then preserved its 3 unique artifacts (`Changelog.md` + `admin-hardening`/`permission-prompt-shortcut` bench tasks). Closed superseded PR #5; removed the stale `.ship-worktree` pinning old `main`. Tests pass except the env-dependent `GET /api/models` (needs a live provider). |
 | 2026-06-01 | Claude | Multi-provider expansion: `provider/model` slash addressing; bespoke OpenAI/DeepSeek/Groq/HuggingFace adapters over one OpenAI-compatible transport (`src/openai.js`) + catalog (`src/providers.js`: OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity). Registry router; `missingCredential()` guard. `OPENAI_BASE_URL` no longer routes Ollama (collision fix in config.js). Cloud-first (no Ollama needed). +18 tests. Researched terminal-bench, lm-eval-harness, HELM, KIRA, opencode for design (see TODO). Merged PR #8. |
 | 2026-06-01 | Claude | Usability: zero-dep `.env` autoloader (`src/env.js` + `src/env-autoload.js`, first import in claudette.js/server.js/bench/run.js so keys land before config.js reads env). `.env.example` catalogs all provider keys (OpenRouter highlighted); `.env` gitignored; "no models" onboarding message walks through setup. +3 tests; README Setup section. |
+| 2026-06-12 | Claude | Repo hygiene (PR #10): gitignored `tmp/`/`test_prompts.txt`/`.claude/settings.local.json` (untracked the latter — per-machine state), committed docs/validation-summary.html. Bench dashboard (PRs #11-#12): committed long-floating `public/bench.html` (renders GET /api/bench), sidebar link, de-staled gemma4 branding, +2 endpoint tests. |
+| 2026-06-12 | Claude | Cloud-first bench defaults + SSE hang fix (PR #13): providers declare `DEFAULT_MODELS` (anthropic/claude-opus-4-8 + sonnet judge; openai/gpt-4o + 4o-mini judge); `defaultCloudModels()` in provider.js; bench agent/judge defaults resolve cloud-first, Ollama fallback w/ 3s timeout. Fixed server stream hang: provider error after SSE headers left responses open forever (this is what stalled the test suite ~9min on no-provider machines) — stream now ends with `{type:'error'}` + failed traceTurn; regression test vs dead Ollama port. |
+| 2026-06-12 | Claude | Prompt/tool-usage eval loops (PR #14): `bench/evals.js` runs declarative cases (`bench/evals/*.json`) through an in-process agent loop in a tmp sandbox; expectations = ordered tool-call subsequence w/ arg matchers (string=substring), forbidden tools, file post-state, answer regex; `--repeat` → pass@k/pass^k for flakiness. chatFn injectable → 7 offline tests w/ scripted mock model. `parseTextToolCalls` now a public chat.js export. Suite on no-provider machine: 125 pass / 32 env-dependent fails (live provider needed: /api/models, streaming, interactive CLI, stress). |
 
 ---
 
@@ -77,6 +80,10 @@ test/test.js      Comprehensive test suite + config coverage
 | `npm run bench -- --task <id> --model gemma4:latest --keep` | Keep worktree for post-mortem |
 | `npm run bench:list` | List all benchmark tasks |
 | `npm run bench:leaderboard` | Regenerate `bench/LEADERBOARD.md` from the latest report file for each model/task pair |
+| `npm run eval -- --all --model <provider/model>` | Run all prompt/tool-usage eval cases (in-process, fast; no worktree) |
+| `npm run eval -- --case <id> --repeat 5` | Flakiness loop on one eval case (pass@k / pass^k) |
+| `npm run eval:list` | List eval cases (`bench/evals/*.json`) |
+| `NODE_ENV=test node --test --test-name-pattern "<pattern>" test/test.js` | Run a targeted slice of the suite (fast; skips other suites' bodies) |
 | `node bench/run.js --all --model qwen3.5:0.8b` | Run the full installed-model benchmark sweep used for the current passing scores |
 
 ---
