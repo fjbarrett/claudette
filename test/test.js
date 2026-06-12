@@ -1403,6 +1403,24 @@ describe('server.js HTTP API', async () => {
     assert.ok(Array.isArray(body.sessions), 'sessions is array');
   });
 
+  test('GET /api/bench returns reports list', async () => {
+    const { status, body } = await httpGet(`${BASE}/api/bench`);
+    assert.equal(status, 200);
+    assert.ok(Array.isArray(body.reports), 'reports is array');
+    // bench/runs/ is gitignored, so reports may be empty on a fresh clone;
+    // only assert per-report shape when runs exist locally.
+    for (const r of body.reports.slice(0, 3)) {
+      assert.ok(r.file, 'report has source file');
+      assert.ok(r.summary, 'report has summary');
+    }
+  });
+
+  test('GET /bench.html serves the bench dashboard', async () => {
+    const { status, body } = await httpGet(`${BASE}/bench.html`);
+    assert.equal(status, 200);
+    assert.ok(String(body).includes('Benchmark Results'), 'dashboard page served');
+  });
+
   test('POST /api/sessions creates a new session', async () => {
     const { status, body } = await httpPost(`${BASE}/api/sessions`, {
       title: 'Test Session',
