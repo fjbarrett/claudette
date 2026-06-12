@@ -1097,6 +1097,29 @@ describe('provider.js', async () => {
     }
   });
 
+  test('defaultCloudModels picks the first credentialed provider in registry order', async () => {
+    const { defaultCloudModels } = await import('../src/provider.js');
+    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
+    const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+    try {
+      process.env.ANTHROPIC_API_KEY = 'k';
+      process.env.OPENAI_API_KEY = 'k';
+      assert.equal(defaultCloudModels().agent, 'anthropic/claude-opus-4-8',
+        'anthropic wins when both keys set (registry order)');
+      assert.equal(defaultCloudModels().judge, 'anthropic/claude-sonnet-4-6',
+        'judge default is the cheaper sibling model');
+
+      delete process.env.ANTHROPIC_API_KEY;
+      assert.equal(defaultCloudModels().agent, 'openai/gpt-4o', 'falls through to openai');
+      assert.equal(defaultCloudModels().judge, 'openai/gpt-4o-mini');
+
+      delete process.env.OPENAI_API_KEY;
+      assert.equal(defaultCloudModels(), null, 'null when no credentialed provider declares defaults');
+    } finally {
+      for (const k of keys) { if (prev[k] == null) delete process.env[k]; else process.env[k] = prev[k]; }
+    }
+  });
+
   test('missingCredential flags the first cloud model without a key, ignores Ollama', async () => {
     const { missingCredential } = await import('../src/provider.js');
     const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY'];

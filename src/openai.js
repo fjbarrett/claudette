@@ -15,6 +15,13 @@ export const id = 'openai';
 // `openai/<id>` works via chatStream regardless of what's listed here.
 const KNOWN_MODELS = ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'o3', 'o4-mini'];
 
+// Picked when a caller needs a model and the user didn't choose one (see
+// provider.js defaultCloudModels): a capable agent, a cheap high-volume judge.
+export const DEFAULT_MODELS = {
+  agent: 'openai/gpt-4o',
+  judge: 'openai/gpt-4o-mini',
+};
+
 function apiBase() {
   return (process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1').replace(/\/+$/, '');
 }
