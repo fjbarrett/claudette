@@ -13,7 +13,7 @@ import { promisify } from 'node:util';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-import { getModels, chatStream } from './provider.js';
+import { getModels, chatStream, missingCredential } from './provider.js';
 import { TOOL_DEFS, executeTool } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
 import { loadClaudeMd, expandFiles } from './context.js';
@@ -68,6 +68,17 @@ export async function start() {
     if (found) { defaultModel = found.name; break; }
   }
   model = modelArg ?? process.env.OLLAMA_MODEL ?? defaultModel;
+
+  // Fail fast on an explicit --model whose provider has no key, instead of
+  // showing the banner and only erroring at the first message. Auto-selected
+  // models are already credential-filtered, so this only guards --model.
+  if (modelArg) {
+    const missing = missingCredential([model]);
+    if (missing) {
+      ui.printError(suggestCredentialFix(missing));
+      exit(1);
+    }
+  }
 
   // Create fresh session
   session = await createSession({ model, cwd: workspace });
@@ -846,6 +857,36 @@ function nullReadline() {
     resume() {},
     async question() { return 'n'; },
   };
+}
+
+/**
+ * Build the startup error shown when an explicit --model names a provider with
+ * no API key. `missing` is the {model, env, label} from missingCredential().
+ * When an OpenRouter key IS present, point the user at routing the same model
+ * through OpenRouter (their working path) instead of just naming the missing key.
+ */
+export function suggestCredentialFix(missing, env = process.env) {
+  const lines = [
+    `${missing.label} model "${missing.model}" needs ${missing.env}, which is not set.`,
+  ];
+  // `provider/model` → drop the leading provider segment to get the bare id.
+  const slash = missing.model.indexOf('/');
+  const bare = slash === -1 ? missing.model : missing.model.slice(slash + 1);
+
+  if (env.OPENROUTER_API_KEY) {
+    lines.push(
+      `You have an OpenRouter key set — route this model through it instead:`,
+      `  --model openrouter/${missing.label.toLowerCase()}/${bare}`,
+      `(OpenRouter uses its own model slugs — run /models or see openrouter.ai/models for the exact id.)`,
+    );
+  } else {
+    lines.push(
+      `Add ${missing.env} to .env, or use a provider you have a key for.`,
+      `Easiest: put OPENROUTER_API_KEY in .env (one key, every provider), then`,
+      `  --model openrouter/${missing.label.toLowerCase()}/${bare}`,
+    );
+  }
+  return lines.join('\n');
 }
 
 // Reused by bench/evals.js so its agent loop merges text-emitted tool calls
