@@ -214,7 +214,7 @@
 <body>
   <header>
     <h1>◆ Benchmark Results</h1>
-    <p id="subtitle">Claudette — gemma4 test harness</p>
+    <p id="subtitle">Claudette — agent benchmark harness</p>
     <button id="refresh-btn">↻ Refresh</button>
   </header>
 
@@ -283,7 +283,7 @@
       renderFilters(allReports);
 
       if (!reports.length) {
-        document.getElementById('main').innerHTML = '<p class="empty">No reports yet. Run <code>npm run bench:gemma</code> to generate some.</p>';
+        document.getElementById('main').innerHTML = '<p class="empty">No reports yet. Run <code>npm run bench -- --task &lt;id&gt; --model &lt;provider/model&gt;</code> to generate some.</p>';
         return;
       }
 
