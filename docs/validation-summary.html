@@ -1,0 +1,542 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claudette Validation Summary</title>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --paper: rgba(255, 252, 247, 0.86);
+      --ink: #1f2421;
+      --muted: #5e685f;
+      --line: rgba(31, 36, 33, 0.12);
+      --accent: #146356;
+      --accent-2: #cb5f2f;
+      --good: #1d6f42;
+      --warn: #b06718;
+      --bad: #9a2f2f;
+      --shadow: 0 18px 60px rgba(46, 32, 17, 0.12);
+      --radius: 24px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(20, 99, 86, 0.16), transparent 30%),
+        radial-gradient(circle at 85% 10%, rgba(203, 95, 47, 0.20), transparent 24%),
+        linear-gradient(180deg, #efe5d7 0%, var(--bg) 48%, #efe8dc 100%);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    .page {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 28px auto 48px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 36px;
+      border: 1px solid var(--line);
+      border-radius: 32px;
+      background:
+        linear-gradient(140deg, rgba(255,255,255,0.82), rgba(255,248,240,0.74)),
+        linear-gradient(120deg, rgba(20,99,86,0.12), rgba(203,95,47,0.10));
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: auto -80px -120px auto;
+      width: 280px;
+      height: 280px;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(20,99,86,0.18), transparent 70%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      gap: 10px;
+      align-items: center;
+      padding: 7px 12px;
+      border-radius: 999px;
+      background: rgba(20, 99, 86, 0.10);
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2 {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", serif;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    h1 {
+      margin-top: 18px;
+      font-size: clamp(2.6rem, 5vw, 4.8rem);
+      line-height: 0.95;
+      max-width: 10ch;
+    }
+
+    .hero p {
+      max-width: 58ch;
+      margin: 18px 0 0;
+      color: var(--muted);
+      font-size: 1.04rem;
+    }
+
+    .meta-row {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 28px;
+    }
+
+    .meta-card, .panel, .result-card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--paper);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .meta-card {
+      padding: 18px;
+      min-height: 118px;
+    }
+
+    .meta-label {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .meta-value {
+      font-size: 1.6rem;
+      font-weight: 700;
+    }
+
+    .meta-sub {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 0.94rem;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.25fr 0.95fr;
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .panel {
+      padding: 24px;
+    }
+
+    .panel h2 {
+      font-size: 1.7rem;
+      margin-bottom: 14px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      font-size: 0.92rem;
+      font-weight: 700;
+      background: rgba(176, 103, 24, 0.12);
+      color: var(--warn);
+    }
+
+    .summary-callout {
+      margin-top: 18px;
+      padding: 18px;
+      border-radius: 20px;
+      background: linear-gradient(135deg, rgba(20,99,86,0.10), rgba(20,99,86,0.04));
+      border: 1px solid rgba(20,99,86,0.14);
+    }
+
+    .summary-callout strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 1.02rem;
+    }
+
+    .score-stack {
+      display: grid;
+      gap: 14px;
+      margin-top: 18px;
+    }
+
+    .result-card {
+      padding: 18px;
+    }
+
+    .score-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+    }
+
+    .score-name {
+      font-weight: 700;
+      font-size: 1rem;
+    }
+
+    .score-value {
+      font-size: 1.35rem;
+      font-weight: 800;
+    }
+
+    .bar {
+      margin-top: 10px;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: rgba(31,36,33,0.08);
+    }
+
+    .fill {
+      height: 100%;
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--accent), #2b8d78);
+    }
+
+    .fill.warn {
+      background: linear-gradient(90deg, #c98b28, #e0b15a);
+    }
+
+    .fill.bad {
+      background: linear-gradient(90deg, #ac4343, #d77373);
+    }
+
+    .list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .list li + li {
+      margin-top: 10px;
+    }
+
+    .table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 0.95rem;
+    }
+
+    .table th, .table td {
+      text-align: left;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    .table th {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    code {
+      font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+      font-size: 0.92em;
+      background: rgba(31,36,33,0.06);
+      padding: 0.18em 0.4em;
+      border-radius: 8px;
+    }
+
+    .footer-note {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    @media (max-width: 900px) {
+      .meta-row, .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        padding: 24px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="eyebrow">Validation Report · April 9, 2026</div>
+      <h1>Claudette on This Machine</h1>
+      <p>
+        Full validation was run against the local repository at <code>/home/frank/Code/test</code> on Ubuntu 24.04 with 12 CPU cores,
+        15 GiB RAM, and a live Ollama backend. After fixing the CLI tool-loop harness and hardening the stress-suite startup path,
+        the branch now passes the complete automated validation sweep on this machine.
+      </p>
+
+      <div class="meta-row">
+        <article class="meta-card">
+          <div class="meta-label">Overall Status</div>
+          <div class="meta-value good">Operational, Clean</div>
+          <div class="meta-sub">Core runtime works and the validation suite completed without failures.</div>
+        </article>
+        <article class="meta-card">
+          <div class="meta-label">Test Suite</div>
+          <div class="meta-value good">102 / 102</div>
+          <div class="meta-sub">0 failed, 0 cancelled, total runtime 568.02s.</div>
+        </article>
+        <article class="meta-card">
+          <div class="meta-label">Syntax Sweep</div>
+          <div class="meta-value good">Pass</div>
+          <div class="meta-sub">All checked JS files parsed successfully.</div>
+        </article>
+        <article class="meta-card">
+          <div class="meta-label">Live Smoke Test</div>
+          <div class="meta-value good">Pass</div>
+          <div class="meta-sub"><code>/api/health</code>, <code>/api/models</code>, and <code>/</code> all responded.</div>
+        </article>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Executive Readout</h2>
+        <div class="status-pill" style="background: rgba(29,111,66,0.12); color: var(--good);">Primary judgment: release-clean on this machine</div>
+        <div class="summary-callout">
+          <strong>What works</strong>
+          The server is up on port <code>4321</code>, the browser UI root returns HTTP <code>200</code>, the health endpoint is healthy,
+          the model endpoint returns all installed Ollama models, and the full automated suite now passes, including session, context,
+          tools, server API, CLI coverage, mock tool-loop execution, and the live Ollama stress loop.
+        </div>
+        <div class="summary-callout">
+          <strong>What was fixed</strong>
+          The CLI now preserves raw tool-name markers in its formatted output, which restores deterministic stdout assertions for
+          <code>read_file</code> and <code>bash</code> tool loops. The stress suite now allocates a free alternate port dynamically and
+          fails fast on startup errors instead of hanging on a stale fixed port.
+        </div>
+        <div class="summary-callout">
+          <strong>Most likely interpretation</strong>
+          The previous report mixed one real UI-compatibility issue with one test-harness issue. The final rerun shows the application
+          behavior is sound on this hardware once the mock CLI harness and stress-suite startup logic are corrected.
+        </div>
+      </article>
+
+      <aside class="panel">
+        <h2>Scorecard</h2>
+        <div class="score-stack">
+          <div class="result-card">
+            <div class="score-top">
+              <div class="score-name">Automated Tests</div>
+              <div class="score-value good">10.0 / 10</div>
+            </div>
+            <div class="bar"><div class="fill" style="width:100%"></div></div>
+          </div>
+          <div class="result-card">
+            <div class="score-top">
+              <div class="score-name">Runtime Smoke Checks</div>
+              <div class="score-value good">9.0 / 10</div>
+            </div>
+            <div class="bar"><div class="fill" style="width:90%"></div></div>
+          </div>
+          <div class="result-card">
+            <div class="score-top">
+              <div class="score-name">Hardware Fit</div>
+              <div class="score-value warn">8.0 / 10</div>
+            </div>
+            <div class="bar"><div class="fill warn" style="width:80%"></div></div>
+          </div>
+          <div class="result-card">
+            <div class="score-top">
+              <div class="score-name">Release Readiness</div>
+              <div class="score-value good">9.0 / 10</div>
+            </div>
+            <div class="bar"><div class="fill" style="width:90%"></div></div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Validation Breakdown</h2>
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Area</th>
+              <th>Result</th>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Node test suite</td>
+              <td class="good">Pass</td>
+              <td>102 tests total; 102 pass, 0 fail, 0 cancelled; 568.02s runtime with the live Ollama stress loop included.</td>
+            </tr>
+            <tr>
+              <td>Session/context/tools suites</td>
+              <td class="good">Pass</td>
+              <td>Core local logic passed cleanly, including persistence and tool execution behavior.</td>
+            </tr>
+            <tr>
+              <td>Server HTTP API suite</td>
+              <td class="good">Pass</td>
+              <td>Health, models, sessions, expansion, streaming response, and static serving checks passed.</td>
+            </tr>
+            <tr>
+              <td>Main CLI suite</td>
+              <td class="good">Pass</td>
+              <td>Banner, help, models, config, session, status, diff, token estimate, and simple message flow all passed.</td>
+            </tr>
+            <tr>
+              <td>CLI tool loop with mock Ollama</td>
+              <td class="good">Pass</td>
+              <td>Deterministic <code>read_file</code>, workspace-guard, and <code>bash</code> tool-loop assertions all pass after the UI and harness fixes.</td>
+            </tr>
+            <tr>
+              <td>Stress suite</td>
+              <td class="good">Pass</td>
+              <td>12 of 12 live-model stress tests completed after switching to a dynamically allocated alternate port and hardening startup error handling.</td>
+            </tr>
+            <tr>
+              <td>Syntax sweep</td>
+              <td class="good">Pass</td>
+              <td><code>src</code>, <code>public</code>, <code>bench</code>, <code>server.js</code>, <code>cli.js</code>, and <code>claudette.js</code> parsed successfully.</td>
+            </tr>
+            <tr>
+              <td>Live smoke test</td>
+              <td class="good">Pass</td>
+              <td><code>/api/health</code> returned OK, <code>/api/models</code> returned model inventory, and root UI returned HTTP 200.</td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+
+      <article class="panel">
+        <h2>Hardware & Runtime</h2>
+        <table class="table">
+          <tbody>
+            <tr>
+              <td>OS</td>
+              <td>Ubuntu 24.04 / Linux 6.17.0-20-generic</td>
+            </tr>
+            <tr>
+              <td>CPU</td>
+              <td>12 logical cores</td>
+            </tr>
+            <tr>
+              <td>Memory</td>
+              <td>15 GiB total, 6.3 GiB available at capture time</td>
+            </tr>
+            <tr>
+              <td>Swap</td>
+              <td>4.0 GiB total, 2.5 GiB used at capture time</td>
+            </tr>
+            <tr>
+              <td>Active Ollama runtime</td>
+              <td><code>llama3.2:latest</code> loaded, 100% GPU, context 4096</td>
+            </tr>
+            <tr>
+              <td>Installed model set</td>
+              <td><code>gemma4</code>, <code>deepseek-coder-v2</code>, <code>qwen2.5-coder</code> 7B/14B, <code>qwen3.5</code>, and others</td>
+            </tr>
+            <tr>
+              <td>App server port</td>
+              <td><code>4321</code> already occupied by a running Node server instance</td>
+            </tr>
+            <tr>
+              <td>Stress test port</td>
+              <td>Dynamically allocated during tests to avoid collisions with lingering processes</td>
+            </tr>
+            <tr>
+              <td>Git branch</td>
+              <td><code>feature/benchmark-harness</code></td>
+            </tr>
+          </tbody>
+        </table>
+      </article>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>Confirmed Findings</h2>
+        <ol class="list">
+          <li>
+            <strong>The CLI tool-loop suite is fixed.</strong>
+            Tool-call output now includes stable raw tool-name markers, which keeps the richer formatted UI while preserving deterministic
+            stdout contracts for automated assertions.
+          </li>
+          <li>
+            <strong>The stress-suite startup path is now resilient.</strong>
+            The test no longer depends on fixed port <code>14323</code>; it reserves a free port at runtime and surfaces startup failures
+            from <code>stderr</code> or early process exit immediately.
+          </li>
+          <li>
+            <strong>Core server behavior remains intact.</strong>
+            Independent smoke checks against the live server on <code>127.0.0.1:4321</code> still succeed, and the full test rerun confirms
+            the earlier runtime assessment.
+          </li>
+          <li>
+            <strong>The repo is validation-clean but test runs generate local session artifacts.</strong>
+            The application persists sessions and transcripts during some integration tests, so the working tree picks up untracked runtime
+            files unless those paths are ignored or cleaned.
+          </li>
+        </ol>
+      </article>
+
+      <article class="panel">
+        <h2>Recommended Next Steps</h2>
+        <ol class="list">
+          <li>Add <code>data/sessions</code> and <code>data/transcripts</code> to <code>.gitignore</code> if you do not want validation runs to leave untracked runtime artifacts.</li>
+          <li>Consider splitting the live Ollama stress loop into a separate slow test target for faster default local iteration.</li>
+          <li>Keep the raw tool-name alias in the CLI output so UI polish does not silently break test contracts again.</li>
+          <li>Use the benchmark harness for repeated model comparisons now that the baseline app validation is clean.</li>
+        </ol>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>Commands Executed For This Report</h2>
+      <table class="table">
+        <tbody>
+          <tr><td><code>node --test test/test.js</code></td><td>Full application suite, including server, CLI, and stress sections</td></tr>
+          <tr><td><code>node --check ...</code></td><td>Syntax sweep across app and benchmark files</td></tr>
+          <tr><td><code>curl http://127.0.0.1:4321/api/health</code></td><td>Live health probe</td></tr>
+          <tr><td><code>curl http://127.0.0.1:4321/api/models</code></td><td>Live model inventory probe</td></tr>
+          <tr><td><code>curl http://127.0.0.1:4321/</code></td><td>Browser UI availability check</td></tr>
+          <tr><td><code>uname -a</code>, <code>free -h</code>, <code>nproc</code></td><td>Machine profile capture</td></tr>
+          <tr><td><code>ollama list</code>, <code>ollama ps</code></td><td>Installed and active model state</td></tr>
+          <tr><td><code>node --test --test-name-pattern "CLI tool loop with mock Ollama" test/test.js</code></td><td>Targeted verification of the repaired mock tool-loop suite</td></tr>
+          <tr><td><code>node --test --test-name-pattern "Stress: Ollama message stream" test/test.js</code></td><td>Targeted verification of the repaired stress-suite startup path</td></tr>
+        </tbody>
+      </table>
+      <p class="footer-note">
+        This report reflects the repaired validation state observed on April 9, 2026 in the local workspace at <code>/home/frank/Code/test</code>.
+      </p>
+    </section>
+  </main>
+</body>
+</html>
