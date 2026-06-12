@@ -1,7 +1,7 @@
 {
   "name": "claudette",
   "version": "1.0.0",
-  "description": "Claudette is a terminal-first AI coding assistant backed by Ollama.",
+  "description": "An AI coding assistant with terminal CLI and browser UI, supporting Ollama and 13+ cloud providers (Anthropic, OpenAI, Gemini, and more)",
   "type": "module",
   "bin": {
     "claudette": "./claudette.js"
