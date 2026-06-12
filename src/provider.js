@@ -60,6 +60,19 @@ export function chatStream(opts) {
 }
 
 /**
+ * Agent/judge default models from the first credentialed cloud provider that
+ * declares them (registry display order: Anthropic, then OpenAI, ...), or null
+ * when no cloud key is set. Lets callers (e.g. the benchmark CLI) pick
+ * cloud-first defaults instead of assuming a local Ollama is running.
+ */
+export function defaultCloudModels() {
+  for (const p of CLOUD) {
+    if (p.DEFAULT_MODELS && p.hasCredentials?.()) return p.DEFAULT_MODELS;
+  }
+  return null;
+}
+
+/**
  * First requested model whose cloud provider is missing credentials, or null if
  * all are reachable. Lets callers (e.g. the benchmark CLI) fail fast before
  * doing expensive setup. Local Ollama models never require credentials.

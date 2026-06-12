@@ -6,7 +6,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { resolveOllamaBaseUrl } from '../src/config.js';
-import { chatStream, missingCredential } from '../src/provider.js';
+import { chatStream, missingCredential, defaultCloudModels } from '../src/provider.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -38,8 +38,8 @@ async function main() {
     throw new Error(requested ? `Unknown task: ${requested}` : 'Use --task <id>, --all, or --list');
   }
 
-  const models = args.models.length ? args.models : [await getDefaultJudgeCapableModel()];
-  const judgeModel = args.judge ?? 'qwen2.5-coder:14b';
+  const models = args.models.length ? args.models : [await getDefaultAgentModel()];
+  const judgeModel = args.judge ?? defaultCloudModels()?.judge ?? 'qwen2.5-coder:14b';
 
   // Fail fast (before spinning up worktrees) if a cloud model is requested
   // without credentials, rather than erroring mid-run.
@@ -314,8 +314,9 @@ async function judgeRun({ judgeModel, task, model, agentRun, workflow, verificat
     diff || '(no diff)',
   ].join('\n');
 
-  // Route the judge through the provider so the judge model can be a local
-  // Ollama model or an anthropic:* model (and works when Ollama is offline).
+  // Route the judge through the provider registry so the judge can be any
+  // provider/model (anthropic/, openai/, deepseek/, ... or a local Ollama
+  // model) and works when Ollama is offline.
   const ac = new AbortController();
   const timeout = setTimeout(() => ac.abort(), 45_000);
   let text;
@@ -526,8 +527,22 @@ function parseArgs(argv) {
   return args;
 }
 
-async function getDefaultJudgeCapableModel() {
-  const res = await fetch(`${OLLAMA_BASE_URL}/api/tags`);
+// Default agent model when --model is omitted: cloud-first (any provider with
+// a key in env — no local Ollama needed), falling back to whatever the local
+// Ollama serves.
+async function getDefaultAgentModel() {
+  const cloud = defaultCloudModels();
+  if (cloud) return cloud.agent;
+
+  let res;
+  try {
+    res = await fetch(`${OLLAMA_BASE_URL}/api/tags`, { signal: AbortSignal.timeout(3000) });
+  } catch {
+    throw new Error(
+      'No --model given and no provider available: set a cloud API key in .env ' +
+      '(e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY) or start Ollama.'
+    );
+  }
   if (!res.ok) throw new Error(`Failed to load models: ${res.status}`);
   const body = await res.json();
   const names = (body.models ?? []).map(model => model.name);

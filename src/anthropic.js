@@ -22,6 +22,14 @@ const KNOWN_MODELS = [
   { id: 'claude-haiku-4-5',  paramSize: 'cloud' },
 ];
 
+// Picked when a caller needs a model and the user didn't choose one (see
+// provider.js defaultCloudModels): the most capable model as the agent, a
+// cheaper one for high-volume auxiliary calls like the benchmark judge.
+export const DEFAULT_MODELS = {
+  agent: 'anthropic/claude-opus-4-8',
+  judge: 'anthropic/claude-sonnet-4-6',
+};
+
 // Env is read at call time (not module load) so tests can point the client at
 // a mock server and toggle credentials between cases.
 function apiBase() {

@@ -1097,6 +1097,29 @@ describe('provider.js', async () => {
     }
   });
 
+  test('defaultCloudModels picks the first credentialed provider in registry order', async () => {
+    const { defaultCloudModels } = await import('../src/provider.js');
+    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
+    const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
+    try {
+      process.env.ANTHROPIC_API_KEY = 'k';
+      process.env.OPENAI_API_KEY = 'k';
+      assert.equal(defaultCloudModels().agent, 'anthropic/claude-opus-4-8',
+        'anthropic wins when both keys set (registry order)');
+      assert.equal(defaultCloudModels().judge, 'anthropic/claude-sonnet-4-6',
+        'judge default is the cheaper sibling model');
+
+      delete process.env.ANTHROPIC_API_KEY;
+      assert.equal(defaultCloudModels().agent, 'openai/gpt-4o', 'falls through to openai');
+      assert.equal(defaultCloudModels().judge, 'openai/gpt-4o-mini');
+
+      delete process.env.OPENAI_API_KEY;
+      assert.equal(defaultCloudModels(), null, 'null when no credentialed provider declares defaults');
+    } finally {
+      for (const k of keys) { if (prev[k] == null) delete process.env[k]; else process.env[k] = prev[k]; }
+    }
+  });
+
   test('missingCredential flags the first cloud model without a key, ignores Ollama', async () => {
     const { missingCredential } = await import('../src/provider.js');
     const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY'];
@@ -2143,6 +2166,73 @@ console.log(JSON.stringify(r));
     assert.equal(parsed.old_str, 'find', 's→old_str for str_replace');
     assert.equal(parsed.new_str, 'replace', 'new→new_str for str_replace');
     assert.equal(parsed.path, 'f.txt', 'path preserved');
+  });
+});
+
+// ─── Server streaming error path ──────────────────────────────────────────────
+// Regression: a provider error after the SSE headers were sent used to leave
+// the response open forever (the top-level handler tried to re-send headers).
+// The stream must terminate with an `error` record instead.
+
+describe('server.js: stream error path', async () => {
+  let port;
+  let base;
+  let serverProcess;
+
+  before(async () => {
+    port = await getFreePort();
+    // Point Ollama at a port nothing listens on so the provider fails fast.
+    const deadOllamaPort = await getFreePort();
+    base = `http://127.0.0.1:${port}`;
+    serverProcess = spawn('node', ['server.js'], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        NODE_ENV: 'test',
+        OLLAMA_BASE_URL: `http://127.0.0.1:${deadOllamaPort}`,
+      },
+      stdio: 'pipe',
+    });
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('error-path server start timeout')), 10_000);
+      const onReady = data => {
+        if (data.toString().includes('listening')) {
+          clearTimeout(timeout);
+          setTimeout(resolve, 100);
+        }
+      };
+      serverProcess.stdout.on('data', onReady);
+      serverProcess.on('error', err => { clearTimeout(timeout); reject(err); });
+    });
+  });
+
+  after(async () => {
+    if (serverProcess) serverProcess.kill();
+  });
+
+  test('POST /api/sessions/:id/messages ends with an error record when the provider is unreachable', async () => {
+    const { body: created } = await httpPost(`${base}/api/sessions`, { model: 'llama3.2:latest' });
+    const sid = created.session.id;
+
+    let timer;
+    const guard = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('stream never ended — error path regressed to a hang')), 15_000);
+    });
+    const { status, lines } = await Promise.race([
+      httpPostStream(`${base}/api/sessions/${sid}/messages`, {
+        content: 'Reply with just the number 42.',
+        model: 'llama3.2:latest',
+      }),
+      guard,
+    ]).finally(() => clearTimeout(timer));
+
+    assert.equal(status, 200, 'headers already sent as 200 before the failure');
+    const err = lines.find(l => l.type === 'error');
+    assert.ok(err, 'stream terminates with an error record');
+    assert.ok(err.error, 'error record carries a message');
+    assert.equal(err.traceTurn?.status, 'failed', 'trace turn marked failed');
   });
 });
 
