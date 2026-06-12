@@ -2169,6 +2169,56 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── ui.js: incremental markdown stream ───────────────────────────────────────
+
+describe('ui.js (markdown stream)', async () => {
+  const { createMarkdownStream } = await import('../src/ui.js');
+
+  function collect() {
+    const chunks = [];
+    const stream = createMarkdownStream(c => chunks.push(c));
+    return { stream, out: () => chunks.join('') };
+  }
+
+  test('renders inline markdown on streamed lines', () => {
+    const { stream, out } = collect();
+    stream.write('Here is **bo');
+    stream.write('ld** and `code`\n');
+    stream.end();
+    const text = out();
+    assert.ok(!text.includes('**'), 'bold markers consumed');
+    assert.ok(text.includes('\x1b[1mbold\x1b[0m'), 'bold rendered as ANSI');
+    assert.ok(text.includes('\x1b[36mcode\x1b[0m'), 'inline code rendered as ANSI');
+  });
+
+  test('keeps code-fence state across chunk boundaries', () => {
+    const { stream, out } = collect();
+    stream.write('```js\nconst x');
+    stream.write(' = 1;\n``');
+    stream.write('`\nplain **after** fence\n');
+    stream.end();
+    const text = out();
+    assert.ok(text.includes('\x1b[36m  const x = 1;\x1b[0m'), 'code line rendered as code');
+    assert.ok(text.includes('\x1b[1mafter\x1b[0m'), 'inline markdown resumes after the fence');
+  });
+
+  test('renders bullets and flushes a trailing partial line on end()', () => {
+    const { stream, out } = collect();
+    stream.write('- first item\n- second');
+    assert.ok(out().includes('•'), 'completed bullet rendered before end()');
+    assert.ok(!out().includes('second'), 'partial line buffered until end()');
+    stream.end();
+    assert.ok(out().includes('second'), 'end() flushes the partial line');
+  });
+
+  test('first rendered line carries no leading newline', () => {
+    const { stream, out } = collect();
+    stream.write('hello\n');
+    stream.end();
+    assert.ok(!out().startsWith('\n'), 'no blank line between ◆ marker and first line');
+  });
+});
+
 // ─── bench/evals.js: prompt/tool-usage eval loops ─────────────────────────────
 // All offline: a scripted chatFn stands in for the model, while the real
 // executeTool runs against a throwaway sandbox.

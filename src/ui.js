@@ -179,63 +179,88 @@ export function table(title, rows) {
   console.log();
 }
 
-function renderMarkdown(text) {
-  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
-  const out = [];
+// Per-line markdown renderer with persistent state (code-fence tracking), so
+// the same logic serves whole-message rendering and incremental streaming.
+// Each call returns the rendered line prefixed with '\n' (callers strip the
+// first one), matching the historical renderMarkdown output byte-for-byte.
+function createMarkdownLineRenderer() {
   let inCode = false;
 
-  for (const rawLine of lines) {
+  return function renderLine(rawLine) {
     if (rawLine.startsWith('```')) {
       inCode = !inCode;
       if (inCode) {
         const lang = rawLine.slice(3).trim();
-        out.push(`\n${GR}  ${'─'.repeat(Math.min(cols() - 4, 40))}${R}`);
-        if (lang) out.push(`${GR}  ${lang}${R}`);
-      } else {
-        out.push(`${GR}  ${'─'.repeat(Math.min(cols() - 4, 40))}${R}\n`);
+        return `\n${GR}  ${'─'.repeat(Math.min(cols() - 4, 40))}${R}` +
+          (lang ? `${GR}  ${lang}${R}` : '');
       }
-      continue;
+      return `${GR}  ${'─'.repeat(Math.min(cols() - 4, 40))}${R}\n`;
     }
 
-    if (inCode) {
-      out.push(`\n${C}  ${rawLine || ' '}${R}`);
-      continue;
-    }
+    if (inCode) return `\n${C}  ${rawLine || ' '}${R}`;
 
     const line = rawLine.trimEnd();
-    if (!line.trim()) {
-      out.push('\n');
-      continue;
-    }
+    if (!line.trim()) return '\n';
 
     const heading = line.match(/^(#{1,6})\s+(.*)$/);
-    if (heading) {
-      out.push(`\n${B}${W}${applyInlineMarkdown(heading[2].trim())}${R}\n`);
-      continue;
-    }
+    if (heading) return `\n${B}${W}${applyInlineMarkdown(heading[2].trim())}${R}\n`;
 
     const bullet = line.match(/^(\s*)[-*]\s+(.*)$/);
-    if (bullet) {
-      out.push(`\n${Y}  •${R} ${applyInlineMarkdown(bullet[2])}`);
-      continue;
-    }
+    if (bullet) return `\n${Y}  •${R} ${applyInlineMarkdown(bullet[2])}`;
 
     const numbered = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
-    if (numbered) {
-      out.push(`\n${Y}  ${numbered[2]}.${R} ${applyInlineMarkdown(numbered[3])}`);
-      continue;
-    }
+    if (numbered) return `\n${Y}  ${numbered[2]}.${R} ${applyInlineMarkdown(numbered[3])}`;
 
     const quote = line.match(/^>\s?(.*)$/);
-    if (quote) {
-      out.push(`\n${GR}  │ ${applyInlineMarkdown(quote[1])}${R}`);
-      continue;
+    if (quote) return `\n${GR}  │ ${applyInlineMarkdown(quote[1])}${R}`;
+
+    return `\n${applyInlineMarkdown(line)}`;
+  };
+}
+
+function renderMarkdown(text) {
+  const renderLine = createMarkdownLineRenderer();
+  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
+  return lines.map(renderLine).join('').replace(/^\n/, '');
+}
+
+/**
+ * Incremental markdown renderer for live streaming: buffers deltas until a
+ * full line is available, renders it with the same state machine as
+ * renderMarkdown (so code fences survive chunk boundaries), and writes it.
+ * Output appears line-by-line instead of token-by-token — the price of
+ * formatted streaming. Call end() to flush a trailing partial line.
+ */
+export function createMarkdownStream(write = chunk => process.stdout.write(chunk)) {
+  const renderLine = createMarkdownLineRenderer();
+  let buffer = '';
+  let first = true;
+
+  const emit = (rawLine) => {
+    let rendered = renderLine(rawLine);
+    if (first) {
+      rendered = rendered.replace(/^\n/, '');
+      first = false;
     }
+    if (rendered) write(rendered);
+  };
 
-    out.push(`\n${applyInlineMarkdown(line)}`);
-  }
-
-  return out.join('').replace(/^\n/, '');
+  return {
+    write(delta) {
+      buffer += String(delta ?? '').replace(/\r\n/g, '\n');
+      let idx;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        emit(buffer.slice(0, idx));
+        buffer = buffer.slice(idx + 1);
+      }
+    },
+    end() {
+      if (buffer) {
+        emit(buffer);
+        buffer = '';
+      }
+    },
+  };
 }
 
 function applyInlineMarkdown(line) {
