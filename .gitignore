@@ -7,3 +7,6 @@ data/transcripts/
 .env
 .env.*
 !.env.example
+tmp/
+test_prompts.txt
+.claude/settings.local.json
