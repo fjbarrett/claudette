@@ -22,11 +22,30 @@ import * as ui from './ui.js';
 const execFile = promisify(_execFile);
 
 // ─── Mutable app state ────────────────────────────────────────────────────────
+
+// Reasoning-effort levels accepted by --effort / /effort, in increasing depth.
+// Passed through to providers that support it (Anthropic output_config.effort;
+// OpenRouter/OpenAI reasoning_effort). null = unset = nothing sent.
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+export function isValidEffort(value) {
+  return EFFORT_LEVELS.includes(value);
+}
+
+// Flags/env that turn on auto-approval (no per-call permission prompts). `-y`
+// is the original; the rest mirror the muscle memory of other CLIs.
+export const BYPASS_FLAGS = ['-y', '--yes', '--yolo', '--bypass', '--dangerously-skip-permissions'];
+export function resolveAutoApprove(argv = process.argv, env = process.env) {
+  if (BYPASS_FLAGS.some(f => argv.includes(f))) return true;
+  const v = env.CLAUDETTE_AUTO_APPROVE;
+  return v != null && v !== '' && v !== '0' && String(v).toLowerCase() !== 'false';
+}
+
 let model      = null;
 let session    = null;
 let workspace  = process.cwd();
 let toolsOn    = true;
-let autoApprove = process.argv.includes('-y') || process.argv.includes('--yes');
+let autoApprove = resolveAutoApprove();
+let effort     = null;  // reasoning effort, or null when unset
 let currentAC  = null;  // AbortController for active stream
 
 // Permission memory: set of tool names or "bash:<cmd>" the user said "always" to
@@ -43,6 +62,18 @@ export async function start() {
   // --model flag
   const modelIdx = process.argv.indexOf('--model');
   const modelArg = modelIdx !== -1 ? process.argv[modelIdx + 1] : null;
+
+  // --effort flag (or CLAUDETTE_EFFORT env). Reject unknown levels up front so
+  // a typo fails here, not as a provider 400 on the first message.
+  const effortIdx = process.argv.indexOf('--effort');
+  const effortArg = effortIdx !== -1 ? process.argv[effortIdx + 1] : process.env.CLAUDETTE_EFFORT;
+  if (effortArg) {
+    if (!isValidEffort(effortArg)) {
+      ui.printError(`Unknown --effort "${effortArg}". Choose one of: ${EFFORT_LEVELS.join(', ')}.`);
+      exit(1);
+    }
+    effort = effortArg;
+  }
 
   // Connect to Ollama
   let models;
@@ -83,7 +114,7 @@ export async function start() {
   // Create fresh session
   session = await createSession({ model, cwd: workspace });
 
-  ui.printBanner({ model, cwd: workspace, sessionId: session.id });
+  ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
 
   // Handle Ctrl+C: cancel stream if running, else exit
   process.on('SIGINT', () => {
@@ -167,7 +198,7 @@ async function handleMessage(text, rl) {
 
   // Build full message list for Ollama
   const messages = [
-    { role: 'system', content: buildSystemPrompt(claudeMd) },
+    { role: 'system', content: buildSystemPrompt(claudeMd, effort) },
     ...session.messages,
   ];
 
@@ -193,7 +224,7 @@ async function runExactBashShortcut(command) {
 
     const claudeMd = await loadClaudeMd(workspace);
     const messages = [
-      { role: 'system', content: buildSystemPrompt(claudeMd) },
+      { role: 'system', content: buildSystemPrompt(claudeMd, effort) },
       ...session.messages,
       {
         role: 'user',
@@ -256,6 +287,7 @@ async function agentLoop(messages, rl) {
         tools,
         signal: ac.signal,
         onDelta,
+        ...(effort ? { effort } : {}),
       });
     } catch (err) {
       ui.stopSpinner();
@@ -417,8 +449,10 @@ async function handleCommand(line, rl) {
         ['Setup & Config'],
         ['/model [name]',    'Show or switch the active model'],
         ['/models',          'List all available models (Ollama + cloud providers)'],
+        ['/effort [level]',  'Show or set reasoning effort (low|medium|high|xhigh|max|off)'],
         ['/config',          'Show current configuration'],
         ['/tools',           'Toggle tool calling on/off'],
+        ['/yolo',            'Toggle auto-approve (run tool calls without prompting)'],
 
         ['Session'],
         ['/session',         'Show current session info'],
@@ -467,6 +501,7 @@ async function handleCommand(line, rl) {
     case '/config':
       ui.table('Config', [
         ['model',       model],
+        ['effort',      effort ?? 'default (unset)'],
         ['workspace',   workspace],
         ['session',     session.id.slice(0, 8)],
         ['tools',       toolsOn ? 'enabled' : 'disabled'],
@@ -478,6 +513,32 @@ async function handleCommand(line, rl) {
     case '/tools':
       toolsOn = !toolsOn;
       ui.printInfo(`Tool calling ${toolsOn ? 'enabled' : 'disabled'}`);
+      return true;
+
+    case '/effort': {
+      if (!arg) {
+        ui.printInfo(`Reasoning effort: ${effort ?? 'default (unset)'}  |  /effort <${EFFORT_LEVELS.join('|')}|off>`);
+        return true;
+      }
+      if (arg === 'off' || arg === 'none' || arg === 'default') {
+        effort = null;
+        ui.printSuccess('Reasoning effort → default (unset)');
+        return true;
+      }
+      if (!isValidEffort(arg)) {
+        ui.printError(`Unknown effort "${arg}". Choose one of: ${EFFORT_LEVELS.join(', ')}, or off.`);
+        return true;
+      }
+      effort = arg;
+      ui.printSuccess(`Reasoning effort → ${effort}`);
+      return true;
+    }
+
+    case '/yolo':
+    case '/bypass':
+      autoApprove = !autoApprove;
+      if (autoApprove) ui.printWarning('Auto-approve ON — tool calls run without asking. Use with care.');
+      else ui.printInfo('Auto-approve OFF — tool calls will prompt for permission.');
       return true;
 
     // ── Sessions ─────────────────────────────────────────────────────────────
@@ -824,7 +885,7 @@ function extractExactBashCommand(text) {
   return match?.[1]?.trim() || null;
 }
 
-function buildSystemPrompt(claudeMd) {
+function buildSystemPrompt(claudeMd, effort) {
   const lines = [
     'You are Ollama Code, an AI coding assistant running in the terminal.',
     'You have access to tools: bash, read_file, write_file, str_replace, patch_file, list_dir, glob, grep, search_code, fetch_url.',
@@ -845,6 +906,13 @@ function buildSystemPrompt(claudeMd) {
     '- Do not run git add, git commit, git push, or create branches unless the prompt explicitly asks for git actions.',
     '- If a tool call fails because a file is missing, use the filenames named in the prompt before trying unrelated files.',
   ];
+  // Let the model answer "what effort am I on?" — it has no other introspection.
+  if (effort) {
+    lines.push(
+      `- Your reasoning effort is set to "${effort}" (one of ${EFFORT_LEVELS.join('/')}). ` +
+      `If asked what effort or reasoning level you are running at, answer "${effort}".`
+    );
+  }
   if (claudeMd) {
     lines.push('', '--- Project Instructions ---', claudeMd);
   }

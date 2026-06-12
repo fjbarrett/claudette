@@ -43,7 +43,7 @@ export async function getModels() {
   }));
 }
 
-export async function chatStream({ model, messages, tools = [], onDelta, signal }) {
+export async function chatStream({ model, messages, tools = [], onDelta, signal, effort = null }) {
   if (!hasCredentials()) {
     throw new Error(`${KEY_ENV} is not set — cannot reach ${LABEL}`);
   }
@@ -51,6 +51,6 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
     baseUrl: apiBase(),
     apiKey: apiKey(),
     model: stripPrefix(model),
-    messages, tools, onDelta, signal, label: LABEL,
+    messages, tools, onDelta, signal, label: LABEL, effort,
   });
 }

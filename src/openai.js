@@ -50,7 +50,7 @@ export async function getModels() {
   }));
 }
 
-export async function chatStream({ model, messages, tools = [], onDelta, signal }) {
+export async function chatStream({ model, messages, tools = [], onDelta, signal, effort = null }) {
   if (!hasCredentials()) {
     throw new Error(`${KEY_ENV} is not set — cannot reach ${LABEL}`);
   }
@@ -59,6 +59,7 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
     apiKey: apiKey(),
     model: stripPrefix(model),
     messages, tools, onDelta, signal, label: LABEL,
+    effort, reasoningStyle: 'openai',
   });
 }
 
@@ -70,10 +71,16 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
  * and returns { content, toolCalls, hadApiToolCalls, promptTokens,
  * completionTokens, toolMode }. `baseUrl` must include the version segment
  * (e.g. `.../v1`); `/chat/completions` is appended.
+ *
+ * `effort` (low|medium|high|xhigh|max) sets reasoning depth on models that
+ * support it. The wire field differs by ecosystem: OpenRouter wants a nested
+ * `reasoning: { effort }`, plain OpenAI-compatible endpoints want a flat
+ * `reasoning_effort` — `reasoningStyle` picks which. Only sent when `effort`
+ * is set, so default requests are byte-identical to before.
  */
 export async function chatCompletionsStream({
   baseUrl, apiKey, model, messages, tools = [], onDelta, signal,
-  label = 'OpenAI', extraHeaders = {},
+  label = 'OpenAI', extraHeaders = {}, effort = null, reasoningStyle = 'openai',
 }) {
   if (!apiKey) throw new Error(`${label}: missing API key`);
 
@@ -85,6 +92,10 @@ export async function chatCompletionsStream({
     temperature: 0,
   };
   if (tools.length) body.tools = toOpenAITools(tools);
+  if (effort) {
+    if (reasoningStyle === 'openrouter') body.reasoning = { effort };
+    else body.reasoning_effort = effort;
+  }
 
   const res = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
@@ -158,7 +169,7 @@ export function makeOpenAICompatibleProvider({
         modified: null,
       }));
     },
-    async chatStream({ model, messages, tools = [], onDelta, signal }) {
+    async chatStream({ model, messages, tools = [], onDelta, signal, effort = null }) {
       if (!hasCredentials()) {
         throw new Error(`${keyEnv} is not set — cannot reach ${label}`);
       }
@@ -167,6 +178,7 @@ export function makeOpenAICompatibleProvider({
         apiKey: readKey(),
         model: stripPrefix(model),
         messages, tools, onDelta, signal, label,
+        effort, reasoningStyle: 'openrouter',
       });
     },
   };
