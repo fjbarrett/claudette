@@ -2146,6 +2146,73 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── Server streaming error path ──────────────────────────────────────────────
+// Regression: a provider error after the SSE headers were sent used to leave
+// the response open forever (the top-level handler tried to re-send headers).
+// The stream must terminate with an `error` record instead.
+
+describe('server.js: stream error path', async () => {
+  let port;
+  let base;
+  let serverProcess;
+
+  before(async () => {
+    port = await getFreePort();
+    // Point Ollama at a port nothing listens on so the provider fails fast.
+    const deadOllamaPort = await getFreePort();
+    base = `http://127.0.0.1:${port}`;
+    serverProcess = spawn('node', ['server.js'], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        NODE_ENV: 'test',
+        OLLAMA_BASE_URL: `http://127.0.0.1:${deadOllamaPort}`,
+      },
+      stdio: 'pipe',
+    });
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('error-path server start timeout')), 10_000);
+      const onReady = data => {
+        if (data.toString().includes('listening')) {
+          clearTimeout(timeout);
+          setTimeout(resolve, 100);
+        }
+      };
+      serverProcess.stdout.on('data', onReady);
+      serverProcess.on('error', err => { clearTimeout(timeout); reject(err); });
+    });
+  });
+
+  after(async () => {
+    if (serverProcess) serverProcess.kill();
+  });
+
+  test('POST /api/sessions/:id/messages ends with an error record when the provider is unreachable', async () => {
+    const { body: created } = await httpPost(`${base}/api/sessions`, { model: 'llama3.2:latest' });
+    const sid = created.session.id;
+
+    let timer;
+    const guard = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('stream never ended — error path regressed to a hang')), 15_000);
+    });
+    const { status, lines } = await Promise.race([
+      httpPostStream(`${base}/api/sessions/${sid}/messages`, {
+        content: 'Reply with just the number 42.',
+        model: 'llama3.2:latest',
+      }),
+      guard,
+    ]).finally(() => clearTimeout(timer));
+
+    assert.equal(status, 200, 'headers already sent as 200 before the failure');
+    const err = lines.find(l => l.type === 'error');
+    assert.ok(err, 'stream terminates with an error record');
+    assert.ok(err.error, 'error record carries a message');
+    assert.equal(err.traceTurn?.status, 'failed', 'trace turn marked failed');
+  });
+});
+
 // ─── Stress loop: Ollama integration ─────────────────────────────────────────
 
 describe('Stress: Ollama message stream', async () => {

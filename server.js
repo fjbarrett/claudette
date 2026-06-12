@@ -38,9 +38,15 @@ const server = http.createServer(async (req, res) => {
 
     await serveStatic(req, res, url);
   } catch (error) {
-    sendJson(res, 500, {
-      error: error instanceof Error ? error.message : "Unexpected server error."
-    });
+    const message = error instanceof Error ? error.message : "Unexpected server error.";
+    if (res.headersSent) {
+      // Mid-stream failure: headers are gone, so close the stream with an
+      // error line instead of leaving the client waiting forever.
+      writeNdjson(res, { type: "error", error: message });
+      res.end();
+    } else {
+      sendJson(res, 500, { error: message });
+    }
   }
 });
 
@@ -244,14 +250,31 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
   pushTraceEvent(res, traceTurn, "assistant_stream_started", {});
 
   let assistantText = "";
-  const result = await chatStream({
-    model,
-    messages: conversation,
-    onDelta: (delta) => {
-      assistantText += delta;
-      writeNdjson(res, { type: "delta", content: delta });
-    }
-  });
+  let result;
+  try {
+    result = await chatStream({
+      model,
+      messages: conversation,
+      onDelta: (delta) => {
+        assistantText += delta;
+        writeNdjson(res, { type: "delta", content: delta });
+      }
+    });
+  } catch (error) {
+    // Provider unreachable or stream failed mid-flight. Headers are already
+    // sent, so finish the ndjson stream with an error record — otherwise the
+    // client hangs waiting for "done" that never comes.
+    const message = error instanceof Error ? error.message : String(error);
+    traceTurn.status = "failed";
+    traceTurn.completedAt = new Date().toISOString();
+    traceTurn.metrics.durationMs = Date.now() - startedAt;
+    pushTraceEvent(res, traceTurn, "assistant_failed", { error: message });
+    session.updatedAt = new Date().toISOString();
+    await saveSession(session);
+    writeNdjson(res, { type: "error", error: message, traceTurn });
+    res.end();
+    return;
+  }
   // result.content is the cleaned/full text; prefer it for the saved record.
   assistantText = result.content || assistantText;
   const promptTokens = result.promptTokens ?? 0;
