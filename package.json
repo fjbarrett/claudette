@@ -13,6 +13,9 @@
     "bench": "node bench/run.js",
     "bench:leaderboard": "node bench/leaderboard.js --write",
     "bench:list": "node bench/run.js --list",
+    "eval": "node bench/evals.js",
+    "eval:all": "node bench/evals.js --all",
+    "eval:list": "node bench/evals.js --list",
     "bench:all": "node bench/run.js --all --model gemma4:latest",
     "bench:gemma": "node bench/run.js --all --model gemma4:latest --verbose"
   }

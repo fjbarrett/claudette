@@ -833,6 +833,10 @@ function nullReadline() {
   };
 }
 
+// Reused by bench/evals.js so its agent loop merges text-emitted tool calls
+// exactly the way the interactive CLI does.
+export { parseTextToolCalls };
+
 export const __test_parseTextToolCalls = parseTextToolCalls;
 export const __test_extractExactBashCommand = extractExactBashCommand;
 

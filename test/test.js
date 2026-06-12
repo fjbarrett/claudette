@@ -2169,6 +2169,143 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── bench/evals.js: prompt/tool-usage eval loops ─────────────────────────────
+// All offline: a scripted chatFn stands in for the model, while the real
+// executeTool runs against a throwaway sandbox.
+
+describe('bench/evals.js (eval loops)', async () => {
+  const { runEvalIteration, matchToolCalls, argsMatch, loadCases } =
+    await import('../bench/evals.js');
+
+  // A chatFn that replays a fixed sequence of model responses.
+  function scriptedModel(responses) {
+    let i = 0;
+    return async () => responses[Math.min(i++, responses.length - 1)];
+  }
+
+  test('argsMatch: string values match by substring, others strictly', () => {
+    assert.ok(argsMatch({ command: 'echo eval-ok && ls' }, { command: 'echo eval-ok' }));
+    assert.ok(!argsMatch({ command: 'echo nope' }, { command: 'echo eval-ok' }));
+    assert.ok(argsMatch({ offset: 5 }, { offset: 5 }));
+    assert.ok(!argsMatch({ offset: 5 }, { offset: 6 }));
+    assert.ok(argsMatch({ anything: 'x' }, {}), 'empty expectation always matches');
+  });
+
+  test('matchToolCalls: ordered subsequence', () => {
+    const actual = [
+      { name: 'read_file', args: { path: 'a.txt' } },
+      { name: 'bash', args: { command: 'ls' } },
+      { name: 'str_replace', args: { path: 'a.txt' } },
+    ];
+    assert.ok(matchToolCalls(actual, [{ name: 'read_file' }, { name: 'str_replace' }]).ok,
+      'subsequence in order matches');
+    const wrongOrder = matchToolCalls(actual, [{ name: 'str_replace' }, { name: 'read_file' }]);
+    assert.ok(!wrongOrder.ok, 'out-of-order does not match');
+    assert.equal(wrongOrder.missing.name, 'read_file');
+  });
+
+  test('runEvalIteration executes tool calls in a sandbox and passes expectations', async () => {
+    const record = await runEvalIteration({
+      id: 'mock-bash',
+      prompt: 'run echo',
+      maxTurns: 4,
+      expect: {
+        tools: [{ name: 'bash', args: { command: 'echo eval-ok' } }],
+        answer: { matches: 'eval-ok' },
+      },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        { content: '', toolCalls: [{ id: 't1', function: { name: 'bash', arguments: '{"command":"echo eval-ok"}' } }] },
+        { content: 'The command printed eval-ok.' },
+      ]),
+    });
+
+    assert.equal(record.error, null);
+    assert.equal(record.turns, 2);
+    assert.equal(record.toolCalls.length, 1);
+    assert.ok(record.toolCalls[0].output.includes('eval-ok'), 'real executeTool ran the command');
+    assert.ok(record.pass, `expected pass, failures: ${record.failures.join(' | ')}`);
+  });
+
+  test('runEvalIteration merges text-emitted tool calls like the CLI does', async () => {
+    const record = await runEvalIteration({
+      id: 'mock-text-call',
+      prompt: 'write a file',
+      maxTurns: 4,
+      expect: {
+        tools: [{ name: 'write_file', args: { path: 'out.txt' } }],
+        files: { 'out.txt': { includes: 'hi' } },
+      },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        // Tool call emitted as JSON in the text body, no API toolCalls field.
+        { content: '{"name": "write_file", "arguments": {"path": "out.txt", "content": "hi"}}' },
+        { content: 'done' },
+      ]),
+    });
+
+    assert.equal(record.error, null);
+    assert.ok(record.pass, `expected pass, failures: ${record.failures.join(' | ')}`);
+    assert.equal(record.toolCalls[0].name, 'write_file');
+  });
+
+  test('runEvalIteration fails on forbidden tools and missing expectations', async () => {
+    const record = await runEvalIteration({
+      id: 'mock-forbidden',
+      prompt: 'edit the file',
+      files: { 'config.js': 'export const TIMEOUT = 30;\n' },
+      maxTurns: 4,
+      expect: {
+        tools: [{ name: 'str_replace', args: { path: 'config.js' } }],
+        forbid: ['write_file'],
+        files: { 'config.js': { includes: 'TIMEOUT = 90' } },
+      },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        // Model rewrites the whole file instead of a targeted edit — and gets it wrong.
+        { content: '', toolCalls: [{ id: 't1', function: { name: 'write_file', arguments: '{"path":"config.js","content":"export const TIMEOUT = 60;"}' } }] },
+        { content: 'done' },
+      ]),
+    });
+
+    assert.ok(!record.pass);
+    assert.ok(record.failures.some(f => f.includes('missing tool call: str_replace')), 'flags missing str_replace');
+    assert.ok(record.failures.some(f => f.includes('forbidden tool was called: write_file')), 'flags forbidden write_file');
+    assert.ok(record.failures.some(f => f.includes('does not include')), 'flags wrong file content');
+  });
+
+  test('runEvalIteration stops at maxTurns without a final answer', async () => {
+    const record = await runEvalIteration({
+      id: 'mock-loop',
+      prompt: 'loop forever',
+      maxTurns: 3,
+      expect: { answer: { matches: 'never-said' } },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        { content: '', toolCalls: [{ id: 't1', function: { name: 'bash', arguments: '{"command":"true"}' } }] },
+      ]),
+    });
+
+    assert.equal(record.turns, 3, 'hit the turn cap');
+    assert.ok(!record.pass, 'no final answer → answer expectation fails');
+  });
+
+  test('shipped eval cases are well-formed', async () => {
+    const cases = await loadCases();
+    assert.ok(cases.length >= 4, 'has seed cases');
+    for (const c of cases) {
+      assert.ok(c.id && c.title && c.prompt, `${c.id ?? '?'} has id/title/prompt`);
+      assert.ok(c.expect && Object.keys(c.expect).length, `${c.id} has expectations`);
+    }
+    const ids = cases.map(c => c.id);
+    assert.equal(new Set(ids).size, ids.length, 'case ids unique');
+  });
+});
+
 // ─── Server streaming error path ──────────────────────────────────────────────
 // Regression: a provider error after the SSE headers were sent used to leave
 // the response open forever (the top-level handler tried to re-send headers).

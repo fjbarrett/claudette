@@ -114,6 +114,33 @@ Each task supports:
 - `timeoutSec`
 - `judgeFocus`: guidance for the LLM judge
 
+## Eval Loops (`bench/evals.js`)
+
+A lighter, faster companion to the full benchmark harness for testing **prompts
+and tool usage**. Instead of a git worktree and a CLI subprocess per run, each
+case drives an in-process agent loop (`chatStream` + `executeTool`) inside a
+throwaway sandbox, records every tool call, and checks declarative
+expectations: which tools were called (ordered subsequence, with argument
+matchers), which tools are forbidden, what the workspace files look like
+afterwards, and what the final answer says.
+
+```sh
+npm run eval:list                                    # list cases
+npm run eval -- --all --model anthropic/claude-opus-4-8
+npm run eval -- --case edit-not-rewrite --repeat 5   # flakiness loop: pass@k / pass^k
+npm run eval -- --case bash-echo --verbose --keep    # show tool calls, keep sandbox
+```
+
+Cases live in `bench/evals/*.json` (see the header comment in `bench/evals.js`
+for the schema). Repeating a case N times reports `pass@k` (any iteration
+passed) and `pass^k` (all passed) — the standard way to surface flaky
+tool-calling behaviour. Reports land in `bench/runs/evals/` (gitignored).
+Expected string argument values match by substring; everything else strictly.
+The loop merges text-emitted tool calls exactly the way the interactive CLI
+does, so models that write JSON tool calls into their text body are scored
+fairly. With no `--model`, the first credentialed cloud provider's default
+agent model is used.
+
 ## Notes
 
 - The harness runs the real CLI agent with `-y`, so tool calls are auto-approved during benchmark runs.
