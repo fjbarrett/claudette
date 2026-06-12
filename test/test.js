@@ -2169,6 +2169,31 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── chat.js: startup credential guard ────────────────────────────────────────
+
+describe('chat.js (credential guard)', async () => {
+  const { suggestCredentialFix } = await import('../src/chat.js');
+  const missing = { model: 'anthropic/claude-opus-4-8', env: 'ANTHROPIC_API_KEY', label: 'Anthropic' };
+
+  test('names the missing env var and the offending model', () => {
+    const msg = suggestCredentialFix(missing, {});
+    assert.ok(msg.includes('ANTHROPIC_API_KEY'), 'names the env var');
+    assert.ok(msg.includes('anthropic/claude-opus-4-8'), 'names the model');
+  });
+
+  test('suggests routing through OpenRouter when an OpenRouter key is set', () => {
+    const msg = suggestCredentialFix(missing, { OPENROUTER_API_KEY: 'k' });
+    assert.ok(msg.includes('--model openrouter/anthropic/claude-opus-4-8'), 'suggests openrouter-prefixed model');
+    assert.ok(/openrouter\.ai\/models|\/models/.test(msg), 'points at the model list for the exact slug');
+  });
+
+  test('falls back to .env setup guidance with no key', () => {
+    const msg = suggestCredentialFix(missing, {});
+    assert.ok(msg.includes('.env'), 'mentions .env setup');
+    assert.ok(msg.includes('OPENROUTER_API_KEY'), 'recommends the one-key option');
+  });
+});
+
 // ─── ui.js: incremental markdown stream ───────────────────────────────────────
 
 describe('ui.js (markdown stream)', async () => {
