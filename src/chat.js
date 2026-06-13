@@ -272,12 +272,15 @@ async function runTurn(messages, rl, trace) {
   rl.pause();
   process.stdin.resume();
   stdout.write('\x1b[?2004h'); // enable bracketed paste so a paste arrives as one unit
+  ui.setLiveInputActive(true); // show what the user types while the turn runs
   const handler = makeTurnInputHandler(sessionInput);
   process.stdin.on('data', handler);
   try {
     await agentLoop(messages, rl, trace, sessionInput);
   } finally {
     process.stdin.removeListener('data', handler);
+    ui.updateLiveInput('');       // erase any in-progress input line
+    ui.setLiveInputActive(false);
     stdout.write('\x1b[?2004l'); // disable bracketed paste
     sessionInput.setMode('idle');
     try { rl.resume(); } catch { /* readline already closed */ }
@@ -290,6 +293,7 @@ async function runTurn(messages, rl, trace) {
 function makeTurnInputHandler(input) {
   const feed = createInputAssembler({
     onLine: (content) => handleTurnInputLine(content, input),
+    onChange: (buf) => ui.updateLiveInput(buf), // echo typed text on the bottom row
     onCancel: () => {
       if (currentAC) {
         currentAC.abort();
@@ -417,7 +421,9 @@ async function agentLoop(messages, rl, trace = null, input = null) {
         trace?.event('assistant_stream_started', { iteration });
         ui.stopSpinner();
         ui.printAssistantStart();
-        mdStream = ui.createMarkdownStream();
+        // During capture, route streamed output through printAboveLive so it
+        // never lands on the user's live input row.
+        mdStream = ui.createMarkdownStream(input ? ui.printAboveLive : undefined);
       }
       mdStream.write(delta);
     };

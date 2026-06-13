@@ -12,6 +12,10 @@
   pasted block is coalesced into a single follow-up (`createInputAssembler`).
 
 ### Added
+- See your follow-ups while the agent works. In an auto-approve TTY session, typed
+  input is now echoed on a managed bottom row (it was blind before) — streamed
+  output is routed above it so the two don't collide, and typing pauses the
+  spinner. (`updateLiveInput`/`printAboveLive` in `ui.js`, assembler `onChange`.)
 - Persistent per-directory prompt history. Re-entering the TUI in the same
   directory restores what you typed there — **up-arrow recalls prior-session
   prompts** like a normal shell (newest-first, consecutive dups skipped). Stored
