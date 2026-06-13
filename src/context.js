@@ -1,21 +1,31 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
+// Project-instruction files loaded into context at each level, in priority
+// order: a Claudette-specific CLAUDETTE.md augments/overrides CLAUDE.md.
+const CONTEXT_FILES = ['CLAUDE.md', 'CLAUDETTE.md'];
+
 /**
- * Walk up from cwd collecting CLAUDE.md files (parent-first so innermost wins).
- * Returns combined content, or empty string if none found.
+ * Walk up from cwd collecting CLAUDE.md / CLAUDETTE.md files (parent-first so
+ * innermost wins). Returns combined content, or empty string if none found.
  */
 export async function loadClaudeMd(cwd) {
   const parts = [];
   let dir = path.resolve(cwd);
 
   while (true) {
-    const candidate = path.join(dir, 'CLAUDE.md');
-    try {
-      const content = await fsp.readFile(candidate, 'utf8');
-      const label = path.relative(cwd, candidate) || 'CLAUDE.md';
-      parts.unshift(`[${label}]\n${content.trim()}`);
-    } catch { /* not found at this level */ }
+    const levelParts = [];
+    for (const name of CONTEXT_FILES) {
+      const candidate = path.join(dir, name);
+      try {
+        const content = await fsp.readFile(candidate, 'utf8');
+        const label = path.relative(cwd, candidate) || name;
+        levelParts.push(`[${label}]\n${content.trim()}`);
+      } catch { /* not found at this level */ }
+    }
+    // Prepend this level's files together (deeper, more specific levels stay
+    // last in the final string), preserving CLAUDE.md → CLAUDETTE.md order.
+    if (levelParts.length) parts.unshift(...levelParts);
 
     // Stop at git repository roots so we don't bleed into parent repos.
     const gitEntry = path.join(dir, '.git');
