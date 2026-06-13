@@ -1,5 +1,6 @@
 // ANSI-based terminal rendering — no external dependencies
 import process from 'node:process';
+import { formatUsd } from './cost.js';
 
 const R = '\x1b[0m', B = '\x1b[1m', D = '\x1b[2m';
 const P = '\x1b[35m', C = '\x1b[36m', G = '\x1b[32m';
@@ -68,8 +69,15 @@ export function printAssistantMessage(text) {
   process.stdout.write(rendered);
 }
 
-export function printAssistantEnd({ model: m, tokens } = {}) {
-  const info = [m, tokens ? `~${tokens} tokens` : null].filter(Boolean).join(' · ');
+export function printAssistantEnd({ model: m, tokens, costUsd, sessionCostUsd } = {}) {
+  const turnCost = formatUsd(costUsd);
+  const sessCost = formatUsd(sessionCostUsd);
+  const info = [
+    m,
+    tokens ? `~${tokens} tokens` : null,
+    turnCost ? `~${turnCost}` : null,
+    sessCost ? `session ~${sessCost}` : null,
+  ].filter(Boolean).join(' · ');
   process.stdout.write(info ? `\n\n${GR}  ↳ ${info}${R}\n` : '\n');
 }
 
@@ -90,8 +98,8 @@ export function printToolCall(name, args) {
     args.pattern   ? args.pattern :
     args.content   ? `${String(args.content).split('\n').length} lines` :
     truncate(JSON.stringify(args), cols() - 20);
-  const alias = displayName === name ? '' : ` ${GR}[${name}]${R}`;
-  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${alias}${GR}(${truncate(primary, cols() - displayName.length - name.length - 8)})${R}\n`);
+  // One clean label per call — the friendly name only (no redundant `[read_file]`).
+  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${GR}(${truncate(primary, cols() - displayName.length - 8)})${R}\n`);
 }
 
 export function printToolResult(name, output, isError = false) {
