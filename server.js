@@ -9,6 +9,7 @@ import { saveTranscript } from "./src/transcript.js";
 import { resolveOllamaBaseUrl } from "./src/config.js";
 import { chatStream, getModels as getProviderModels } from "./src/provider.js";
 import { getModels as getAnthropicModels } from "./src/anthropic.js";
+import { createTurnTrace } from "./src/trace.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -187,23 +188,16 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
 
   const expanded = await expandPromptContext(promptText, cwd);
   const userMessage = { role: "user", content: expanded.text };
-  const traceTurn = {
-    id: randomUUID(),
-    prompt: truncateLine(promptText, 160),
-    createdAt: new Date().toISOString(),
-    completedAt: null,
-    status: "running",
+  // Shared turn tracer; each event is also streamed to the browser as a
+  // `trace` record so the web UI updates live.
+  const trace = createTurnTrace({
+    prompt: promptText,
     model,
     cwd,
     expandedFiles: expanded.files,
-    metrics: {
-      durationMs: null,
-      promptTokens: 0,
-      completionTokens: 0,
-      totalTokens: 0
-    },
-    events: []
-  };
+    onEvent: (event, turn) => writeNdjson(res, { type: "trace", turnId: turn.id, event })
+  });
+  const traceTurn = trace.turn;
   session.cwd = cwd;
   session.model = model;
   session.updatedAt = new Date().toISOString();
@@ -233,21 +227,14 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
     traceTurn
   });
 
-  const startedAt = Date.now();
-  pushTraceEvent(res, traceTurn, "input_received", {
-    promptChars: promptText.length
-  });
-  pushTraceEvent(res, traceTurn, "files_expanded", {
-    count: expanded.files.length,
-    files: expanded.files
-  });
-  pushTraceEvent(res, traceTurn, "system_prompt_built", {
+  trace.event("input_received", { promptChars: promptText.length });
+  trace.event("files_expanded", { count: expanded.files.length, files: expanded.files });
+  trace.event("system_prompt_built", {
     systemChars: String(body?.system || DEFAULT_SYSTEM_PROMPT).length,
     historyMessages: conversation.length
   });
-  pushTraceEvent(res, traceTurn, "model_request_started", { model });
-
-  pushTraceEvent(res, traceTurn, "assistant_stream_started", {});
+  trace.event("model_request_started", { model });
+  trace.event("assistant_stream_started", {});
 
   let assistantText = "";
   let result;
@@ -265,10 +252,8 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
     // sent, so finish the ndjson stream with an error record — otherwise the
     // client hangs waiting for "done" that never comes.
     const message = error instanceof Error ? error.message : String(error);
-    traceTurn.status = "failed";
-    traceTurn.completedAt = new Date().toISOString();
-    traceTurn.metrics.durationMs = Date.now() - startedAt;
-    pushTraceEvent(res, traceTurn, "assistant_failed", { error: message });
+    trace.fail();
+    trace.event("assistant_failed", { error: message });
     session.updatedAt = new Date().toISOString();
     await saveSession(session);
     writeNdjson(res, { type: "error", error: message, traceTurn });
@@ -277,23 +262,12 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
   }
   // result.content is the cleaned/full text; prefer it for the saved record.
   assistantText = result.content || assistantText;
-  const promptTokens = result.promptTokens ?? 0;
-  const completionTokens = result.completionTokens ?? 0;
 
   const assistantMessage = { role: "assistant", content: assistantText };
   session.messages.push(assistantMessage);
-  traceTurn.status = "completed";
-  traceTurn.completedAt = new Date().toISOString();
-  traceTurn.metrics = {
-    durationMs: Date.now() - startedAt,
-    promptTokens,
-    completionTokens,
-    totalTokens: promptTokens + completionTokens
-  };
-  pushTraceEvent(res, traceTurn, "assistant_completed", {
-    chars: assistantText.length,
-    ...traceTurn.metrics
-  });
+  trace.addUsage({ promptTokens: result.promptTokens ?? 0, completionTokens: result.completionTokens ?? 0 });
+  trace.complete();
+  trace.event("assistant_completed", { chars: assistantText.length, ...traceTurn.metrics });
   session.updatedAt = new Date().toISOString();
   await saveSession(session);
 
@@ -448,21 +422,6 @@ async function getDefaultModel() {
 
 function writeNdjson(res, payload) {
   res.write(`${JSON.stringify(payload)}\n`);
-}
-
-function pushTraceEvent(res, traceTurn, type, data) {
-  const event = {
-    id: randomUUID(),
-    type,
-    at: new Date().toISOString(),
-    data
-  };
-  traceTurn.events.push(event);
-  writeNdjson(res, {
-    type: "trace",
-    turnId: traceTurn.id,
-    event
-  });
 }
 
 function sendJson(res, statusCode, payload) {

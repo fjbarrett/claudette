@@ -17,6 +17,7 @@ import { getModels, chatStream, missingCredential } from './provider.js';
 import { TOOL_DEFS, executeTool } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
 import { loadClaudeMd, expandFiles } from './context.js';
+import { createTurnTrace, truncateLine } from './trace.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -194,11 +195,19 @@ async function handleMessage(text, rl) {
   // Push to session history
   session.messages.push({ role: 'user', content: expandedText });
   if (session.title === 'New Session') session.title = text.slice(0, 60);
+
+  // Start a turn trace (session.turns[]) so this turn can be debugged later.
+  if (!Array.isArray(session.turns)) session.turns = [];
+  const trace = createTurnTrace({ prompt: text, model, cwd: workspace, expandedFiles: files });
+  session.turns.push(trace.turn);
+  trace.event('input_received', { promptChars: text.length });
+  trace.event('files_expanded', { count: files.length, files });
+
   void scheduleSessionSave(session);
 
   const exactCommand = extractExactBashCommand(expandedText);
   if (exactCommand) {
-    await runExactBashShortcut(exactCommand);
+    await runExactBashShortcut(exactCommand, trace);
     return;
   }
 
@@ -215,25 +224,34 @@ async function handleMessage(text, rl) {
   const claudeMd = await loadClaudeMd(workspace);
 
   // Build full message list for Ollama
+  const systemPrompt = buildSystemPrompt(claudeMd, effort);
   const messages = [
-    { role: 'system', content: buildSystemPrompt(claudeMd, effort) },
+    { role: 'system', content: systemPrompt },
     ...session.messages,
   ];
+  trace.event('system_prompt_built', { systemChars: systemPrompt.length, historyMessages: messages.length });
 
-  await agentLoop(messages, rl);
+  await agentLoop(messages, rl, trace);
 }
 
-async function runExactBashShortcut(command) {
+async function runExactBashShortcut(command, trace = null) {
   ui.printToolCall('bash', { command });
+  trace?.event('tool_call', { name: 'bash', preview: truncateLine(command, 200) });
   try {
     const output = await executeTool('bash', { command }, { cwd: workspace, workspace });
     ui.printToolResult('bash', output);
+    trace?.event('tool_result', { name: 'bash', isError: false, chars: String(output).length });
     const assistantMsg = 'Executed the exact bash command from the prompt.';
     session.messages.push({ role: 'assistant', content: assistantMsg });
     session.messages.push({ role: 'tool', content: output, name: 'bash' });
+    if (trace) {
+      trace.complete();
+      trace.event('assistant_completed', { chars: assistantMsg.length, ...trace.turn.metrics });
+    }
     await flushSessionSave(session);
   } catch (err) {
     ui.printToolResult('bash', err.message, true);
+    trace?.event('tool_result', { name: 'bash', isError: true, chars: String(err.message).length });
     session.messages.push({
       role: 'tool',
       content: `Exact-command shortcut failed: ${err.message}`,
@@ -249,12 +267,13 @@ async function runExactBashShortcut(command) {
         content: `The exact bash command from the prompt failed.\nCommand:\n${command}\n\nError:\n${err.message}\n\nInspect the relevant file(s), repair the issue, and verify the task.`,
       },
     ];
-    await agentLoop(messages, nullReadline());
+    // Continue the same turn trace through the recovery loop.
+    await agentLoop(messages, nullReadline(), trace);
   }
 }
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
-async function agentLoop(messages, rl) {
+async function agentLoop(messages, rl, trace = null) {
   const tools = toolsOn ? TOOL_DEFS : [];
   let iteration = 0;
   const MAX_ITERATIONS = 20; // prevent runaway loops
@@ -297,6 +316,7 @@ async function agentLoop(messages, rl) {
       }
       if (!streamStarted) {
         streamStarted = true;
+        trace?.event('assistant_stream_started', { iteration });
         ui.stopSpinner();
         ui.printAssistantStart();
         mdStream = ui.createMarkdownStream();
@@ -306,6 +326,7 @@ async function agentLoop(messages, rl) {
 
 
     let result;
+    trace?.event('model_request_started', { model, iteration });
     try {
       result = await chatStream({
         model,
@@ -317,7 +338,15 @@ async function agentLoop(messages, rl) {
       });
     } catch (err) {
       if (!jsonIpc) ui.stopSpinner();
-      if (err.name === 'AbortError') return; // user cancelled
+      if (err.name === 'AbortError') {
+        trace?.event('assistant_aborted', { iteration });
+        trace?.fail();
+        await flushSessionSave(session);
+        return; // user cancelled
+      }
+      trace?.event('assistant_failed', { error: err.message, iteration });
+      trace?.fail();
+      await flushSessionSave(session);
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'error', error: err.message }));
       } else {
@@ -331,6 +360,7 @@ async function agentLoop(messages, rl) {
     }
 
     if (!jsonIpc && !streamStarted) ui.stopSpinner();
+    trace?.addUsage({ promptTokens: result.promptTokens, completionTokens: result.completionTokens });
 
     // ── Merge text-parsed tool calls with API tool calls ─────────────────────
     // Some models (qwen2.5-coder) emit some calls via API and others as JSON
@@ -367,6 +397,10 @@ async function agentLoop(messages, rl) {
         });
       }
       session.messages.push({ role: 'assistant', content: result.content });
+      if (trace) {
+        trace.complete();
+        trace.event('assistant_completed', { chars: (result.content ?? '').length, ...trace.turn.metrics });
+      }
       await flushSessionSave(session);
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'assistant', content: result.content }));
@@ -405,6 +439,7 @@ async function agentLoop(messages, rl) {
         args = { raw: rawArgs };
       }
 
+      trace?.event('tool_call', { name, preview: truncateLine(JSON.stringify(args ?? {}), 200) });
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'tool_call', name, arguments: args }));
       }
@@ -418,6 +453,7 @@ async function agentLoop(messages, rl) {
       if (!allowed) {
         const denied = 'User denied permission for this operation.';
         ui.printWarning(denied);
+        trace?.event('tool_denied', { name });
         const deniedMsg = { role: 'tool', content: denied, ...(call.id ? { tool_call_id: call.id } : {}) };
         messages.push(deniedMsg);
         session.messages.push(deniedMsg);
@@ -437,8 +473,8 @@ async function agentLoop(messages, rl) {
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'tool_result', name, result: toolResult, isError }));
       }
-
       if (!jsonIpc) ui.printToolResult(name, toolResult, isError);
+      trace?.event('tool_result', { name, isError, chars: toolResult.length });
 
       const resultMsg = { role: 'tool', content: toolResult, ...(call.id ? { tool_call_id: call.id } : {}) };
 
@@ -450,6 +486,11 @@ async function agentLoop(messages, rl) {
     // Loop continues → send tool results back to model
   }
 
+  if (trace) {
+    trace.event('max_iterations', { iterations: MAX_ITERATIONS });
+    trace.complete();
+    await flushSessionSave(session);
+  }
   ui.printWarning(`Reached ${MAX_ITERATIONS} tool iterations — stopping to prevent runaway loop.`);
 }
 

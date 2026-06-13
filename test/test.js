@@ -2112,6 +2112,42 @@ describe('CLI tool loop with mock Ollama', async () => {
       'second request includes bash command output'
     );
   });
+
+  test('records a per-turn trace (session.turns[]) with events and metrics', async () => {
+    const sessionsDir = path.join(ROOT, 'data', 'sessions');
+    const before = new Set(await fsp.readdir(sessionsDir));
+
+    const { timedOut } = await runCliWithInput(
+      ['inspect the file\n'],
+      {
+        args: ['-y', '--cwd', tmpDir, '--model', 'mock-coder:latest'],
+        env: { OLLAMA_BASE_URL: mockBaseUrl },
+        timeout: 15_000,
+      }
+    );
+    assert.equal(timedOut, false, 'cli should exit normally');
+
+    const created = (await fsp.readdir(sessionsDir)).filter(f => f.endsWith('.json') && !before.has(f));
+    try {
+      let turn;
+      for (const f of created) {
+        const s = JSON.parse(await fsp.readFile(path.join(sessionsDir, f), 'utf8'));
+        if (s.turns?.[0]?.prompt?.includes('inspect the file')) { turn = s.turns[0]; break; }
+      }
+      assert.ok(turn, 'a session with a trace for this prompt was written');
+
+      const types = turn.events.map(e => e.type);
+      for (const expected of ['input_received', 'files_expanded', 'model_request_started', 'tool_call', 'tool_result', 'assistant_completed']) {
+        assert.ok(types.includes(expected), `turn records "${expected}" event (got: ${types.join(', ')})`);
+      }
+      assert.equal(turn.events.find(e => e.type === 'tool_call').data.name, 'read_file', 'tool_call event names the tool');
+      assert.equal(turn.status, 'completed', 'turn marked completed');
+      assert.ok(turn.metrics.durationMs >= 0, 'turn records a duration');
+      assert.equal(typeof turn.metrics.totalTokens, 'number', 'turn records token metrics');
+    } finally {
+      await Promise.all(created.map(f => fsp.rm(path.join(sessionsDir, f), { force: true })));
+    }
+  });
 });
 
 // ─── chat.js parser tests (normalizeArgs fix for 's' alias) ──────────────────
