@@ -2,9 +2,9 @@ id: "tool-roundtrip-test"
 title: "Write and run a tool round-trip integration test"
 category: "coding"
 timeoutSec: 180
-prompt: >
+prompt: |-
   Call write_file NOW — do not read any files first. Write bench/scratch/tool-roundtrip.js with this exact content:
-  
+
   import { executeTool } from '../../src/tools.js';
   (async () => {
     const r1 = await executeTool('bash', { command: 'echo hello' }, { cwd: '.', workspace: '.' });
@@ -14,9 +14,8 @@ prompt: >
     if (!r2.includes('test')) throw new Error('read_file assert failed: ' + r2);
     console.log('all passed');
   })();
-  
+
   After writing, run: node bench/scratch/tool-roundtrip.js
-verify: 
-  - node bench/scratch/tool-roundtrip.js
-judgeFocus: >
-  Did the agent create a valid ESM test file that imports executeTool, runs both assertions, and exits 0? Penalise for using require() instead of import, skipping an assertion, catching errors silently, or the test failing at runtime.
+verify:
+  - "node bench/scratch/tool-roundtrip.js"
+judgeFocus: "Did the agent create a valid ESM test file that imports executeTool, runs both assertions, and exits 0? Penalise for using require() instead of import, skipping an assertion, catching errors silently, or the test failing at runtime."

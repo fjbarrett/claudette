@@ -7,11 +7,11 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { resolveOllamaBaseUrl } from '../src/config.js';
 import { chatStream, missingCredential, defaultCloudModels } from '../src/provider.js';
+import { loadTasks } from './tasks.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
-const TASKS_DIR = path.join(__dirname, 'tasks');
 const RUNS_DIR = path.join(__dirname, 'runs');
 // Worktrees live one level above the repo root so loadClaudeMd (which stops at
 // .git boundaries) never walks up and finds the repo's own CLAUDE.md.
@@ -266,14 +266,42 @@ function computeHardScore({ agentRun, verification, diffStat, gitStatus }) {
   };
 }
 
+// The agent runs under --json-ipc, so its stdout is a JSONL event stream
+// (turn/delta/assistant/tool_call/tool_result/done/error). Reconstruct a
+// human-readable workflow summary from those events. Any non-JSON line is
+// ignored, so stray output never corrupts the summary.
 function buildWorkflowSummary(stdout) {
-  const lines = String(stdout ?? '').split('\n');
-  const toolLines = lines.filter(line => line.includes('⏺') || line.includes('Allow this tool call?'));
-  const summary = [...toolLines, ...lines.slice(-40)].join('\n').trim();
-  return {
-    toolEvents: toolLines.length,
-    summary,
-  };
+  const events = [];
+  let toolEvents = 0;
+  for (const line of String(stdout ?? '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let msg;
+    try { msg = JSON.parse(trimmed); } catch { continue; }
+    switch (msg.type) {
+      case 'turn':
+        events.push(`── turn ${msg.iteration} ──`);
+        break;
+      case 'tool_call':
+        toolEvents++;
+        events.push(`⏺ ${msg.name}(${truncate(oneLine(JSON.stringify(msg.arguments ?? {})), 300)})`);
+        break;
+      case 'tool_result':
+        events.push(`  ⎿ ${msg.name} → ${msg.isError ? 'ERROR' : 'ok'}: ${truncate(oneLine(msg.result), 200)}`);
+        break;
+      case 'assistant':
+        if (msg.content && msg.content.trim()) events.push(`assistant: ${truncate(oneLine(msg.content), 400)}`);
+        break;
+      case 'error':
+        events.push(`error: ${msg.error}`);
+        break;
+    }
+  }
+  return { toolEvents, summary: events.join('\n').trim() };
+}
+
+function oneLine(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
 async function judgeRun({ judgeModel, task, model, agentRun, workflow, verification, diffStat, diff, gitStatus }) {
@@ -503,99 +531,6 @@ async function git(args, cwd) {
   return result.stdout;
 }
 
-function parseYaml(text) {
-  const lines = text.split(/\r?\n/);
-  const result = {};
-  let currentKey = null;
-  let blockType = null; // 'literal' (|) or 'folded' (>) or 'array'
-  let blockIndent = 0;
-  let blockLines = [];
-
-  function flushBlock() {
-    if (!currentKey) return;
-    if (blockType === 'literal' || blockType === 'folded') {
-      let content = blockLines.join('\n');
-      if (blockType === 'folded') {
-        content = blockLines.join(' ').replace(/\s+/g, ' ').trim();
-      }
-      result[currentKey] = content;
-    } else if (blockType === 'array') {
-      result[currentKey] = blockLines;
-    }
-    currentKey = null;
-    blockType = null;
-    blockLines = [];
-  }
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-
-    const indent = line.length - line.trimStart().length;
-
-    if (blockType && indent > blockIndent) {
-      if (blockType === 'array') {
-        if (trimmed.startsWith('-')) {
-          blockLines.push(trimmed.slice(1).trim());
-        }
-      } else {
-        blockLines.push(line.slice(blockIndent + 2));
-      }
-      continue;
-    } else if (blockType) {
-      flushBlock();
-    }
-
-    const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) continue;
-
-    const key = line.slice(0, colonIdx).trim();
-    const value = line.slice(colonIdx + 1).trim();
-
-    if (value === '|' || value === '>') {
-      currentKey = key;
-      blockType = value === '|' ? 'literal' : 'folded';
-      blockIndent = indent;
-    } else if (value === '' && i + 1 < lines.length && lines[i + 1].trim().startsWith('-')) {
-      currentKey = key;
-      blockType = 'array';
-      blockIndent = indent;
-    } else {
-      let parsedVal = value;
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-        parsedVal = value.slice(1, -1);
-      } else if (value === 'true') {
-        parsedVal = true;
-      } else if (value === 'false') {
-        parsedVal = false;
-      } else if (!isNaN(value) && value !== '') {
-        parsedVal = Number(value);
-      }
-      result[key] = parsedVal;
-    }
-  }
-  flushBlock();
-  return result;
-}
-
-async function loadTasks() {
-  const entries = await fs.readdir(TASKS_DIR);
-  const tasks = [];
-  for (const entry of entries) {
-    const ext = path.extname(entry).toLowerCase();
-    if (ext !== '.json' && ext !== '.yaml' && ext !== '.yml') continue;
-    const raw = await fs.readFile(path.join(TASKS_DIR, entry), 'utf8');
-    if (ext === '.json') {
-      tasks.push(JSON.parse(raw));
-    } else {
-      tasks.push(parseYaml(raw));
-    }
-  }
-  return tasks.sort((a, b) => a.id.localeCompare(b.id));
-}
-
-
 function pickTask(tasks, id) {
   if (!id) return null;
   return tasks.find(task => task.id === id) ?? null;
@@ -695,7 +630,11 @@ function round1(n) {
   return Math.round(n * 10) / 10;
 }
 
-main().catch(error => {
-  console.error(error.stack || error.message);
-  process.exit(1);
-});
+// Only run the CLI when executed directly (`node bench/run.js`), not when a
+// test imports this module for its helpers.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch(error => {
+    console.error(error.stack || error.message);
+    process.exit(1);
+  });
+}

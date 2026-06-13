@@ -2,12 +2,10 @@ id: "fullstack-nextjs-postgres"
 title: "Create a full-stack containerized Next.js + Postgres app"
 category: "coding"
 timeoutSec: 300
-prompt: >
-  Create a full stack, containerized application with NextJS and Postgres. Scaffold everything inside a new subdirectory called `myapp/`. Do NOT modify any existing files outside that directory. Create from scratch: `myapp/docker-compose.yml` with nextjs and postgres services, `myapp/app/package.json` with next as a dependency, `myapp/app/pages/index.js` as a minimal Next.js page, and `myapp/app/.env.example` with DATABASE_URL. Use write_file for all new files.
-verify: 
-  - test -f myapp/docker-compose.yml
-  - docker compose -f myapp/docker-compose.yml config --quiet
-  - grep -q '"next"' myapp/app/package.json
-  - grep -qi 'postgres' myapp/docker-compose.yml
-judgeFocus: >
-  Did the agent create a working docker-compose.yml with Next.js and Postgres services, a Next.js app directory with package.json, and any necessary connection/env configuration? Penalise for missing files, broken compose syntax, or incomplete wiring.
+prompt: "Create a full stack, containerized application with NextJS and Postgres. Scaffold everything inside a new subdirectory called `myapp/`. Do NOT modify any existing files outside that directory. Create from scratch: `myapp/docker-compose.yml` with nextjs and postgres services, `myapp/app/package.json` with next as a dependency, `myapp/app/pages/index.js` as a minimal Next.js page, and `myapp/app/.env.example` with DATABASE_URL. Use write_file for all new files."
+verify:
+  - "test -f myapp/docker-compose.yml"
+  - "docker compose -f myapp/docker-compose.yml config --quiet"
+  - "grep -q '\"next\"' myapp/app/package.json"
+  - "grep -qi 'postgres' myapp/docker-compose.yml"
+judgeFocus: "Did the agent create a working docker-compose.yml with Next.js and Postgres services, a Next.js app directory with package.json, and any necessary connection/env configuration? Penalise for missing files, broken compose syntax, or incomplete wiring."

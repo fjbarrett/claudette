@@ -3,6 +3,19 @@
 ## [Unreleased]
 
 ### Added
+- Benchmark harness upgrades. **Request caching** (default-on, `--no-cache`):
+  `provider.chatStream` hashes each request (model/messages/tools/effort, order-
+  independent, callbacks excluded) into `bench/runs/.cache/` so re-runs and
+  re-judging are free; writes are atomic (temp + rename) and a corrupt/missing
+  entry degrades to a live call with a stderr warning instead of crashing.
+  **Structured JSON IPC**: the harness drives `claudette.js --json-ipc`, which
+  emits a pure JSONL event stream (`ready`/`turn`/`delta`/`tool_call`/
+  `tool_result`/`assistant`/`done`/`error`) with no spinner/markdown/banner
+  leakage, replacing terminal-glyph scraping. **YAML task definitions**
+  (`bench/tasks/*.yaml`): a lossless YAML subset loader (`bench/tasks.js`) stores
+  multi-line prompts as literal `|-` blocks, so exact-reproduction `str_replace`
+  anchors are preserved byte-for-byte. +offline tests for all three (parser
+  round-trip, cache key/atomicity/corruption, and the end-to-end IPC protocol).
 - First-run setup via a gitignored `.env`: a zero-dependency loader (`src/env.js`)
   autoloads `.env` (package root → cwd → `~/.config/claudette`) before any module
   reads `process.env`; a real shell var always wins. Ships `.env.example`

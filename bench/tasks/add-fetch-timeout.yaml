@@ -3,11 +3,9 @@ title: "Add a fetch timeout to the Ollama client"
 category: "coding"
 timeoutSec: 150
 singleTurn: true
-prompt: >
-  Read src/ollama.js using read_file. Then immediately call str_replace to add an AbortController with a 60-second timeout (60_000 ms) inside the chatStream function, before the fetch call. Wire its signal into the fetch options instead of the bare caller signal. If the caller also passes a signal, call controller.abort() when it fires. Clear the timeout when the response arrives. Do NOT describe what you plan to do — call str_replace now to make the edit. After editing, run bash to verify: node --check src/ollama.js and grep -n AbortController src/ollama.js.
-verify: 
-  - node --check src/ollama.js
-  - grep -n 'AbortController' src/ollama.js
-  - git diff --name-only | grep 'src/ollama.js'
-judgeFocus: >
-  Did the agent read the file before editing? Did it use str_replace rather than rewrite_file? Is the AbortController timeout correctly wired so it actually fires after 60s? Does the caller signal still abort the request? Is the timeout cleared so it doesn't leak?
+prompt: "Read src/ollama.js using read_file. Then immediately call str_replace to add an AbortController with a 60-second timeout (60_000 ms) inside the chatStream function, before the fetch call. Wire its signal into the fetch options instead of the bare caller signal. If the caller also passes a signal, call controller.abort() when it fires. Clear the timeout when the response arrives. Do NOT describe what you plan to do — call str_replace now to make the edit. After editing, run bash to verify: node --check src/ollama.js and grep -n AbortController src/ollama.js."
+verify:
+  - "node --check src/ollama.js"
+  - "grep -n 'AbortController' src/ollama.js"
+  - "git diff --name-only | grep 'src/ollama.js'"
+judgeFocus: "Did the agent read the file before editing? Did it use str_replace rather than rewrite_file? Is the AbortController timeout correctly wired so it actually fires after 60s? Does the caller signal still abort the request? Is the timeout cleared so it doesn't leak?"

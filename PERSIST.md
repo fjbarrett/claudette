@@ -61,6 +61,7 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-06-12 | Codex | Designed queued follow-ups and mid-run steering: live input, FIFO safe-boundary injection, interruption semantics, state model, tests, and phased rollout in `docs/queued-followups-plan.md`. |
 | 2026-06-12 | Codex | Designed model-agnostic parallel subagents: read-only fan-out/fan-in first, reusable agent runner, lifecycle manager, queue integration, then worktree editing and agent teams in `docs/parallel-subagents-plan.md`. |
 | 2026-06-12 | Antigravity | Scoped benchmark and evaluation harness; generated detailed scoping report artifact. |
+| 2026-06-12 | Claude | Hardened bench harness upgrades on `feature/harness-upgrades`: extracted side-effect-free `bench/tasks.js` w/ literal-block YAML loader, re-migrated all 20 tasks to round-trip the original JSON exactly (fixes folded-scalar prompt corruption that collapsed str_replace anchors); clean JSONL `--json-ipc` (gated spinner/markdown/banner/goodbye); `buildWorkflowSummary` now parses JSON events; cache hardened (stable order-independent key, atomic temp+rename writes, corrupt/miss → live call w/ warning). +10 offline tests (parser round-trip, cache, end-to-end IPC). Suite: 165 pass / 15 env-dependent fails. Docs: Changelog, bench/README, model-attribution convention in CLAUDE.md+AGENTS.md. |
 
 ---
 

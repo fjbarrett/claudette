@@ -2,7 +2,7 @@ id: "fastapi-sqlite-todo"
 title: "Build a FastAPI todo service with SQLite via SQLAlchemy"
 category: "project"
 timeoutSec: 360
-prompt: >
+prompt: |-
   Scaffold a Python web service from scratch inside a NEW subdirectory called `todo-svc/`. Do NOT modify any files outside `todo-svc/`. Use write_file for every file. Build a FastAPI todo service persisting to SQLite through SQLAlchemy. Create:
   1. `todo-svc/requirements.txt` — listing `fastapi`, `uvicorn`, and `sqlalchemy`.
   2. `todo-svc/app/database.py` — a SQLAlchemy engine + SessionLocal for a SQLite URL (e.g. sqlite:///./todo.db) and a Base.
@@ -10,14 +10,13 @@ prompt: >
   4. `todo-svc/app/main.py` — a FastAPI app (`app = FastAPI()`) exposing GET /todos (list), POST /todos (create), and PATCH /todos/{id} (toggle/update), using a DB session dependency and creating tables on startup.
   5. `todo-svc/.env.example` — documenting any configuration (e.g. DATABASE_URL).
   After creating the files, run `python3 -m py_compile todo-svc/app/main.py todo-svc/app/models.py todo-svc/app/database.py` to confirm they compile.
-verify: 
-  - test -f todo-svc/requirements.txt
-  - grep -qi 'fastapi' todo-svc/requirements.txt
-  - grep -qi 'sqlalchemy' todo-svc/requirements.txt
-  - python3 -m py_compile todo-svc/app/main.py todo-svc/app/models.py todo-svc/app/database.py
-  - grep -q 'FastAPI()' todo-svc/app/main.py
-  - grep -Eq 'class Todo' todo-svc/app/models.py
-  - grep -Eq '@app\.(get|post|patch)' todo-svc/app/main.py
-  - test -f todo-svc/.env.example
-judgeFocus: >
-  Did the agent build a coherent FastAPI + SQLAlchemy + SQLite todo service: requirements with fastapi/uvicorn/sqlalchemy, a database module with engine/SessionLocal/Base, a Todo model, and a main app exposing list/create/update endpoints with a DB session dependency and table creation? Penalise for missing files, endpoints that don't touch the database, no session handling, or files outside todo-svc/.
+verify:
+  - "test -f todo-svc/requirements.txt"
+  - "grep -qi 'fastapi' todo-svc/requirements.txt"
+  - "grep -qi 'sqlalchemy' todo-svc/requirements.txt"
+  - "python3 -m py_compile todo-svc/app/main.py todo-svc/app/models.py todo-svc/app/database.py"
+  - "grep -q 'FastAPI()' todo-svc/app/main.py"
+  - "grep -Eq 'class Todo' todo-svc/app/models.py"
+  - "grep -Eq '@app\\.(get|post|patch)' todo-svc/app/main.py"
+  - "test -f todo-svc/.env.example"
+judgeFocus: "Did the agent build a coherent FastAPI + SQLAlchemy + SQLite todo service: requirements with fastapi/uvicorn/sqlalchemy, a database module with engine/SessionLocal/Base, a Todo model, and a main app exposing list/create/update endpoints with a DB session dependency and table creation? Penalise for missing files, endpoints that don't touch the database, no session handling, or files outside todo-svc/."

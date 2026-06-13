@@ -3,16 +3,15 @@ title: "Targeted str_replace edit with verification"
 category: "coding"
 timeoutSec: 120
 singleTurn: true
-prompt: >
+prompt: |-
   Call str_replace on src/tools.js — do NOT read the file first. Use these exact values:
     path: src/tools.js
     old_str: "      timeout: 30_000,\n      maxBuffer: 2 * 1024 * 1024,"
     new_str: "      timeout: 45_000,\n      maxBuffer: 2 * 1024 * 1024,"
-  
+
   After editing, call bash with command: node --check src/tools.js && grep -n 45_000 src/tools.js
-verify: 
-  - node --check src/tools.js
-  - grep -n '45_000' src/tools.js
-  - git diff --name-only | grep 'src/tools.js'
-judgeFocus: >
-  Did the agent use str_replace rather than write_file to make a minimal targeted change? Did it verify the result?
+verify:
+  - "node --check src/tools.js"
+  - "grep -n '45_000' src/tools.js"
+  - "git diff --name-only | grep 'src/tools.js'"
+judgeFocus: "Did the agent use str_replace rather than write_file to make a minimal targeted change? Did it verify the result?"

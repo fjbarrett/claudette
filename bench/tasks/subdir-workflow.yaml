@@ -2,11 +2,9 @@ id: "subdir-workflow"
 title: "Create and run a script inside a subdirectory"
 category: "coding"
 timeoutSec: 180
-prompt: >
-  Create a directory bench/scratch/cli-tool/. Inside it, write index.js using ESM syntax (the root package.json already has type:module so no separate package.json is needed). The script should read process.argv[2] and print it uppercased — e.g. node index.js hello prints HELLO. Write the file content directly with write_file — do not wrap file content in markdown code fences. After writing, run it with bash using the full path: node bench/scratch/cli-tool/index.js hello. Check that the output contains HELLO. If it fails, read the file, fix the error, and re-run.
-verify: 
-  - node bench/scratch/cli-tool/index.js hello 2>&1 | grep -i HELLO
-  - node --check bench/scratch/cli-tool/index.js
-  - git status --short | grep 'bench/scratch/cli-tool/index.js'
-judgeFocus: >
-  Did the agent correctly use the full path to run the script rather than cd? Did it actually verify output rather than assuming it worked?
+prompt: "Create a directory bench/scratch/cli-tool/. Inside it, write index.js using ESM syntax (the root package.json already has type:module so no separate package.json is needed). The script should read process.argv[2] and print it uppercased — e.g. node index.js hello prints HELLO. Write the file content directly with write_file — do not wrap file content in markdown code fences. After writing, run it with bash using the full path: node bench/scratch/cli-tool/index.js hello. Check that the output contains HELLO. If it fails, read the file, fix the error, and re-run."
+verify:
+  - "node bench/scratch/cli-tool/index.js hello 2>&1 | grep -i HELLO"
+  - "node --check bench/scratch/cli-tool/index.js"
+  - "git status --short | grep 'bench/scratch/cli-tool/index.js'"
+judgeFocus: "Did the agent correctly use the full path to run the script rather than cd? Did it actually verify output rather than assuming it worked?"

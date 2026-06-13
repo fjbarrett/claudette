@@ -3,35 +3,34 @@ title: "Add a new tool to the tool registry"
 category: "coding"
 timeoutSec: 180
 singleTurn: true
-prompt: >
+prompt: |-
   Add an 'echo' tool to src/tools.js. Make exactly two str_replace calls — do NOT read the file first.
-  
+
   str_replace call 1 — add to TOOL_DEFS array. The array ends with this exact text followed by the executor comment:
-  
+
   ];
-  
+
   // ─── Executor dispatch ────────────────────────────────────────────────────────
-  
+
   Insert the echo entry before ];
-  
+
   str_replace call 2 — add to executeTool switch. Replace:
-  
+
       default: throw new Error(`Unknown tool: ${name}`);
-  
+
   With:
-  
+
       case 'echo': {
         return String(args.message ?? '');
       }
       default: throw new Error(`Unknown tool: ${name}`);
-  
+
   The echo TOOL_DEF should have: name 'echo', description 'Echo back the message unchanged.', and a required string parameter named 'message'.
-  
+
   After both edits, verify: node --check src/tools.js && grep -n '"echo"' src/tools.js && node -e "import('./src/tools.js').then(async m => { const r = await m.executeTool('echo', {message:'hello'}, {cwd:'.', workspace:'.'}); if (!r.includes('hello')) throw new Error('failed'); console.log('ok'); })"
-verify: 
-  - node --check src/tools.js
-  - grep -n '"echo"' src/tools.js
-  - git diff --name-only | grep 'src/tools.js'
-  - node -e "import('./src/tools.js').then(async m => { const r = await m.executeTool('echo', {message:'hello'}, {cwd:'.', workspace:'.'}); if (!r.includes('hello')) throw new Error('echo returned: ' + r); console.log('ok'); })"
-judgeFocus: >
-  Did the agent use str_replace to add both TOOL_DEFS and executeTool entries in sync? Did the agent verify the tool actually works?
+verify:
+  - "node --check src/tools.js"
+  - "grep -n '\"echo\"' src/tools.js"
+  - "git diff --name-only | grep 'src/tools.js'"
+  - "node -e \"import('./src/tools.js').then(async m => { const r = await m.executeTool('echo', {message:'hello'}, {cwd:'.', workspace:'.'}); if (!r.includes('hello')) throw new Error('echo returned: ' + r); console.log('ok'); })\""
+judgeFocus: "Did the agent use str_replace to add both TOOL_DEFS and executeTool entries in sync? Did the agent verify the tool actually works?"

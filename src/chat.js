@@ -116,7 +116,7 @@ export async function start() {
   // Create fresh session
   session = await createSession({ model, cwd: workspace });
 
-  ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
+  if (!jsonIpc) ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
 
   // Handle Ctrl+C: cancel stream if running, else exit
   process.on('SIGINT', () => {
@@ -126,7 +126,7 @@ export async function start() {
       ui.stopSpinner();
       stdout.write(`\n${'\x1b[90m'}(cancelled)\x1b[0m\n`);
     } else {
-      console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
+      if (!jsonIpc) console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
       exit(0);
     }
   });
@@ -161,7 +161,6 @@ export async function start() {
       }
     }
 
-
     if (line.startsWith('/')) {
       const cont = await handleCommand(line, rl);
       if (!cont) break;
@@ -183,7 +182,7 @@ export async function start() {
   }
 
   rl.close();
-  console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
+  if (!jsonIpc) console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
 }
 
 // ─── User message handler ─────────────────────────────────────────────────────
@@ -266,7 +265,7 @@ async function agentLoop(messages, rl) {
       console.log(JSON.stringify({ type: 'turn', iteration }));
     }
     const label = iteration === 1 ? 'Thinking' : 'Working';
-    ui.startSpinner(label);
+    if (!jsonIpc) ui.startSpinner(label);
 
     const ac = new AbortController();
     currentAC = ac;
@@ -294,6 +293,7 @@ async function agentLoop(messages, rl) {
     const onDelta = (delta) => {
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'delta', content: delta }));
+        return; // IPC mode emits only JSONL — no terminal rendering
       }
       if (!streamStarted) {
         streamStarted = true;
@@ -316,9 +316,13 @@ async function agentLoop(messages, rl) {
         ...(effort ? { effort } : {}),
       });
     } catch (err) {
-      ui.stopSpinner();
+      if (!jsonIpc) ui.stopSpinner();
       if (err.name === 'AbortError') return; // user cancelled
-      ui.printError(`Stream error: ${err.message}`);
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'error', error: err.message }));
+      } else {
+        ui.printError(`Stream error: ${err.message}`);
+      }
       return;
     } finally {
       process.stdin.removeListener('data', ctrlCHandler);
@@ -326,7 +330,7 @@ async function agentLoop(messages, rl) {
       rl.resume(); // restore readline after streaming
     }
 
-    if (!streamStarted) ui.stopSpinner();
+    if (!jsonIpc && !streamStarted) ui.stopSpinner();
 
     // ── Merge text-parsed tool calls with API tool calls ─────────────────────
     // Some models (qwen2.5-coder) emit some calls via API and others as JSON
@@ -348,18 +352,20 @@ async function agentLoop(messages, rl) {
 
     // ── No tool calls → normal response, done ──────────────────────────────
     if (!result.toolCalls?.length) {
-      if (!streamStarted && result.content) {
-        // Nothing was streamed (e.g. empty onDelta path) — render with markdown
-        ui.printAssistantStart();
-        ui.printAssistantMessage(result.content);
-      } else if (streamStarted) {
-        mdStream.end(); // flush a trailing partial line
-        stdout.write('\n');
+      if (!jsonIpc) {
+        if (!streamStarted && result.content) {
+          // Nothing was streamed (e.g. empty onDelta path) — render with markdown
+          ui.printAssistantStart();
+          ui.printAssistantMessage(result.content);
+        } else if (streamStarted) {
+          mdStream.end(); // flush a trailing partial line
+          stdout.write('\n');
+        }
+        ui.printAssistantEnd({
+          model,
+          tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) || null,
+        });
       }
-      ui.printAssistantEnd({
-        model,
-        tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) || null,
-      });
       session.messages.push({ role: 'assistant', content: result.content });
       await flushSessionSave(session);
       if (jsonIpc) {
@@ -370,14 +376,16 @@ async function agentLoop(messages, rl) {
     }
 
     // ── Tool calls ─────────────────────────────────────────────────────────
-    if (!streamStarted && result.content) {
-      // Content wasn't streamed yet — render it before tool blocks
-      ui.printAssistantStart();
-      ui.printAssistantMessage(result.content);
-      stdout.write('\n');
-    } else if (streamStarted) {
-      mdStream.end(); // flush a trailing partial line
-      stdout.write('\n'); // newline after streamed text before tool blocks
+    if (!jsonIpc) {
+      if (!streamStarted && result.content) {
+        // Content wasn't streamed yet — render it before tool blocks
+        ui.printAssistantStart();
+        ui.printAssistantMessage(result.content);
+        stdout.write('\n');
+      } else if (streamStarted) {
+        mdStream.end(); // flush a trailing partial line
+        stdout.write('\n'); // newline after streamed text before tool blocks
+      }
     }
 
     // Record assistant turn with tool_calls
@@ -403,7 +411,7 @@ async function agentLoop(messages, rl) {
 
       // The permission prompt renders the call itself — printing the normal
       // tool-call line too showed the same call twice.
-      if (!needsApproval(name, args)) ui.printToolCall(name, args);
+      if (!jsonIpc && !needsApproval(name, args)) ui.printToolCall(name, args);
 
       // Permission check
       const allowed = await checkPermission(name, args, rl);
@@ -430,7 +438,7 @@ async function agentLoop(messages, rl) {
         console.log(JSON.stringify({ type: 'tool_result', name, result: toolResult, isError }));
       }
 
-      ui.printToolResult(name, toolResult, isError);
+      if (!jsonIpc) ui.printToolResult(name, toolResult, isError);
 
       const resultMsg = { role: 'tool', content: toolResult, ...(call.id ? { tool_call_id: call.id } : {}) };
 

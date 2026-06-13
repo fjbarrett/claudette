@@ -2,11 +2,9 @@ id: "limit-context-depth"
 title: "Add a directory depth limit to the CLAUDE.md loader"
 category: "coding"
 timeoutSec: 120
-prompt: >
-  Read src/context.js using read_file to find the while loop in loadClaudeMd. Then immediately call str_replace to add a depth counter: insert `let depth = 0;` before the while loop and at the top of the loop body add `depth++; if (depth >= 20) break;`. Make a minimal edit — do NOT rewrite the file. Do NOT describe what you plan to do — call str_replace now. After editing run bash to verify: node --check src/context.js and grep -n depth src/context.js.
-verify: 
-  - node --check src/context.js
-  - grep -n 'depth' src/context.js
-  - git diff --name-only | grep 'src/context.js'
-judgeFocus: >
-  Did the agent read the short file before editing? Did it use str_replace for a minimal change? Is the depth counter correctly placed inside the while loop and does it actually break at 20? Is the counter reset properly (initialized outside or before the loop)?
+prompt: "Read src/context.js using read_file to find the while loop in loadClaudeMd. Then immediately call str_replace to add a depth counter: insert `let depth = 0;` before the while loop and at the top of the loop body add `depth++; if (depth >= 20) break;`. Make a minimal edit — do NOT rewrite the file. Do NOT describe what you plan to do — call str_replace now. After editing run bash to verify: node --check src/context.js and grep -n depth src/context.js."
+verify:
+  - "node --check src/context.js"
+  - "grep -n 'depth' src/context.js"
+  - "git diff --name-only | grep 'src/context.js'"
+judgeFocus: "Did the agent read the short file before editing? Did it use str_replace for a minimal change? Is the depth counter correctly placed inside the while loop and does it actually break at 20? Is the counter reset properly (initialized outside or before the loop)?"
