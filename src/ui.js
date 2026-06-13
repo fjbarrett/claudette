@@ -4,20 +4,20 @@ import { formatUsd } from './cost.js';
 
 const jsonIpc = process.argv.includes('--json-ipc');
 
-// Palette: Monokai (24-bit truecolor). Honors NO_COLOR (https://no-color.org).
+// Palette: VS Code Default Dark+ (24-bit truecolor). Honors NO_COLOR.
 const NO_COLOR = process.env.NO_COLOR != null && process.env.NO_COLOR !== '';
 const sgr = (code) => (NO_COLOR ? '' : code);
 const fg = (r, g, b) => (NO_COLOR ? '' : `\x1b[38;2;${r};${g};${b}m`);
 
 const R = sgr('\x1b[0m'), B = sgr('\x1b[1m'), D = sgr('\x1b[2m');
-const P  = fg(174, 129, 255);  // purple    #AE81FF
-const C  = fg(102, 217, 239);  // cyan      #66D9EF
-const G  = fg(166, 226,  46);  // green     #A6E22E
-const Y  = fg(230, 219, 116);  // yellow    #E6DB74
-const RE = fg(249,  38, 114);  // red/pink  #F92672
-const O  = fg(253, 151,  31);  // orange    #FD971F
-const GR = fg(117, 113,  94);  // comment   #75715E
-const W  = fg(248, 248, 242);  // foreground #F8F8F2
+const P  = fg(197, 134, 192);  // keyword purple  #C586C0
+const C  = fg( 86, 156, 214);  // VS Code blue    #569CD6
+const G  = fg( 78, 201, 176);  // type teal/green #4EC9B0
+const Y  = fg(220, 220, 170);  // function yellow #DCDCAA
+const RE = fg(244,  71,  71);  // error red       #F44747
+const O  = fg(206, 145, 120);  // string orange   #CE9178
+const GR = fg(133, 133, 133);  // muted gray      #858585
+const W  = fg(212, 212, 212);  // foreground      #D4D4D4
 
 // Exported so callers/tests reference exact codes instead of hardcoding them.
 export const palette = { R, B, D, P, C, G, Y, RE, O, GR, W };
