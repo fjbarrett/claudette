@@ -12,11 +12,11 @@
   directory restores what you typed there — **up-arrow recalls prior-session
   prompts** like a normal shell (newest-first, consecutive dups skipped). Stored
   under `data/history/` keyed by the absolute cwd (gitignored). (`src/history.js`)
-- VS Code Default Dark+ palette. The CLI/TUI colors mirror VS Code's default dark
-  theme (keyword purple `#C586C0`, blue `#569CD6`, teal `#4EC9B0`, function yellow
-  `#DCDCAA`, string orange `#CE9178`, error red `#F44747`, muted `#858585`, fg
-  `#D4D4D4`), via 24-bit truecolor (`src/ui.js`); `NO_COLOR` is honored and the
-  exact codes are exported as `palette`.
+- VS Code Default Dark+ palette, brightened for terminal readability. The CLI/TUI
+  colors mirror VS Code's default dark theme (purple, blue, teal, function yellow,
+  string orange, error red) with higher luminance so text reads clearly on common
+  terminal backgrounds, via 24-bit truecolor (`src/ui.js`); `NO_COLOR` is honored
+  and the exact codes are exported as `palette`.
 - The CLI/TUI now also loads a **`CLAUDETTE.md`** project-instructions file,
   walked up the directory tree alongside `CLAUDE.md` (innermost wins; a level's
   `CLAUDETTE.md` comes after its `CLAUDE.md` so it can augment/override) — for
