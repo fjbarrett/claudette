@@ -2377,6 +2377,57 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── Follow-up queue (mid-run steering) ──────────────────────────────────────
+// While the agent works, submitted prompts go into this FIFO and are drained
+// into one steering message at a safe boundary — never a second agent loop.
+
+describe('src/input.js (follow-up queue)', async () => {
+  const { InputController, buildFollowUpMessage } = await import('../src/input.js');
+
+  test('enqueue trims, ignores blank, and stamps the item', () => {
+    const q = new InputController();
+    assert.equal(q.enqueue('   '), null, 'blank ignored');
+    assert.equal(q.enqueue(''), null, 'empty ignored');
+    const item = q.enqueue('  also update the README  ');
+    assert.equal(item.content, 'also update the README', 'trimmed');
+    assert.ok(item.id && item.queuedAt, 'stamped with id + timestamp');
+    assert.equal(q.size, 1);
+  });
+
+  test('drain returns FIFO order once and empties the queue', () => {
+    const q = new InputController();
+    q.enqueue('a'); q.enqueue('b'); q.enqueue('c');
+    assert.deepEqual(q.drain().map(i => i.content), ['a', 'b', 'c'], 'FIFO order');
+    assert.equal(q.size, 0, 'emptied');
+    assert.deepEqual(q.drain(), [], 'second drain is empty');
+    q.enqueue('d'); // queued after a drain waits for the next boundary
+    assert.deepEqual(q.drain().map(i => i.content), ['d']);
+  });
+
+  test('list returns copies; clear reports and empties', () => {
+    const q = new InputController();
+    q.enqueue('x'); q.enqueue('y');
+    const listed = q.list();
+    listed[0].content = 'mutated';
+    assert.equal(q.list()[0].content, 'x', 'list returns copies, not live refs');
+    assert.equal(q.clear(), 2, 'clear reports count');
+    assert.equal(q.size, 0);
+  });
+
+  test('buildFollowUpMessage: null when empty, plain for one, numbered+labeled for many', () => {
+    assert.equal(buildFollowUpMessage([]), null);
+    assert.deepEqual(
+      buildFollowUpMessage([{ content: 'just this' }]),
+      { role: 'user', content: 'just this' },
+      'single item is delivered verbatim',
+    );
+    const many = buildFollowUpMessage([{ content: 'first' }, { content: 'second' }]);
+    assert.equal(many.role, 'user');
+    assert.match(many.content, /\[Follow-up sent while you were working\]/, 'labeled as steering input');
+    assert.match(many.content, /1\. first\n2\. second/, 'numbered, order preserved');
+  });
+});
+
 // ─── chat.js: effort + bypass settings ────────────────────────────────────────
 
 describe('chat.js (effort + bypass)', async () => {

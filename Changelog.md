@@ -3,6 +3,14 @@
 ## [Unreleased]
 
 ### Added
+- Queued follow-ups (mid-run steering). In an auto-approve TTY session you can
+  **type while the agent works**; submitted lines go into a visible FIFO queue
+  (`/queue`, `/queue clear`) instead of starting a second loop, and are delivered
+  as one combined steering message at the next safe boundary (after a model
+  response and its tool calls, before the next request) — keeping exactly one
+  agent loop per session. `src/input.js` (`InputController`) is unit-tested.
+  Phase 1: live capture is gated to auto-approve TTY (a normal turn needs stdin
+  for permission prompts); echo/redraw and approval-mode input come next.
 - Configurable agent-loop cap. The per-turn tool-iteration limit is now **50** by
   default (was a hard **20** that cut off large multi-file builds mid-task) and
   configurable via `--max-iterations N` / `CLAUDETTE_MAX_ITERATIONS`. On reaching

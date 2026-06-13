@@ -203,6 +203,30 @@ export function table(title, rows) {
   console.log();
 }
 
+// ─── Follow-up queue (mid-run steering) ──────────────────────────────────────
+
+export function printQueued(item, count) {
+  if (jsonIpc || !item) return;
+  const preview = truncate(item.content.replace(/\s+/g, ' '), cols() - 24);
+  process.stdout.write(`\n  ${C}⊕ Queued (${count})${R} ${GR}${preview}${R}\n`);
+}
+
+export function printQueue(items) {
+  if (jsonIpc) return;
+  if (!items.length) { console.log(`\n  ${GR}Queue empty.${R}`); return; }
+  console.log(`\n  ${B}Queued follow-ups (${items.length})${R}`);
+  items.forEach((it, i) => {
+    console.log(`  ${C}${String(i + 1).padStart(2)}.${R} ${GR}${truncate(it.content.replace(/\s+/g, ' '), cols() - 8)}${R}`);
+  });
+  console.log();
+}
+
+export function printFollowUpDelivery(items) {
+  if (jsonIpc || !items.length) return;
+  const label = items.length === 1 ? 'follow-up' : `${items.length} follow-ups`;
+  process.stdout.write(`\n  ${P}↳ delivering your ${label}…${R}\n`);
+}
+
 
 // Per-line markdown renderer with persistent state (code-fence tracking), so
 // the same logic serves whole-message rendering and incremental streaming.
