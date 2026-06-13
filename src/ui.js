@@ -1,5 +1,6 @@
 // ANSI-based terminal rendering — no external dependencies
 import process from 'node:process';
+import { formatUsd } from './cost.js';
 
 const jsonIpc = process.argv.includes('--json-ipc');
 
@@ -76,9 +77,16 @@ export function printAssistantMessage(text) {
   process.stdout.write(rendered);
 }
 
-export function printAssistantEnd({ model: m, tokens } = {}) {
+export function printAssistantEnd({ model: m, tokens, costUsd, sessionCostUsd } = {}) {
   if (jsonIpc) return;
-  const info = [m, tokens ? `~${tokens} tokens` : null].filter(Boolean).join(' · ');
+  const turnCost = formatUsd(costUsd);
+  const sessCost = formatUsd(sessionCostUsd);
+  const info = [
+    m,
+    tokens ? `~${tokens} tokens` : null,
+    turnCost ? `~${turnCost}` : null,
+    sessCost ? `session ~${sessCost}` : null,
+  ].filter(Boolean).join(' · ');
   process.stdout.write(info ? `\n\n${GR}  ↳ ${info}${R}\n` : '\n');
 }
 
@@ -100,8 +108,8 @@ export function printToolCall(name, args) {
     args.pattern   ? args.pattern :
     args.content   ? `${String(args.content).split('\n').length} lines` :
     truncate(JSON.stringify(args), cols() - 20);
-  const alias = displayName === name ? '' : ` ${GR}[${name}]${R}`;
-  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${alias}${GR}(${truncate(primary, cols() - displayName.length - name.length - 8)})${R}\n`);
+  // One clean label per call — the friendly name only (no redundant `[read_file]`).
+  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${GR}(${truncate(primary, cols() - displayName.length - 8)})${R}\n`);
 }
 
 export function printToolResult(name, output, isError = false) {
@@ -166,8 +174,7 @@ export function printPermissionPrompt(toolName, detail) {
   const truncated = detailLines.length > 8;
   // Show the call like a tool call line, then the detail block
   const primary = truncate(detail.split('\n')[0], cols() - displayName.length - 4);
-  const alias = displayName === toolName ? '' : ` ${GR}[${toolName}]${R}`;
-  console.log(`\n${B}${Y}⏺ ${displayName}${R}${alias}${GR}(${primary})${R}`);
+  console.log(`\n${B}${Y}⏺ ${displayName}${R}${GR}(${primary})${R}`);
   if (detailLines.length > 1) {
     preview.slice(1).forEach(l => console.log(`   ${GR}${l}${R}`));
     if (truncated) console.log(`   ${GR}… (truncated)${R}`);

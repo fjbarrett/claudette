@@ -6,6 +6,8 @@
 // (deepseek.js, groq.js, huggingface.js), which each own their base URL, key,
 // and model list while sharing this wire protocol.
 
+import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
+
 const PREFIX = 'openai/';
 export const KEY_ENV = 'OPENAI_API_KEY';
 export const LABEL = 'OpenAI';
@@ -90,11 +92,18 @@ export async function chatCompletionsStream({
     stream: true,
     stream_options: { include_usage: true },
     temperature: 0,
+    max_tokens: resolveMaxTokens(),
   };
   if (tools.length) body.tools = toOpenAITools(tools);
   if (effort) {
     if (reasoningStyle === 'openrouter') body.reasoning = { effort };
     else body.reasoning_effort = effort;
+  }
+  // Anthropic prompt caching (OpenRouter forwards `cache_control` to Anthropic):
+  // mark the stable prefix so it isn't re-billed at full price every iteration.
+  // Only for Anthropic models — OpenAI auto-caches and rejects cache_control.
+  if (promptCacheEnabled() && /claude|anthropic/i.test(model)) {
+    applyAnthropicCacheBreakpoints(body.messages);
   }
 
   const res = await fetch(`${baseUrl}/chat/completions`, {
@@ -182,6 +191,35 @@ export function makeOpenAICompatibleProvider({
       });
     },
   };
+}
+
+// Mark up to two ephemeral cache breakpoints on OpenAI-shaped messages: the
+// system prompt and the conversation tail. Anthropic (via OpenRouter) then
+// reuses the longest cached prefix instead of re-billing it on every request.
+// String content is promoted to a single text part so the marker has somewhere
+// to live; messages with no text content (e.g. an assistant turn that is only
+// tool_calls) are skipped.
+export function applyAnthropicCacheBreakpoints(messages) {
+  const mark = (m) => {
+    if (!m) return false;
+    if (typeof m.content === 'string') {
+      if (!m.content) return false;
+      m.content = [{ type: 'text', text: m.content }];
+    }
+    if (Array.isArray(m.content) && m.content.length) {
+      const last = m.content[m.content.length - 1];
+      if (last && typeof last === 'object') { last.cache_control = { type: 'ephemeral' }; return true; }
+    }
+    return false;
+  };
+
+  const system = messages.find(m => m.role === 'system');
+  mark(system);
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i] === system) break;
+    if (mark(messages[i])) break;
+  }
+  return messages;
 }
 
 // ─── Format translation ──────────────────────────────────────────────────────

@@ -3,6 +3,18 @@
 ## [Unreleased]
 
 ### Added
+- Cost controls. **Prompt caching** for Anthropic — native and via OpenRouter
+  (`src/llm-config.js` + ephemeral cache breakpoints on the system prompt and the
+  conversation tail; on by default, `CLAUDETTE_PROMPT_CACHE=0` to disable) — so the
+  stable prefix isn't re-billed at full input price on every tool iteration / turn.
+  **Sane `max_tokens`** default (16k; `CLAUDETTE_MAX_TOKENS`) on the OpenAI-
+  compatible transport, so OpenRouter no longer reserves the model max (65k) per
+  call (the cause of spurious `402`s). **Bash output cap** before it enters context
+  (`CLAUDETTE_BASH_OUTPUT_CHARS`, default 16k, head+tail) so one large dump isn't
+  re-sent every iteration. **Live cost meter**: per-turn `~$` in the assistant
+  footer and an accurate `/cost` summary from real per-turn token metrics
+  (`src/cost.js`; override prices with `CLAUDETTE_PRICES`). Tool-call lines now show
+  one clean label (`Read`, not `Read [read_file]`).
 - Per-turn session tracing in the CLI/TUI. A shared tracer (`src/trace.js`) records
   each turn into `session.turns[]` — status, model, expanded `@files`, token/
   duration metrics, and an ordered event log (`input_received` →

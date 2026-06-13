@@ -1029,7 +1029,12 @@ describe('anthropic.js', async () => {
       assert.equal(result.toolMode, 'native');
       assert.equal(receivedAuth, 'test-key');
       assert.equal(receivedBody.model, 'claude-opus-4-8', 'anthropic: prefix stripped');
-      assert.equal(receivedBody.system, 'be brief', 'system pulled to top level');
+      assert.deepEqual(
+        receivedBody.system,
+        [{ type: 'text', text: 'be brief', cache_control: { type: 'ephemeral' } }],
+        'system pulled to top level as an ephemeral cache block (prompt caching on by default)',
+      );
+      assert.ok(receivedBody.max_tokens > 0 && receivedBody.max_tokens <= 16_384, 'a sane max_tokens cap is sent');
       assert.ok(receivedBody.tools, 'tools forwarded');
       assert.equal(receivedBody.output_config, undefined, 'no effort sent by default');
     } finally {
@@ -2067,7 +2072,7 @@ describe('CLI tool loop with mock Ollama', async () => {
     );
 
     assert.equal(timedOut, false, 'cli should exit normally');
-    assert.ok(stdout.includes('⚙ read_file') || stdout.includes('read_file'), 'tool call was shown');
+    assert.ok(stdout.includes('⏺ Read'), 'tool call was shown with its clean label');
     assert.ok(stdout.includes('Read') || stdout.includes('notes.txt'), 'tool result was shown');
     assert.ok(stdout.includes('Final answer: saw alpha from file.'), 'assistant finished with final answer');
     assert.equal(requestBodies.length, 2, 'two chat requests expected for tool loop');
@@ -2103,7 +2108,7 @@ describe('CLI tool loop with mock Ollama', async () => {
     );
 
     assert.equal(timedOut, false, 'cli should exit normally');
-    assert.ok(stdout.includes('⚙ bash') || stdout.includes('bash'), 'bash tool call was shown');
+    assert.ok(stdout.includes('⏺ Bash'), 'bash tool call was shown with its clean label');
     assert.ok(stdout.includes(tmpDir), 'bash tool output includes cwd');
     assert.ok(stdout.includes(`Command completed in ${tmpDir}.`), 'assistant consumed bash tool output');
     assert.equal(requestBodies.length, 2, 'two chat requests expected for bash tool loop');
@@ -2147,6 +2152,73 @@ describe('CLI tool loop with mock Ollama', async () => {
     } finally {
       await Promise.all(created.map(f => fsp.rm(path.join(sessionsDir, f), { force: true })));
     }
+  });
+});
+
+// ─── Cost & request tuning (caching, max_tokens, pricing, bash cap) ──────────
+// These directly cut the API bill: prompt caching stops re-billing the stable
+// prefix every iteration, max_tokens stops gateways over-reserving credit, and
+// the bash cap stops one big dump riding along forever.
+
+describe('cost & request tuning', async () => {
+  test('applyAnthropicCacheBreakpoints marks system + conversation tail, skips empty turns', async () => {
+    const { applyAnthropicCacheBreakpoints } = await import('../src/openai.js');
+    const messages = [
+      { role: 'system', content: 'SYS' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', function: { name: 'x', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'big result' },
+    ];
+    applyAnthropicCacheBreakpoints(messages);
+    assert.equal(messages[0].content.at(-1).cache_control.type, 'ephemeral', 'system prompt cached');
+    assert.equal(messages[3].content.at(-1).cache_control.type, 'ephemeral', 'conversation tail cached');
+    assert.equal(messages[2].content, null, 'tool_calls-only assistant turn is left untouched');
+  });
+
+  test('markAnthropicTail (native) caches the last content block', async () => {
+    const { markAnthropicTail } = await import('../src/anthropic.js');
+    const messages = [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'x' }] }];
+    markAnthropicTail(messages);
+    assert.equal(messages[0].content.at(-1).cache_control.type, 'ephemeral');
+  });
+
+  test('resolveMaxTokens caps output (sane default, env override)', async () => {
+    const { resolveMaxTokens } = await import('../src/llm-config.js');
+    const prev = process.env.CLAUDETTE_MAX_TOKENS;
+    delete process.env.CLAUDETTE_MAX_TOKENS;
+    assert.equal(resolveMaxTokens(), 16_384, 'sane default, not the model max');
+    process.env.CLAUDETTE_MAX_TOKENS = '8000';
+    assert.equal(resolveMaxTokens(), 8000, 'env override honored');
+    if (prev === undefined) delete process.env.CLAUDETTE_MAX_TOKENS; else process.env.CLAUDETTE_MAX_TOKENS = prev;
+  });
+
+  test('promptCacheEnabled defaults on, disables with =0', async () => {
+    const { promptCacheEnabled } = await import('../src/llm-config.js');
+    const prev = process.env.CLAUDETTE_PROMPT_CACHE;
+    delete process.env.CLAUDETTE_PROMPT_CACHE;
+    assert.equal(promptCacheEnabled(), true);
+    process.env.CLAUDETTE_PROMPT_CACHE = '0';
+    assert.equal(promptCacheEnabled(), false);
+    if (prev === undefined) delete process.env.CLAUDETTE_PROMPT_CACHE; else process.env.CLAUDETTE_PROMPT_CACHE = prev;
+  });
+
+  test('pricing matches most-specific model and estimates cost', async () => {
+    const { priceFor, estimateCost, formatUsd } = await import('../src/cost.js');
+    assert.deepEqual(priceFor('openai/gpt-4o-mini'), { in: 0.15, out: 0.6 }, 'mini beats 4o by specificity');
+    assert.ok(priceFor('openrouter/anthropic/claude-opus-4.8'), 'opus priced across prefixes');
+    assert.equal(estimateCost('claude-haiku-4.5', { promptTokens: 1_000_000 }), 1, '$1 per 1M haiku input');
+    assert.equal(estimateCost('mystery-model', { promptTokens: 1_000_000 }), null, 'unknown model → null');
+    assert.equal(formatUsd(0.004), '$0.0040');
+    assert.equal(formatUsd(1.5), '$1.50');
+  });
+
+  test('capBashOutput truncates large output (head+tail) and leaves small output intact', async () => {
+    const { capBashOutput } = await import('../src/tools.js');
+    const big = 'A'.repeat(40_000);
+    const capped = capBashOutput(big);
+    assert.ok(capped.length < big.length, 'large output is shrunk');
+    assert.match(capped, /bash output truncated/, 'truncation is signposted');
+    assert.equal(capBashOutput('hello world'), 'hello world', 'small output untouched');
   });
 });
 

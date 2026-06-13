@@ -18,6 +18,7 @@ import { TOOL_DEFS, executeTool } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
 import { loadClaudeMd, expandFiles } from './context.js';
 import { createTurnTrace, truncateLine } from './trace.js';
+import { estimateCost, formatUsd } from './cost.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -391,9 +392,16 @@ async function agentLoop(messages, rl, trace = null) {
           mdStream.end(); // flush a trailing partial line
           stdout.write('\n');
         }
+        // Prefer the turn's accumulated usage (across tool iterations) for the
+        // cost meter; fall back to this single response when there's no trace.
+        const turnUsage = trace
+          ? trace.turn.metrics
+          : { promptTokens: result.promptTokens ?? 0, completionTokens: result.completionTokens ?? 0 };
         ui.printAssistantEnd({
           model,
-          tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) || null,
+          tokens: (turnUsage.promptTokens ?? 0) + (turnUsage.completionTokens ?? 0) || null,
+          costUsd: estimateCost(model, turnUsage),
+          sessionCostUsd: sessionCostUsd(),
         });
       }
       session.messages.push({ role: 'assistant', content: result.content });
@@ -492,6 +500,30 @@ async function agentLoop(messages, rl, trace = null) {
     await flushSessionSave(session);
   }
   ui.printWarning(`Reached ${MAX_ITERATIONS} tool iterations — stopping to prevent runaway loop.`);
+}
+
+// ─── Session cost helpers ─────────────────────────────────────────────────────
+// Sum the real per-turn token usage recorded on the trace (session.turns[]).
+function sessionUsage() {
+  const turns = Array.isArray(session?.turns) ? session.turns : [];
+  return turns.reduce((acc, t) => {
+    acc.promptTokens += t.metrics?.promptTokens ?? 0;
+    acc.completionTokens += t.metrics?.completionTokens ?? 0;
+    return acc;
+  }, { promptTokens: 0, completionTokens: 0 });
+}
+
+// Estimated cumulative USD for the session, pricing each turn by the model that
+// ran it. Returns null when no turn used a model with known pricing.
+function sessionCostUsd() {
+  const turns = Array.isArray(session?.turns) ? session.turns : [];
+  let cost = 0;
+  let priced = false;
+  for (const t of turns) {
+    const c = estimateCost(t.model ?? model, t.metrics ?? {});
+    if (c != null) { cost += c; priced = true; }
+  }
+  return priced ? cost : null;
 }
 
 // ─── Permission check ─────────────────────────────────────────────────────────
@@ -757,15 +789,31 @@ async function handleCommand(line, rl) {
 
     // ── Info ─────────────────────────────────────────────────────────────────
     case '/cost': {
-      const approxTokens = session.messages.reduce((acc, m) => {
-        const len = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length;
-        return acc + Math.ceil(len / 4);
-      }, 0);
-      ui.table('Session Cost Estimate', [
-        ['messages',      String(session.messages.length)],
-        ['approx tokens', `~${approxTokens.toLocaleString()}`],
-        ['model',         model],
-      ]);
+      const usage = sessionUsage();
+      const total = usage.promptTokens + usage.completionTokens;
+      if (total > 0) {
+        // Real provider-reported usage, summed from the per-turn trace.
+        const cost = sessionCostUsd();
+        ui.table('Session Cost', [
+          ['turns',         String((session.turns ?? []).length)],
+          ['input tokens',  usage.promptTokens.toLocaleString()],
+          ['output tokens', usage.completionTokens.toLocaleString()],
+          ['total tokens',  total.toLocaleString()],
+          ['est. cost',     cost != null ? `~${formatUsd(cost)}` : 'n/a (unpriced model)'],
+          ['model',         model],
+        ]);
+      } else {
+        // No turns recorded yet — fall back to a rough char-based estimate.
+        const approxTokens = session.messages.reduce((acc, m) => {
+          const len = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length;
+          return acc + Math.ceil(len / 4);
+        }, 0);
+        ui.table('Session Cost Estimate', [
+          ['messages',      String(session.messages.length)],
+          ['approx tokens', `~${approxTokens.toLocaleString()}`],
+          ['model',         model],
+        ]);
+      }
       return true;
     }
 

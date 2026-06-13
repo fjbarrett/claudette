@@ -240,7 +240,7 @@ async function runBash(command, cwd) {
       maxBuffer: 2 * 1024 * 1024,
     });
     const out = [stdout, stderr].filter(Boolean).join('\n').trim();
-    return out || '(exit 0, no output)';
+    return capBashOutput(out) || '(exit 0, no output)';
   } catch (err) {
     if (err.killed) throw new Error('Command timed out after 30s');
     const out = [err.stdout, err.stderr].filter(Boolean).join('\n').trim();
@@ -461,4 +461,17 @@ async function patchFile(filePath, args, cwd, workspace) {
 
   await fsp.writeFile(abs, content, 'utf8');
   return `Applied ${applied} patch${applied === 1 ? '' : 'es'} to ${filePath}`;
+}
+
+// Cap bash output before it enters the model context. Large command dumps (e.g.
+// a multi-megabyte API response) would otherwise be re-sent on every subsequent
+// tool iteration, multiplying token cost. Keep the head and tail (errors and
+// summaries usually live at the end). Override with CLAUDETTE_BASH_OUTPUT_CHARS.
+export function capBashOutput(text) {
+  const limit = Number(process.env.CLAUDETTE_BASH_OUTPUT_CHARS ?? 16_000);
+  if (!Number.isFinite(limit) || limit <= 0 || text.length <= limit) return text;
+  const head = Math.floor(limit * 0.7);
+  const tail = limit - head;
+  const omitted = text.length - limit;
+  return `${text.slice(0, head)}\n\n… [bash output truncated — ${omitted} chars omitted] …\n\n${text.slice(text.length - tail)}`;
 }

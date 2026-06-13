@@ -7,6 +7,8 @@
 
 // Canonical addressing is `anthropic/<id>`; the legacy `anthropic:<id>` colon
 // form is still accepted as an input alias.
+import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
+
 const PREFIX = 'anthropic/';
 const LEGACY_PREFIX = 'anthropic:';
 const API_VERSION = '2023-06-01';
@@ -80,13 +82,22 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
   }
 
   const { system, messages: anthropicMessages } = toAnthropicMessages(messages);
+  const cache = promptCacheEnabled();
+  if (cache) markAnthropicTail(anthropicMessages);
   const body = {
     model: stripPrefix(model),
-    max_tokens: Number(process.env.ANTHROPIC_MAX_TOKENS ?? 4096),
+    // ANTHROPIC_MAX_TOKENS still overrides; otherwise the shared sane default.
+    max_tokens: Number(process.env.ANTHROPIC_MAX_TOKENS) || resolveMaxTokens(),
     stream: true,
     messages: anthropicMessages,
   };
-  if (system) body.system = system;
+  if (system) {
+    // Cache the (large, stable) system prompt + CLAUDE.md as an ephemeral
+    // breakpoint so it isn't re-billed at full input price on every request.
+    body.system = cache
+      ? [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }]
+      : system;
+  }
   if (tools.length) body.tools = toAnthropicTools(tools);
   // Reasoning depth on models that support it (Opus 4.5+, Sonnet 4.6). Only
   // sent when set, so default requests are unchanged.
@@ -111,6 +122,22 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
   const result = await parseSSE(res.body, onDelta);
   result.toolMode = tools.length ? 'native' : 'none';
   return result;
+}
+
+// Add an ephemeral cache breakpoint to the last content block of the final
+// message, so Anthropic caches the whole conversation prefix up to it and reuses
+// it across tool iterations and follow-up turns.
+export function markAnthropicTail(messages) {
+  const last = messages[messages.length - 1];
+  if (!last) return messages;
+  if (typeof last.content === 'string' && last.content) {
+    last.content = [{ type: 'text', text: last.content }];
+  }
+  if (Array.isArray(last.content) && last.content.length) {
+    const block = last.content[last.content.length - 1];
+    if (block && typeof block === 'object') block.cache_control = { type: 'ephemeral' };
+  }
+  return messages;
 }
 
 // ─── Format translation ─────────────────────────────────────────────────────
