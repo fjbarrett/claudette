@@ -2502,6 +2502,16 @@ describe('src/input.js (follow-up queue)', async () => {
     assert.deepEqual(lines, ['also update the README']);
   });
 
+  test('assembler: onChange echoes the growing buffer and clears on submit', () => {
+    const changes = [];
+    const lines = [];
+    const feed = createInputAssembler({ onChange: b => changes.push(b), onLine: l => lines.push(l) });
+    feed('hi');
+    feed('\r');
+    assert.deepEqual(changes, ['h', 'hi', ''], 'fires per keystroke, then empties on submit');
+    assert.deepEqual(lines, ['hi']);
+  });
+
   test('assembler: a bracketed paste is ONE submission, not one per line (the 78-line bug)', () => {
     const lines = [];
     const feed = createInputAssembler({ onLine: l => lines.push(l) });

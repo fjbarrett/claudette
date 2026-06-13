@@ -62,13 +62,15 @@ export class InputController {
 const PASTE_START = '\x1b[200~';
 const PASTE_END = '\x1b[201~';
 
-export function createInputAssembler({ onLine, onCancel } = {}) {
+export function createInputAssembler({ onLine, onCancel, onChange } = {}) {
   let buf = '';
   let pasting = false;
+  const changed = () => onChange?.(buf); // current buffer, for live echo
 
   const submit = () => {
     const content = buf.replace(/\r/g, '').replace(/\n+$/, '').trim();
     buf = '';
+    changed();
     if (content && onLine) onLine(content);
   };
 
@@ -79,16 +81,17 @@ export function createInputAssembler({ onLine, onCancel } = {}) {
         const end = s.indexOf(PASTE_END);
         if (end === -1) { buf += s; s = ''; }          // paste continues in a later chunk
         else { buf += s.slice(0, end); s = s.slice(end + PASTE_END.length); pasting = false; }
+        changed();
         continue;
       }
       const start = s.indexOf(PASTE_START);
       const segment = start === -1 ? s : s.slice(0, start);
       for (const ch of segment) {
         const code = ch.charCodeAt(0);
-        if (code === 0x03) { buf = ''; onCancel?.(); }            // Ctrl+C
-        else if (code === 0x0d || code === 0x0a) submit();        // Enter
-        else if (code === 0x7f || code === 0x08) buf = buf.slice(0, -1); // Backspace
-        else if (code >= 0x20) buf += ch;                          // printable
+        if (code === 0x03) { buf = ''; changed(); onCancel?.(); }        // Ctrl+C
+        else if (code === 0x0d || code === 0x0a) submit();               // Enter
+        else if (code === 0x7f || code === 0x08) { buf = buf.slice(0, -1); changed(); } // Backspace
+        else if (code >= 0x20) { buf += ch; changed(); }                 // printable
       }
       if (start === -1) { s = ''; }
       else { pasting = true; s = s.slice(start + PASTE_START.length); }

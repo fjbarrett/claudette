@@ -59,6 +59,35 @@ export function stopSpinner() {
   process.stdout.write('\r\x1b[2K');
 }
 
+// ─── Live input line (see your follow-ups while the agent works) ─────────────
+// A single managed bottom row that shows what you're typing during a turn.
+// `updateLiveInput` redraws it in place; `printAboveLive` (the markdown-stream
+// writer during capture) erases it before output so the two never collide.
+// Typing stops the spinner so they don't fight for the bottom row.
+let _liveOn = false;
+let _liveText = '';
+
+export function setLiveInputActive(on) {
+  _liveOn = Boolean(on);
+  if (!_liveOn) _liveText = '';
+}
+
+export function updateLiveInput(text) {
+  if (jsonIpc || !_liveOn) return;
+  _liveText = String(text ?? '');
+  if (_liveText) stopSpinner();          // the input line takes the bottom row
+  process.stdout.write('\r\x1b[2K');     // clear the row
+  if (_liveText) process.stdout.write(`${GR}❯ ${R}${W}${_liveText}${R}`);
+}
+
+// Write turn output above the live input line: erase it first so output never
+// lands on the same row. The next keystroke redraws the input.
+export function printAboveLive(s) {
+  if (jsonIpc) { process.stdout.write(s); return; }
+  if (_liveOn && _liveText) process.stdout.write('\r\x1b[2K');
+  process.stdout.write(s);
+}
+
 export function cols() {
   return Math.min(process.stdout.columns || 80, 88);
 }
