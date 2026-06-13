@@ -3,6 +3,9 @@
 ## [Unreleased]
 
 ### Added
+- Monokai palette. The CLI/TUI colors are now the Monokai (VS Code) theme, via
+  24-bit truecolor (`src/ui.js`), and `NO_COLOR` is honored. The exact codes are
+  exported as `palette` for callers/tests.
 - The CLI/TUI now also loads a **`CLAUDETTE.md`** project-instructions file,
   walked up the directory tree alongside `CLAUDE.md` (innermost wins; a level's
   `CLAUDETTE.md` comes after its `CLAUDE.md` so it can augment/override) — for
