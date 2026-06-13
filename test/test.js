@@ -359,6 +359,36 @@ describe('context.js', async () => {
     }
   });
 
+  test('loadClaudeMd also loads CLAUDETTE.md, after CLAUDE.md at the same level', async () => {
+    const { loadClaudeMd } = await import('../src/context.js');
+    const dir = await makeTmpDir();
+    try {
+      await fsp.writeFile(path.join(dir, 'CLAUDE.md'), '# Generic\nGeneric guidance.');
+      await fsp.writeFile(path.join(dir, 'CLAUDETTE.md'), '# Claudette\nClaudette-specific guidance.');
+      const result = await loadClaudeMd(dir);
+      assert.ok(result.includes('Generic guidance.'), 'includes CLAUDE.md');
+      assert.ok(result.includes('Claudette-specific guidance.'), 'includes CLAUDETTE.md');
+      assert.ok(
+        result.indexOf('Generic guidance.') < result.indexOf('Claudette-specific guidance.'),
+        'CLAUDETTE.md comes after CLAUDE.md so it can augment/override',
+      );
+    } finally {
+      await cleanDir(dir);
+    }
+  });
+
+  test('loadClaudeMd reads CLAUDETTE.md even without a CLAUDE.md', async () => {
+    const { loadClaudeMd } = await import('../src/context.js');
+    const dir = await makeTmpDir();
+    try {
+      await fsp.writeFile(path.join(dir, 'CLAUDETTE.md'), 'Only Claudette here.');
+      const result = await loadClaudeMd(dir);
+      assert.ok(result.includes('Only Claudette here.'));
+    } finally {
+      await cleanDir(dir);
+    }
+  });
+
   test('expandFiles returns unchanged text with no @tokens', async () => {
     const { expandFiles } = await import('../src/context.js');
     const { text, files } = await expandFiles('hello world', tmpDir, tmpDir);

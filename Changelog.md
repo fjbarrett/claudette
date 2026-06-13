@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- The CLI/TUI now also loads a **`CLAUDETTE.md`** project-instructions file,
+  walked up the directory tree alongside `CLAUDE.md` (innermost wins; a level's
+  `CLAUDETTE.md` comes after its `CLAUDE.md` so it can augment/override) — for
+  Claudette-specific guidance on a directory or session.
 - Token-spend usage log. Every completed turn appends a flat JSONL record to
   `data/usage/usage.jsonl` — model, prompt/completion/total tokens, estimated
   cost, duration, tool-call count, prompt, status — a ready-made dataset for
