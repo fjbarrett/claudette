@@ -4,10 +4,23 @@ import { formatUsd } from './cost.js';
 
 const jsonIpc = process.argv.includes('--json-ipc');
 
-const R = '\x1b[0m', B = '\x1b[1m', D = '\x1b[2m';
+// Palette: Monokai (24-bit truecolor). Honors NO_COLOR (https://no-color.org).
+const NO_COLOR = process.env.NO_COLOR != null && process.env.NO_COLOR !== '';
+const sgr = (code) => (NO_COLOR ? '' : code);
+const fg = (r, g, b) => (NO_COLOR ? '' : `\x1b[38;2;${r};${g};${b}m`);
 
-const P = '\x1b[35m', C = '\x1b[36m', G = '\x1b[32m';
-const Y = '\x1b[33m', RE = '\x1b[31m', GR = '\x1b[90m', W = '\x1b[97m';
+const R = sgr('\x1b[0m'), B = sgr('\x1b[1m'), D = sgr('\x1b[2m');
+const P  = fg(174, 129, 255);  // purple    #AE81FF
+const C  = fg(102, 217, 239);  // cyan      #66D9EF
+const G  = fg(166, 226,  46);  // green     #A6E22E
+const Y  = fg(230, 219, 116);  // yellow    #E6DB74
+const RE = fg(249,  38, 114);  // red/pink  #F92672
+const O  = fg(253, 151,  31);  // orange    #FD971F
+const GR = fg(117, 113,  94);  // comment   #75715E
+const W  = fg(248, 248, 242);  // foreground #F8F8F2
+
+// Exported so callers/tests reference exact codes instead of hardcoding them.
+export const palette = { R, B, D, P, C, G, Y, RE, O, GR, W };
 
 export const s = {
   purple:     t => `${P}${t}${R}`,

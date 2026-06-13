@@ -2560,7 +2560,8 @@ describe('chat.js (credential guard)', async () => {
 // ─── ui.js: incremental markdown stream ───────────────────────────────────────
 
 describe('ui.js (markdown stream)', async () => {
-  const { createMarkdownStream } = await import('../src/ui.js');
+  const { createMarkdownStream, palette } = await import('../src/ui.js');
+  const code = (t) => `${palette.C}${t}${palette.R}`; // how inline/code text is colored
 
   function collect() {
     const chunks = [];
@@ -2575,8 +2576,8 @@ describe('ui.js (markdown stream)', async () => {
     stream.end();
     const text = out();
     assert.ok(!text.includes('**'), 'bold markers consumed');
-    assert.ok(text.includes('\x1b[1mbold\x1b[0m'), 'bold rendered as ANSI');
-    assert.ok(text.includes('\x1b[36mcode\x1b[0m'), 'inline code rendered as ANSI');
+    assert.ok(text.includes(`${palette.B}bold${palette.R}`), 'bold rendered as ANSI');
+    assert.ok(text.includes(code('code')), 'inline code rendered as ANSI');
   });
 
   test('keeps code-fence state across chunk boundaries', () => {
@@ -2586,8 +2587,8 @@ describe('ui.js (markdown stream)', async () => {
     stream.write('`\nplain **after** fence\n');
     stream.end();
     const text = out();
-    assert.ok(text.includes('\x1b[36m  const x = 1;\x1b[0m'), 'code line rendered as code');
-    assert.ok(text.includes('\x1b[1mafter\x1b[0m'), 'inline markdown resumes after the fence');
+    assert.ok(text.includes(code('  const x = 1;')), 'code line rendered as code');
+    assert.ok(text.includes(`${palette.B}after${palette.R}`), 'inline markdown resumes after the fence');
   });
 
   test('renders bullets and flushes a trailing partial line on end()', () => {
