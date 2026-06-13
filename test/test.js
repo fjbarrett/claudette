@@ -2407,6 +2407,32 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── Per-directory prompt history (up-arrow recall) ──────────────────────────
+
+describe('src/history.js (per-directory prompt history)', async () => {
+  const { historyFile, loadHistory, appendHistory } = await import('../src/history.js');
+
+  test('history is per-directory, newest-first, dedups consecutive, skips blanks', async () => {
+    const dir = await makeTmpDir();
+    const a = '/tmp/projA', b = '/tmp/projB';
+    appendHistory(a, 'first', { dir });
+    appendHistory(a, '   ', { dir });      // blank skipped
+    appendHistory(a, 'second', { dir });
+    appendHistory(a, 'second', { dir });   // consecutive duplicate skipped
+    appendHistory(b, 'other', { dir });
+    assert.deepEqual(await loadHistory(a, { dir }), ['second', 'first'], 'newest-first, deduped, no blanks');
+    assert.deepEqual(await loadHistory(b, { dir }), ['other'], 'separate dirs keep separate history');
+    assert.notEqual(historyFile(a, dir), historyFile(b, dir), 'distinct files per directory');
+    await cleanDir(dir);
+  });
+
+  test('loadHistory returns [] when a directory has no history yet', async () => {
+    const dir = await makeTmpDir();
+    assert.deepEqual(await loadHistory('/tmp/never-used-here', { dir }), []);
+    await cleanDir(dir);
+  });
+});
+
 // ─── Token-spend usage log (dataset) ─────────────────────────────────────────
 // One flat JSONL record per finished turn, for building token-efficiency datasets.
 

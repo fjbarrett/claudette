@@ -8,6 +8,10 @@
   pasted block is coalesced into a single follow-up (`createInputAssembler`).
 
 ### Added
+- Persistent per-directory prompt history. Re-entering the TUI in the same
+  directory restores what you typed there — **up-arrow recalls prior-session
+  prompts** like a normal shell (newest-first, consecutive dups skipped). Stored
+  under `data/history/` keyed by the absolute cwd (gitignored). (`src/history.js`)
 - Monokai palette. The CLI/TUI colors are now the Monokai (VS Code) theme, via
   24-bit truecolor (`src/ui.js`), and `NO_COLOR` is honored. The exact codes are
   exported as `palette` for callers/tests.

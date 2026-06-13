@@ -21,6 +21,7 @@ import { createTurnTrace, truncateLine } from './trace.js';
 import { estimateCost, formatUsd } from './cost.js';
 import { InputController, buildFollowUpMessage, createInputAssembler } from './input.js';
 import { recordTurnUsage } from './usage.js';
+import { loadHistory, appendHistory } from './history.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -146,7 +147,10 @@ export async function start() {
     }
   });
 
-  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: !jsonIpc });
+  // Seed readline with this directory's prior-session prompts so up-arrow recalls
+  // them like a normal shell (newest-first, per the readline contract).
+  const history = jsonIpc ? [] : await loadHistory(workspace);
+  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: !jsonIpc, history, historySize: 1000 });
 
   // Main REPL loop
   while (true) {
@@ -162,6 +166,9 @@ export async function start() {
 
     line = line.trim();
     if (!line) continue;
+
+    // Persist the entered line to this directory's history for next session.
+    if (!jsonIpc) appendHistory(workspace, line);
 
     if (jsonIpc) {
       try {
