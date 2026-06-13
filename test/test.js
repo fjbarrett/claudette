@@ -2447,7 +2447,46 @@ describe('src/usage.js (token-spend log)', async () => {
 // into one steering message at a safe boundary — never a second agent loop.
 
 describe('src/input.js (follow-up queue)', async () => {
-  const { InputController, buildFollowUpMessage } = await import('../src/input.js');
+  const { InputController, buildFollowUpMessage, createInputAssembler } = await import('../src/input.js');
+
+  test('assembler: a typed line submits on Enter', () => {
+    const lines = [];
+    const feed = createInputAssembler({ onLine: l => lines.push(l) });
+    feed('also update the README\r');
+    assert.deepEqual(lines, ['also update the README']);
+  });
+
+  test('assembler: a bracketed paste is ONE submission, not one per line (the 78-line bug)', () => {
+    const lines = [];
+    const feed = createInputAssembler({ onLine: l => lines.push(l) });
+    const pasted = ['## Sources', '', '* one', '* two', '* three'].join('\n'); // multi-line w/ blanks
+    feed(`\x1b[200~${pasted}\x1b[201~`); // paste arrives; not submitted yet
+    assert.deepEqual(lines, [], 'paste alone does not submit');
+    feed('\r');                          // user presses Enter
+    assert.equal(lines.length, 1, 'exactly one follow-up for the whole paste');
+    assert.equal(lines[0], pasted.trim(), 'newlines preserved as one message');
+  });
+
+  test('assembler: a paste split across chunks still coalesces to one submission', () => {
+    const lines = [];
+    const feed = createInputAssembler({ onLine: l => lines.push(l) });
+    feed('\x1b[200~line one\nline ');
+    feed('two\x1b[201~');
+    feed('\r');
+    assert.deepEqual(lines, ['line one\nline two']);
+  });
+
+  test('assembler: Ctrl+C cancels and clears, backspace edits', () => {
+    const lines = [];
+    let cancelled = 0;
+    const feed = createInputAssembler({ onLine: l => lines.push(l), onCancel: () => cancelled++ });
+    feed('hi\x7f\r');                 // backspace removes the "i"
+    assert.deepEqual(lines, ['h']);
+    feed('partial\x03');             // Ctrl+C drops the buffer
+    feed('\r');
+    assert.equal(cancelled, 1);
+    assert.deepEqual(lines, ['h'], 'cancelled text is not submitted');
+  });
 
   test('enqueue trims, ignores blank, and stamps the item', () => {
     const q = new InputController();

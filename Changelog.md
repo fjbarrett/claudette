@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+- Pasting a multi-line block while the agent works no longer fragments into one
+  queued follow-up per line. Bracketed paste mode is enabled during a turn and a
+  pasted block is coalesced into a single follow-up (`createInputAssembler`).
+
 ### Added
 - Monokai palette. The CLI/TUI colors are now the Monokai (VS Code) theme, via
   24-bit truecolor (`src/ui.js`), and `NO_COLOR` is honored. The exact codes are

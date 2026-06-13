@@ -19,7 +19,7 @@ import { createSession, loadSession, saveSession, scheduleSessionSave, flushSess
 import { loadClaudeMd, expandFiles } from './context.js';
 import { createTurnTrace, truncateLine } from './trace.js';
 import { estimateCost, formatUsd } from './cost.js';
-import { InputController, buildFollowUpMessage } from './input.js';
+import { InputController, buildFollowUpMessage, createInputAssembler } from './input.js';
 import { recordTurnUsage } from './usage.js';
 import * as ui from './ui.js';
 
@@ -264,12 +264,14 @@ async function runTurn(messages, rl, trace) {
   sessionInput.setMode('working');
   rl.pause();
   process.stdin.resume();
+  stdout.write('\x1b[?2004h'); // enable bracketed paste so a paste arrives as one unit
   const handler = makeTurnInputHandler(sessionInput);
   process.stdin.on('data', handler);
   try {
     await agentLoop(messages, rl, trace, sessionInput);
   } finally {
     process.stdin.removeListener('data', handler);
+    stdout.write('\x1b[?2004l'); // disable bracketed paste
     sessionInput.setMode('idle');
     try { rl.resume(); } catch { /* readline already closed */ }
   }
@@ -279,29 +281,18 @@ async function runTurn(messages, rl, trace) {
 // not echo, so typed text isn't shown until submitted (Phase 1) — on Enter the
 // line is queued and acknowledged. Ctrl+C still cancels the active stream.
 function makeTurnInputHandler(input) {
-  let buf = '';
-  return (chunk) => {
-    for (const ch of chunk.toString('utf8')) {
-      const code = ch.charCodeAt(0);
-      if (code === 0x03) {                          // Ctrl+C → cancel active stream
-        buf = '';
-        if (currentAC) {
-          currentAC.abort();
-          currentAC = null;
-          ui.stopSpinner();
-          stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
-        }
-      } else if (code === 0x0d || code === 0x0a) {  // Enter → submit a follow-up
-        const line = buf.trim();
-        buf = '';
-        if (line) handleTurnInputLine(line, input);
-      } else if (code === 0x7f || code === 0x08) {  // Backspace
-        buf = buf.slice(0, -1);
-      } else if (code >= 0x20) {                     // printable
-        buf += ch;
+  const feed = createInputAssembler({
+    onLine: (content) => handleTurnInputLine(content, input),
+    onCancel: () => {
+      if (currentAC) {
+        currentAC.abort();
+        currentAC = null;
+        ui.stopSpinner();
+        stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
       }
-    }
-  };
+    },
+  });
+  return (chunk) => feed(chunk.toString('utf8'));
 }
 
 function handleTurnInputLine(line, input) {
