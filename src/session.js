@@ -20,6 +20,7 @@ export async function createSession({ model, cwd }) {
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     messages: [],
+    turns: [],
   };
   await saveSession(session);
   return session;

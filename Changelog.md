@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- Per-turn session tracing in the CLI/TUI. A shared tracer (`src/trace.js`) records
+  each turn into `session.turns[]` — status, model, expanded `@files`, token/
+  duration metrics, and an ordered event log (`input_received` →
+  `system_prompt_built` → `model_request_started` → `tool_call`/`tool_result` … →
+  `assistant_completed`/`assistant_failed`). The web server was refactored onto the
+  same tracer, so a past CLI session is now as debuggable as a server one. +offline
+  regression test.
 - First-run setup via a gitignored `.env`: a zero-dependency loader (`src/env.js`)
   autoloads `.env` (package root → cwd → `~/.config/claudette`) before any module
   reads `process.env`; a real shell var always wins. Ships `.env.example`
