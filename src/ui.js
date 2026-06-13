@@ -10,14 +10,15 @@ const sgr = (code) => (NO_COLOR ? '' : code);
 const fg = (r, g, b) => (NO_COLOR ? '' : `\x1b[38;2;${r};${g};${b}m`);
 
 const R = sgr('\x1b[0m'), B = sgr('\x1b[1m'), D = sgr('\x1b[2m');
-const P  = fg(197, 134, 192);  // keyword purple  #C586C0
-const C  = fg( 86, 156, 214);  // VS Code blue    #569CD6
-const G  = fg( 78, 201, 176);  // type teal/green #4EC9B0
-const Y  = fg(220, 220, 170);  // function yellow #DCDCAA
-const RE = fg(244,  71,  71);  // error red       #F44747
-const O  = fg(206, 145, 120);  // string orange   #CE9178
-const GR = fg(133, 133, 133);  // muted gray      #858585
-const W  = fg(212, 212, 212);  // foreground      #D4D4D4
+// VS Code Default Dark hues, brightened for terminal readability.
+const P  = fg(218, 165, 214);  // keyword purple  #DAA5D6
+const C  = fg(112, 184, 235);  // blue            #70B8EB
+const G  = fg( 92, 218, 192);  // teal/green      #5CDAC0
+const Y  = fg(233, 227, 168);  // function yellow #E9E3A8
+const RE = fg(255, 110, 110);  // error red       #FF6E6E
+const O  = fg(230, 174, 145);  // string orange   #E6AE91
+const GR = fg(180, 186, 196);  // muted gray      #B4BAC4
+const W  = fg(238, 238, 238);  // foreground      #EEEEEE
 
 // Exported so callers/tests reference exact codes instead of hardcoding them.
 export const palette = { R, B, D, P, C, G, Y, RE, O, GR, W };
