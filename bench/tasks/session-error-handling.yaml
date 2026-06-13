@@ -1,0 +1,10 @@
+id: "session-error-handling"
+title: "Wrap corrupt-JSON session reads in try/catch"
+category: "coding"
+timeoutSec: 120
+prompt: "Read src/session.js. The listSessions function reads from a directory and returns session objects. Add error handling so that if an individual session file is corrupt JSON, it is silently skipped instead of crashing the whole list. Use try/catch around the JSON.parse. After editing, verify with: node --check src/session.js && grep -n 'try\\|catch' src/session.js"
+verify:
+  - "node --check src/session.js"
+  - "grep -q 'try' src/session.js"
+  - "grep -q 'catch' src/session.js"
+judgeFocus: "Did the agent read session.js, locate the listSessions function, add a try/catch specifically around JSON parsing of individual files, and verify the change? Penalise for rewriting the whole function, adding catch in the wrong location, or swallowing errors that should propagate."

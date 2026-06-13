@@ -1,0 +1,11 @@
+id: "edit-two-timeouts"
+title: "Update timeout values in two files"
+category: "coding"
+timeoutSec: 120
+prompt: "Read src/tools.js and find the bash tool's timeout value. Then read src/ollama.js and find the fetch timeout value. Update both to 90_000 ms. Make exactly two str_replace calls — one per file. After both edits, run: node --check src/tools.js && node --check src/ollama.js && grep -n 90_000 src/tools.js src/ollama.js"
+verify:
+  - "node --check src/tools.js"
+  - "node --check src/ollama.js"
+  - "grep -q 90_000 src/tools.js"
+  - "grep -q 90_000 src/ollama.js"
+judgeFocus: "Did the agent read both files, make exactly two targeted str_replace edits, and verify both files have the new timeout value? Penalise for reading unnecessary files, rewriting entire files, or missing one of the two edits."
