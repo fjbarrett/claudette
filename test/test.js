@@ -2235,6 +2235,9 @@ describe('cost & request tuning', async () => {
   test('pricing matches most-specific model and estimates cost', async () => {
     const { priceFor, estimateCost, formatUsd } = await import('../src/cost.js');
     assert.deepEqual(priceFor('openai/gpt-4o-mini'), { in: 0.15, out: 0.6 }, 'mini beats 4o by specificity');
+    assert.deepEqual(priceFor('openrouter/openai/gpt-5-nano'), { in: 0.05, out: 0.4 }, 'gpt-5-nano priced (no longer $0.00)');
+    assert.deepEqual(priceFor('openai/gpt-5-mini'), { in: 0.25, out: 2 }, 'gpt-5-mini beats gpt-5 by specificity');
+    assert.deepEqual(priceFor('gpt-5'), { in: 1.25, out: 10 });
     assert.ok(priceFor('openrouter/anthropic/claude-opus-4.8'), 'opus priced across prefixes');
     assert.equal(estimateCost('claude-haiku-4.5', { promptTokens: 1_000_000 }), 1, '$1 per 1M haiku input');
     assert.equal(estimateCost('mystery-model', { promptTokens: 1_000_000 }), null, 'unknown model → null');
@@ -2430,6 +2433,23 @@ describe('src/history.js (per-directory prompt history)', async () => {
     const dir = await makeTmpDir();
     assert.deepEqual(await loadHistory('/tmp/never-used-here', { dir }), []);
     await cleanDir(dir);
+  });
+});
+
+// ─── Turn trace terminal status ──────────────────────────────────────────────
+
+describe('src/trace.js (turn status)', async () => {
+  const { createTurnTrace } = await import('../src/trace.js');
+
+  test('complete/fail/cancel set distinct statuses and fire onFinish once', () => {
+    for (const [method, expected] of [['complete', 'completed'], ['fail', 'failed'], ['cancel', 'cancelled']]) {
+      let finished = null;
+      const tr = createTurnTrace({ prompt: 'p', model: 'm', cwd: '/w', onFinish: (t) => { finished = t.status; } });
+      tr[method]();
+      assert.equal(tr.turn.status, expected, `${method}() → ${expected}`);
+      assert.equal(finished, expected, 'onFinish saw the terminal status');
+      assert.ok(tr.turn.metrics.durationMs >= 0, 'duration stamped');
+    }
   });
 });
 

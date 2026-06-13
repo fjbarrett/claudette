@@ -62,5 +62,6 @@ export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], onEven
     addUsage,
     complete: () => finish('completed'),
     fail: () => finish('failed'),
+    cancel: () => finish('cancelled'),
   };
 }
