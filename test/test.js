@@ -2380,8 +2380,16 @@ console.log(JSON.stringify(r));
 // ─── chat.js: effort + bypass settings ────────────────────────────────────────
 
 describe('chat.js (effort + bypass)', async () => {
-  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS } =
+  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS, resolveMaxIterations } =
     await import('../src/chat.js');
+
+  test('resolveMaxIterations defaults to 50 and is configurable', () => {
+    assert.equal(resolveMaxIterations([], {}), 50, 'sane default (raised from the old hard 20)');
+    assert.equal(resolveMaxIterations(['node', 'claudette.js', '--max-iterations', '200'], {}), 200, 'flag wins');
+    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: '120' }), 120, 'env honored');
+    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: 'nonsense' }), 50, 'bad value → default');
+    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: '0' }), 50, 'zero rejected');
+  });
 
   test('isValidEffort accepts the documented levels and rejects others', () => {
     for (const lvl of EFFORT_LEVELS) assert.ok(isValidEffort(lvl), `${lvl} valid`);

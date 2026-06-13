@@ -44,6 +44,16 @@ export function resolveAutoApprove(argv = process.argv, env = process.env) {
   return v != null && v !== '' && v !== '0' && String(v).toLowerCase() !== 'false';
 }
 
+// Tool iterations allowed per turn before the runaway guard pauses the loop.
+// Default 50 (was a hard 20, which cut off large multi-file builds); raise with
+// --max-iterations N or CLAUDETTE_MAX_ITERATIONS.
+export function resolveMaxIterations(argv = process.argv, env = process.env) {
+  const flagIdx = argv.indexOf('--max-iterations');
+  const raw = flagIdx !== -1 ? argv[flagIdx + 1] : env.CLAUDETTE_MAX_ITERATIONS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 50;
+}
+
 let model      = null;
 let session    = null;
 let workspace  = process.cwd();
@@ -277,7 +287,7 @@ async function runExactBashShortcut(command, trace = null) {
 async function agentLoop(messages, rl, trace = null) {
   const tools = toolsOn ? TOOL_DEFS : [];
   let iteration = 0;
-  const MAX_ITERATIONS = 20; // prevent runaway loops
+  const MAX_ITERATIONS = resolveMaxIterations(); // runaway guard; configurable
 
   while (iteration < MAX_ITERATIONS) {
     iteration++;
@@ -494,12 +504,23 @@ async function agentLoop(messages, rl, trace = null) {
     // Loop continues → send tool results back to model
   }
 
-  if (trace) {
-    trace.event('max_iterations', { iterations: MAX_ITERATIONS });
-    trace.complete();
-    await flushSessionSave(session);
+  if (trace) trace.event('max_iterations', { iterations: MAX_ITERATIONS });
+
+  // Don't silently die mid-task. In an interactive terminal, offer to keep
+  // going; a fresh iteration budget continues the same turn (and trace).
+  // nullReadline (exact-bash fallback) answers 'n', so this can't hang.
+  if (!autoApprove && !jsonIpc && process.stdin.isTTY) {
+    let answer = '';
+    try {
+      answer = String(await rl.question(`\n\x1b[90m⚠ Hit ${MAX_ITERATIONS} tool iterations. Keep going? [y/N] \x1b[0m`)).trim().toLowerCase();
+    } catch { /* no usable input — fall through to stop */ }
+    if (answer === 'y' || answer === 'yes') {
+      return agentLoop(messages, rl, trace);
+    }
   }
-  ui.printWarning(`Reached ${MAX_ITERATIONS} tool iterations — stopping to prevent runaway loop.`);
+
+  if (trace) { trace.complete(); await flushSessionSave(session); }
+  ui.printWarning(`Reached ${MAX_ITERATIONS} tool iterations — stopping (runaway guard). Type a message to continue where it left off, or raise the limit with --max-iterations N (or CLAUDETTE_MAX_ITERATIONS).`);
 }
 
 // ─── Session cost helpers ─────────────────────────────────────────────────────

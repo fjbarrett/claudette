@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- Configurable agent-loop cap. The per-turn tool-iteration limit is now **50** by
+  default (was a hard **20** that cut off large multi-file builds mid-task) and
+  configurable via `--max-iterations N` / `CLAUDETTE_MAX_ITERATIONS`. On reaching
+  it, an interactive session offers to keep going instead of silently stopping,
+  and the stop message says how to continue or raise the limit.
 - Cost controls. **Prompt caching** for Anthropic — native and via OpenRouter
   (`src/llm-config.js` + ephemeral cache breakpoints on the system prompt and the
   conversation tail; on by default, `CLAUDETTE_PROMPT_CACHE=0` to disable) — so the
