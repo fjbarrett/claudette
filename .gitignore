@@ -3,6 +3,7 @@ bench/runs/
 bench/scratch/
 data/sessions/
 data/transcripts/
+data/usage/
 .ship-worktree/
 .env
 .env.*

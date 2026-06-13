@@ -2377,6 +2377,41 @@ console.log(JSON.stringify(r));
   });
 });
 
+// ─── Token-spend usage log (dataset) ─────────────────────────────────────────
+// One flat JSONL record per finished turn, for building token-efficiency datasets.
+
+describe('src/usage.js (token-spend log)', async () => {
+  const { buildUsageRecord, appendUsage } = await import('../src/usage.js');
+  const { estimateCost } = await import('../src/cost.js');
+
+  test('buildUsageRecord flattens a finished turn into a dataset row', () => {
+    const turn = {
+      id: 't1', model: 'anthropic/claude-haiku-4.5', cwd: '/w', status: 'completed',
+      prompt: 'do the thing', completedAt: '2026-06-12T00:00:00.000Z',
+      metrics: { promptTokens: 1000, completionTokens: 200, totalTokens: 1200, durationMs: 1500 },
+      events: [{ type: 'tool_call' }, { type: 'tool_result' }, { type: 'tool_call' }],
+    };
+    const rec = buildUsageRecord(turn, { id: 's1' });
+    assert.equal(rec.sessionId, 's1');
+    assert.equal(rec.turnId, 't1');
+    assert.equal(rec.totalTokens, 1200);
+    assert.equal(rec.toolCalls, 2, 'counts tool_call events only');
+    assert.equal(rec.estCostUsd, estimateCost('anthropic/claude-haiku-4.5', turn.metrics));
+    assert.equal(rec.prompt, 'do the thing');
+    assert.equal(rec.ts, '2026-06-12T00:00:00.000Z');
+  });
+
+  test('appendUsage writes one parseable JSONL record per call', async () => {
+    const dir = await makeTmpDir();
+    appendUsage({ a: 1 }, { dir });
+    appendUsage({ a: 2 }, { dir });
+    const lines = (await fsp.readFile(path.join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n');
+    assert.equal(lines.length, 2, 'append-only');
+    assert.deepEqual(lines.map(l => JSON.parse(l).a), [1, 2], 'each line is valid JSON in order');
+    await cleanDir(dir);
+  });
+});
+
 // ─── Follow-up queue (mid-run steering) ──────────────────────────────────────
 // While the agent works, submitted prompts go into this FIFO and are drained
 // into one steering message at a safe boundary — never a second agent loop.

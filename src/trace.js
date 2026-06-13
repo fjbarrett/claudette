@@ -16,7 +16,7 @@ export function truncateLine(value, max = 160) {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
-export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], onEvent = null } = {}) {
+export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], onEvent = null, onFinish = null } = {}) {
   const turn = {
     id: randomUUID(),
     prompt: truncateLine(prompt, 160),
@@ -50,6 +50,9 @@ export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], onEven
     turn.status = status;
     turn.completedAt = new Date().toISOString();
     turn.metrics.durationMs = Date.now() - startedAt;
+    // Fires once per terminal turn (complete/fail) — used to append the usage
+    // log. A logging error must never break the turn.
+    if (onFinish) { try { onFinish(turn); } catch { /* ignore */ } }
     return turn;
   }
 
