@@ -19,6 +19,7 @@ import { createSession, loadSession, saveSession, scheduleSessionSave, flushSess
 import { loadClaudeMd, expandFiles } from './context.js';
 import { createTurnTrace, truncateLine } from './trace.js';
 import { estimateCost, formatUsd } from './cost.js';
+import { InputController, buildFollowUpMessage } from './input.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -61,6 +62,7 @@ let toolsOn    = true;
 let autoApprove = resolveAutoApprove();
 let effort     = null;  // reasoning effort, or null when unset
 let currentAC  = null;  // AbortController for active stream
+let sessionInput = new InputController(); // follow-up queue for mid-run steering
 
 // Permission memory: set of tool names or "bash:<cmd>" the user said "always" to
 const alwaysAllow = new Set();
@@ -242,7 +244,71 @@ async function handleMessage(text, rl) {
   ];
   trace.event('system_prompt_built', { systemChars: systemPrompt.length, historyMessages: messages.length });
 
-  await agentLoop(messages, rl, trace);
+  await runTurn(messages, rl, trace);
+}
+
+// Run one agent turn, capturing typed follow-ups into the session queue while it
+// works. Live capture is enabled only for an auto-approve TTY session: a normal
+// turn needs stdin for permission prompts, and --json-ipc has no terminal. The
+// queue drain inside agentLoop runs regardless, so it stays unit-testable.
+async function runTurn(messages, rl, trace) {
+  const capture = autoApprove && !jsonIpc && process.stdin.isTTY;
+  if (!capture) {
+    await agentLoop(messages, rl, trace, null);
+    return;
+  }
+  sessionInput.setMode('working');
+  rl.pause();
+  process.stdin.resume();
+  const handler = makeTurnInputHandler(sessionInput);
+  process.stdin.on('data', handler);
+  try {
+    await agentLoop(messages, rl, trace, sessionInput);
+  } finally {
+    process.stdin.removeListener('data', handler);
+    sessionInput.setMode('idle');
+    try { rl.resume(); } catch { /* readline already closed */ }
+  }
+}
+
+// Minimal raw-mode line reader used only while a turn is running. Raw mode does
+// not echo, so typed text isn't shown until submitted (Phase 1) — on Enter the
+// line is queued and acknowledged. Ctrl+C still cancels the active stream.
+function makeTurnInputHandler(input) {
+  let buf = '';
+  return (chunk) => {
+    for (const ch of chunk.toString('utf8')) {
+      const code = ch.charCodeAt(0);
+      if (code === 0x03) {                          // Ctrl+C → cancel active stream
+        buf = '';
+        if (currentAC) {
+          currentAC.abort();
+          currentAC = null;
+          ui.stopSpinner();
+          stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
+        }
+      } else if (code === 0x0d || code === 0x0a) {  // Enter → submit a follow-up
+        const line = buf.trim();
+        buf = '';
+        if (line) handleTurnInputLine(line, input);
+      } else if (code === 0x7f || code === 0x08) {  // Backspace
+        buf = buf.slice(0, -1);
+      } else if (code >= 0x20) {                     // printable
+        buf += ch;
+      }
+    }
+  };
+}
+
+function handleTurnInputLine(line, input) {
+  if (line === '/queue') { ui.printQueue(input.list()); return; }
+  if (line === '/queue clear') {
+    const n = input.clear();
+    ui.printInfo(`Cleared ${n} queued follow-up${n === 1 ? '' : 's'}.`);
+    return;
+  }
+  const item = input.enqueue(line);
+  if (item) ui.printQueued(item, input.size);
 }
 
 async function runExactBashShortcut(command, trace = null) {
@@ -283,8 +349,23 @@ async function runExactBashShortcut(command, trace = null) {
   }
 }
 
+// Drain queued follow-ups into one steering user message and append it to the
+// live conversation + persisted history. Returns true when something was
+// delivered. Called only at safe boundaries (between model requests).
+async function deliverQueuedFollowUps(input, messages, trace) {
+  const items = input ? input.drain() : [];
+  if (!items.length) return false;
+  const msg = buildFollowUpMessage(items);
+  ui.printFollowUpDelivery(items);
+  messages.push(msg);
+  session.messages.push(msg);
+  trace?.event('followup_delivered', { count: items.length });
+  await flushSessionSave(session);
+  return true;
+}
+
 // ─── Agent loop ───────────────────────────────────────────────────────────────
-async function agentLoop(messages, rl, trace = null) {
+async function agentLoop(messages, rl, trace = null, input = null) {
   const tools = toolsOn ? TOOL_DEFS : [];
   let iteration = 0;
   const MAX_ITERATIONS = resolveMaxIterations(); // runaway guard; configurable
@@ -300,21 +381,25 @@ async function agentLoop(messages, rl, trace = null) {
     const ac = new AbortController();
     currentAC = ac;
 
-    // Pause readline so direct stdout.write() during streaming doesn't confuse it
-    rl.pause();
-
-    // When readline is paused, raw terminal mode means Ctrl+C sends \x03 to stdin
-    // rather than generating SIGINT — process.on('SIGINT') won't fire. Listen directly.
-    const ctrlCHandler = (chunk) => {
-      if (chunk[0] === 0x03 && currentAC) {
-        currentAC.abort();
-        currentAC = null;
-        ui.stopSpinner();
-        stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
-      }
-    };
-    process.stdin.resume();
-    process.stdin.on('data', ctrlCHandler);
+    // When the turn wrapper is capturing follow-ups (auto-approve TTY), it owns
+    // stdin and Ctrl+C for the whole turn. Otherwise do the per-iteration
+    // readline pause + raw Ctrl+C handling here (so Ctrl+C still cancels and
+    // permission prompts keep working).
+    let ctrlCHandler = null;
+    if (!input) {
+      // Pause readline so direct stdout.write() during streaming doesn't confuse it
+      rl.pause();
+      ctrlCHandler = (chunk) => {
+        if (chunk[0] === 0x03 && currentAC) {
+          currentAC.abort();
+          currentAC = null;
+          ui.stopSpinner();
+          stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
+        }
+      };
+      process.stdin.resume();
+      process.stdin.on('data', ctrlCHandler);
+    }
 
     // Live streaming: stop spinner on first token, render deltas through the
     // incremental markdown stream (line-buffered so formatting is correct).
@@ -365,9 +450,9 @@ async function agentLoop(messages, rl, trace = null) {
       }
       return;
     } finally {
-      process.stdin.removeListener('data', ctrlCHandler);
+      if (ctrlCHandler) process.stdin.removeListener('data', ctrlCHandler);
       currentAC = null;
-      rl.resume(); // restore readline after streaming
+      if (!input) rl.resume(); // restore readline after streaming (turn wrapper owns it otherwise)
     }
 
     if (!jsonIpc && !streamStarted) ui.stopSpinner();
@@ -415,6 +500,11 @@ async function agentLoop(messages, rl, trace = null) {
         });
       }
       session.messages.push({ role: 'assistant', content: result.content });
+
+      // Safe boundary: deliver follow-ups queued during this turn and keep the
+      // same agent loop alive instead of finishing.
+      if (await deliverQueuedFollowUps(input, messages, trace)) continue;
+
       if (trace) {
         trace.complete();
         trace.event('assistant_completed', { chars: (result.content ?? '').length, ...trace.turn.metrics });
@@ -501,7 +591,10 @@ async function agentLoop(messages, rl, trace = null) {
     }
 
     await flushSessionSave(session);
-    // Loop continues → send tool results back to model
+    // Safe boundary: inject follow-ups queued during tool execution before the
+    // next model request, so they ride along with the tool results.
+    await deliverQueuedFollowUps(input, messages, trace);
+    // Loop continues → send tool results (+ any follow-up) back to model
   }
 
   if (trace) trace.event('max_iterations', { iterations: MAX_ITERATIONS });
@@ -515,7 +608,7 @@ async function agentLoop(messages, rl, trace = null) {
       answer = String(await rl.question(`\n\x1b[90m⚠ Hit ${MAX_ITERATIONS} tool iterations. Keep going? [y/N] \x1b[0m`)).trim().toLowerCase();
     } catch { /* no usable input — fall through to stop */ }
     if (answer === 'y' || answer === 'yes') {
-      return agentLoop(messages, rl, trace);
+      return agentLoop(messages, rl, trace, input); // propagate capture across the continue
     }
   }
 
@@ -617,6 +710,7 @@ async function handleCommand(line, rl) {
 
         ['Info'],
         ['/cost',            'Estimate token usage for this session'],
+        ['/queue',           'List follow-ups queued while the agent works (type while it runs); /queue clear'],
         ['/vim',             'Toggle vim mode indicator'],
         ['/exit',            'Quit'],
       ]);
@@ -809,6 +903,16 @@ async function handleCommand(line, rl) {
       return true;
 
     // ── Info ─────────────────────────────────────────────────────────────────
+    case '/queue': {
+      if (arg === 'clear') {
+        const n = sessionInput.clear();
+        ui.printInfo(`Cleared ${n} queued follow-up${n === 1 ? '' : 's'}.`);
+      } else {
+        ui.printQueue(sessionInput.list());
+      }
+      return true;
+    }
+
     case '/cost': {
       const usage = sessionUsage();
       const total = usage.promptTokens + usage.completionTokens;
