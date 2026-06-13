@@ -2548,6 +2548,238 @@ describe('bench/evals.js (eval loops)', async () => {
   });
 });
 
+// ─── Bench task loading (YAML) ────────────────────────────────────────────────
+// The JSON→YAML migration must preserve task semantics exactly. A folded scalar
+// silently collapsed the multi-line str_replace anchors in exact-reproduction
+// tasks, changing what the model was asked. parseYaml stores those as literal
+// blocks and round-trips the original JSON objects.
+
+describe('bench/tasks.js (YAML task loading)', async () => {
+  test('parseYaml: literal block preserves newlines, blank lines, and indentation', async () => {
+    const { parseYaml } = await import('../bench/tasks.js');
+    const yaml = [
+      'id: "x"',
+      'prompt: |-',
+      '  line one',
+      '',
+      '  line three',
+      '      deeply indented',
+    ].join('\n') + '\n';
+    const obj = parseYaml(yaml);
+    assert.equal(obj.id, 'x');
+    assert.equal(obj.prompt, 'line one\n\nline three\n    deeply indented');
+  });
+
+  test('parseYaml: scalars coerce number/boolean and unquote strings', async () => {
+    const { parseYaml } = await import('../bench/tasks.js');
+    const obj = parseYaml(['n: 240', 'b: true', 'q: "hello: world"', 'plain: bare'].join('\n'));
+    assert.equal(obj.n, 240);
+    assert.equal(obj.b, true);
+    assert.equal(obj.q, 'hello: world');
+    assert.equal(obj.plain, 'bare');
+  });
+
+  test('toYaml → parseYaml round-trips a representative task exactly', async () => {
+    const { parseYaml, toYaml } = await import('../bench/tasks.js');
+    const task = {
+      id: 'demo',
+      title: 'Demo: edit & verify',
+      category: 'coding',
+      timeoutSec: 180,
+      singleTurn: true,
+      prompt: "Replace:\n\n    default: throw new Error();\n\nWith:\n\n    case 'x': return;\n    default: throw new Error();",
+      verify: ['node --check src/tools.js', "grep -n '\"echo\"' src/tools.js"],
+      judgeFocus: "Did it work? Don't churn the file.",
+    };
+    assert.deepEqual(parseYaml(toYaml(task)), task);
+  });
+
+  test('parseYaml: a line without a colon throws instead of silently dropping', async () => {
+    const { parseYaml } = await import('../bench/tasks.js');
+    assert.throws(() => parseYaml('this has no colon\n'), /expected "key: value"/);
+  });
+
+  test('loadTasks: every real task validates and exact anchors survive', async () => {
+    const { loadTasks } = await import('../bench/tasks.js');
+    const tasks = await loadTasks();
+    assert.ok(tasks.length >= 20, 'all task files loaded');
+    for (const t of tasks) {
+      assert.ok(t.id && t.title && t.category && t.prompt, `${t.id ?? '?'} has required fields`);
+      assert.ok(Array.isArray(t.verify) && t.verify.every(c => typeof c === 'string'), `${t.id} verify is string[]`);
+    }
+    const ids = tasks.map(t => t.id);
+    assert.equal(new Set(ids).size, ids.length, 'task ids unique');
+
+    const addTool = tasks.find(t => t.id === 'add-new-tool');
+    assert.ok(addTool, 'add-new-tool present');
+    assert.ok(
+      addTool.prompt.includes('];\n\n// ─── Executor dispatch'),
+      'multi-line str_replace anchor is byte-preserved (would break under folded scalars)',
+    );
+    assert.equal(addTool.singleTurn, true);
+    assert.equal(addTool.timeoutSec, 180);
+  });
+});
+
+// ─── Bench request cache ──────────────────────────────────────────────────────
+// Caching is opt-in (CLAUDETTE_BENCH_CACHE=1) and lets the harness re-judge for
+// free. The key must cover everything that changes the output; writes must be
+// atomic; a corrupt or missing entry must degrade to a live call, never throw.
+
+describe('provider.js (bench cache)', async () => {
+  test('getCacheKey covers output-affecting fields and ignores callbacks/order', async () => {
+    const { getCacheKey } = await import('../src/provider.js');
+    const base = { model: 'm', messages: [{ role: 'user', content: 'hi' }], tools: [], effort: 'high' };
+    const k1 = getCacheKey({ ...base, signal: {}, onDelta() {}, onEvent() {} });
+    const k2 = getCacheKey({ effort: 'high', tools: [], messages: [{ role: 'user', content: 'hi' }], model: 'm' });
+    assert.equal(k1, k2, 'key is order-independent and ignores streaming/cancellation plumbing');
+    assert.notEqual(k1, getCacheKey({ ...base, messages: [{ role: 'user', content: 'HELLO' }] }), 'content-sensitive');
+    assert.notEqual(k1, getCacheKey({ ...base, effort: 'low' }), 'effort-sensitive');
+    assert.notEqual(k1, getCacheKey({ ...base, model: 'other' }), 'model-sensitive');
+    assert.match(k1, /^[0-9a-f]{64}$/, 'looks like a sha256 hex digest');
+  });
+
+  test('writeCache publishes atomically and readCache round-trips', async () => {
+    const { writeCache, readCache } = await import('../src/provider.js');
+    const dir = await makeTmpDir();
+    const file = path.join(dir, 'entry.json');
+    const value = { content: 'hello', toolCalls: [], promptTokens: 1, completionTokens: 2 };
+    await writeCache(file, value);
+    assert.deepEqual(await readCache(file), value);
+    const leftover = (await fsp.readdir(dir)).filter(f => f.endsWith('.tmp'));
+    assert.equal(leftover.length, 0, 'no temp file left behind after rename');
+    await cleanDir(dir);
+  });
+
+  test('readCache returns null (clean miss) for a missing file', async () => {
+    const { readCache } = await import('../src/provider.js');
+    assert.equal(await readCache(path.join(os.tmpdir(), `absent-${randomUUID()}.json`)), null);
+  });
+
+  test('readCache returns null instead of throwing on a corrupt entry', async () => {
+    const { readCache } = await import('../src/provider.js');
+    const dir = await makeTmpDir();
+    const file = path.join(dir, 'corrupt.json');
+    await fsp.writeFile(file, '{ not valid json', 'utf8');
+    assert.equal(await readCache(file), null);
+    await cleanDir(dir);
+  });
+});
+
+// ─── CLI JSON IPC protocol ────────────────────────────────────────────────────
+// The benchmark harness drives claudette.js over --json-ipc. stdout must be a
+// pure JSONL event stream (no spinner/markdown/banner leakage), and the full
+// tool loop must surface ready/turn/tool_call/tool_result/assistant/done.
+
+describe('CLI JSON IPC protocol (--json-ipc)', async () => {
+  let tmpDir;
+  let mockServer;
+  let mockBaseUrl;
+
+  before(async () => {
+    tmpDir = await makeTmpDir();
+    await fsp.writeFile(path.join(tmpDir, 'notes.txt'), 'alpha from file\n', 'utf8');
+
+    mockServer = http.createServer(async (req, res) => {
+      if (req.method === 'GET' && req.url === '/api/tags') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          models: [{ name: 'mock-ipc:latest', size: 1, details: { family: 'mock', parameter_size: '1b' }, modified_at: new Date().toISOString() }],
+        }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/api/chat') {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const ndjson = (recs) => {
+          res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+          for (const r of recs) res.write(JSON.stringify(r) + '\n');
+          res.end();
+        };
+        const lastTool = [...(body.messages ?? [])].reverse().find(m => m.role === 'tool');
+        if (lastTool) {
+          ndjson([{ message: { content: 'Saw alpha from file.' } }, { done: true, prompt_eval_count: 5, eval_count: 6 }]);
+        } else {
+          ndjson([
+            { message: { content: 'Reading file.', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'notes.txt' } } }] } },
+            { done: true, prompt_eval_count: 4, eval_count: 5 },
+          ]);
+        }
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise(resolve => mockServer.listen(0, '127.0.0.1', resolve));
+    mockBaseUrl = `http://127.0.0.1:${mockServer.address().port}`;
+  });
+
+  after(async () => {
+    await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
+    await cleanDir(tmpDir);
+  });
+
+  function driveIpc({ timeout = 20_000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const proc = spawn('node', ['claudette.js', '--json-ipc', '-y', '--cwd', tmpDir, '--model', 'mock-ipc:latest'], {
+        cwd: ROOT,
+        env: { ...process.env, OLLAMA_BASE_URL: mockBaseUrl },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '', stderr = '', buffer = '';
+      const events = [], nonJson = [];
+      let promptSent = false;
+      proc.stdout.on('data', d => {
+        stdout += d;
+        buffer += d.toString();
+        const parts = buffer.split('\n');
+        buffer = parts.pop();
+        for (const line of parts) {
+          const t = line.trim();
+          if (!t) continue;
+          let msg;
+          try { msg = JSON.parse(t); } catch { nonJson.push(line); continue; }
+          events.push(msg);
+          if (msg.type === 'ready') {
+            if (!promptSent) {
+              promptSent = true;
+              proc.stdin.write(JSON.stringify({ type: 'prompt', text: 'inspect the file' }) + '\n');
+            } else {
+              proc.stdin.write(JSON.stringify({ type: 'exit' }) + '\n');
+              proc.stdin.end();
+            }
+          }
+        }
+      });
+      proc.stderr.on('data', d => stderr += d);
+      const timer = setTimeout(() => { proc.kill('SIGTERM'); resolve({ events, nonJson, stdout, stderr, timedOut: true }); }, timeout);
+      proc.on('close', () => { clearTimeout(timer); resolve({ events, nonJson, stdout, stderr, timedOut: false }); });
+      proc.on('error', reject);
+    });
+  }
+
+  test('emits pure JSONL and a complete event sequence through a tool loop', async () => {
+    const { events, nonJson, timedOut } = await driveIpc();
+    assert.equal(timedOut, false, 'process exits cleanly after {type:exit}');
+    assert.deepEqual(nonJson, [], 'stdout is pure JSONL — no spinner/markdown/banner leaks');
+
+    const types = events.map(e => e.type);
+    assert.ok(types.includes('ready'), 'ready emitted');
+    assert.ok(types.includes('turn'), 'turn emitted');
+
+    const toolCall = events.find(e => e.type === 'tool_call');
+    assert.ok(toolCall && toolCall.name === 'read_file', 'tool_call event carries the tool name');
+    const toolResult = events.find(e => e.type === 'tool_result');
+    assert.ok(toolResult && toolResult.name === 'read_file' && typeof toolResult.result === 'string', 'tool_result event carries the result');
+    const done = events.find(e => e.type === 'done');
+    assert.ok(done && typeof done.tokens === 'number', 'done event reports a token count');
+    assert.ok(
+      events.some(e => e.type === 'assistant' && /alpha from file/.test(e.content ?? '')),
+      'final assistant content is present',
+    );
+  });
+});
+
 // ─── Server streaming error path ──────────────────────────────────────────────
 // Regression: a provider error after the SSE headers were sent used to leave
 // the response open forever (the top-level handler tried to re-send headers).

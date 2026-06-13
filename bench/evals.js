@@ -249,7 +249,9 @@ export async function loadCases() {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  process.env.CLAUDETTE_BENCH_CACHE = args.noCache ? '0' : '1';
   const cases = await loadCases();
+
 
   if (args.list) {
     for (const c of cases) {
@@ -319,7 +321,7 @@ async function main() {
 }
 
 function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false };
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -329,10 +331,12 @@ function parseArgs(argv) {
     else if (arg === '--repeat') args.repeat = Number(argv[++i]);
     else if (arg === '--keep') args.keep = true;
     else if (arg === '--verbose') args.verbose = true;
+    else if (arg === '--no-cache') args.noCache = true;
     else throw new Error(`Unknown flag: ${arg}`);
   }
   return args;
 }
+
 
 function truncate(value, max) {
   const s = String(value ?? '');

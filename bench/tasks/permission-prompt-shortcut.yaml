@@ -1,0 +1,9 @@
+id: "permission-prompt-shortcut"
+title: "CLI permission prompt shortcut"
+category: "coding"
+timeoutSec: 180
+prompt: "Inspect the CLI permission prompt. If it still shows always instead of the single-letter shortcut a, fix it cleanly and verify the changed file still parses."
+verify:
+  - "rg -n \"\\\\[y/n/a\\\\]\" src/chat.js"
+  - "node --check src/chat.js"
+judgeFocus: "Did the agent inspect the relevant CLI permission path first, make a minimal edit, and verify the change without unnecessary file churn?"

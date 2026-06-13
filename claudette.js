@@ -12,6 +12,10 @@ import './src/env-autoload.js'; // load .env before anything reads process.env
 import { start } from './src/chat.js';
 
 start().catch(err => {
-  console.error('\x1b[31m✗ Fatal:\x1b[0m', err.message);
+  if (process.argv.includes('--json-ipc')) {
+    console.log(JSON.stringify({ type: 'error', error: err.message }));
+  } else {
+    console.error('\x1b[31m✗ Fatal:\x1b[0m', err.message);
+  }
   process.exit(1);
 });

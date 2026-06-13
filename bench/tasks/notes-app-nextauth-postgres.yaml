@@ -1,0 +1,28 @@
+id: "notes-app-nextauth-postgres"
+title: "Build a Next.js note-taking app with Google auth and Postgres"
+category: "project"
+timeoutSec: 420
+prompt: |-
+  Scaffold a note-taking web app from scratch inside a NEW subdirectory called `notes-app/`. Do NOT modify any files outside `notes-app/`. Use JavaScript (Next.js App Router) — not TypeScript. Use write_file for every file. Build:
+  1. `notes-app/package.json` — a Next.js app whose dependencies include `next`, `react`, `react-dom`, `next-auth`, `@prisma/client`, and a devDependency `prisma`.
+  2. `notes-app/prisma/schema.prisma` — a Prisma datasource with `provider = "postgresql"` reading `env("DATABASE_URL")`, and a `Note` model with at least `id`, `title`, `content`, `userId`, and `createdAt` fields.
+  3. `notes-app/app/api/auth/[...nextauth]/route.js` — NextAuth configured with the Google provider (GoogleProvider), exporting GET and POST handlers.
+  4. `notes-app/app/api/notes/route.js` — GET (list notes) and POST (create a note) handlers backed by the Prisma client.
+  5. `notes-app/app/page.jsx` — a minimal notes UI page.
+  6. `notes-app/.env.example` — documenting `DATABASE_URL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `NEXTAUTH_SECRET`, and `NEXTAUTH_URL`.
+  After creating the files, run `node --check notes-app/app/api/notes/route.js` and `node --check notes-app/app/api/auth/[...nextauth]/route.js` to confirm the route handlers parse.
+verify:
+  - "test -f notes-app/package.json"
+  - "node -e \"JSON.parse(require('fs').readFileSync('notes-app/package.json','utf8'))\""
+  - "grep -q '\"next-auth\"' notes-app/package.json"
+  - "grep -q '@prisma/client' notes-app/package.json"
+  - "test -f notes-app/prisma/schema.prisma"
+  - "grep -q 'model Note' notes-app/prisma/schema.prisma"
+  - "grep -qi 'provider = \"postgresql\"' notes-app/prisma/schema.prisma"
+  - "grep -rqi 'google' notes-app/app/api/auth"
+  - "node --check notes-app/app/api/notes/route.js"
+  - "test -f notes-app/.env.example"
+  - "grep -q 'DATABASE_URL' notes-app/.env.example"
+  - "grep -q 'GOOGLE_CLIENT_ID' notes-app/.env.example"
+  - "grep -q 'NEXTAUTH_SECRET' notes-app/.env.example"
+judgeFocus: "Did the agent scaffold a coherent Next.js note-taking app: a package.json with the right deps (next, next-auth, @prisma/client), a Prisma schema with a Postgres datasource and a Note model, a NextAuth route wired to the Google provider exporting GET/POST, a notes API route that actually uses the Prisma client for list/create, a UI page, and a complete .env.example? Penalise for missing files, deps that don't match the stack, a NextAuth route that doesn't configure Google, a notes route that doesn't touch Prisma, or scaffolding written outside notes-app/."
