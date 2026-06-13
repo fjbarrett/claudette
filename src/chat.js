@@ -20,6 +20,7 @@ import { loadClaudeMd, expandFiles } from './context.js';
 import { createTurnTrace, truncateLine } from './trace.js';
 import { estimateCost, formatUsd } from './cost.js';
 import { InputController, buildFollowUpMessage } from './input.js';
+import { recordTurnUsage } from './usage.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -211,7 +212,10 @@ async function handleMessage(text, rl) {
 
   // Start a turn trace (session.turns[]) so this turn can be debugged later.
   if (!Array.isArray(session.turns)) session.turns = [];
-  const trace = createTurnTrace({ prompt: text, model, cwd: workspace, expandedFiles: files });
+  const trace = createTurnTrace({
+    prompt: text, model, cwd: workspace, expandedFiles: files,
+    onFinish: (turn) => recordTurnUsage(turn, session), // append per-turn usage log
+  });
   session.turns.push(trace.turn);
   trace.event('input_received', { promptChars: text.length });
   trace.event('files_expanded', { count: files.length, files });

@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- Token-spend usage log. Every completed turn appends a flat JSONL record to
+  `data/usage/usage.jsonl` — model, prompt/completion/total tokens, estimated
+  cost, duration, tool-call count, prompt, status — a ready-made dataset for
+  studying and improving token efficiency. On by default; `CLAUDETTE_USAGE_LOG=0`
+  to disable, `CLAUDETTE_USAGE_DIR` to relocate. (`src/usage.js`; gitignored.)
 - Queued follow-ups (mid-run steering). In an auto-approve TTY session you can
   **type while the agent works**; submitted lines go into a visible FIFO queue
   (`/queue`, `/queue clear`) instead of starting a second loop, and are delivered
