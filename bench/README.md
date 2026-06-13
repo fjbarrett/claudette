@@ -5,7 +5,9 @@ This harness runs repeatable coding/admin tasks against the local CLI agent in i
 ## What it does
 
 - Creates a temporary git branch and worktree for each run
-- Executes the local CLI agent (`claudette.js`) with a task prompt
+- Drives the local CLI agent (`claudette.js`) over a structured JSON IPC
+  protocol (`--json-ipc`) rather than scraping terminal output
+- Caches provider responses by default so re-runs and re-judging are free
 - Captures the workflow transcript, git diff, and verification results
 - Runs an LLM judge over the workflow and outcome
 - Writes JSON and Markdown reports under `bench/runs/`
@@ -130,17 +132,47 @@ breaks down on long, multi-file builds.
 
 ## Task File Format
 
-Task definitions live in `bench/tasks/*.json`.
+Task definitions live in `bench/tasks/*.yaml` (legacy `*.json` is still loaded).
+The loader (`bench/tasks.js`) parses a small, lossless YAML subset; multi-line
+prompts are stored as literal `|-` blocks so exact-reproduction prompts keep
+their line breaks and indentation byte-for-byte. (Folded `>` scalars must be
+avoided for those — they collapse line breaks and silently change the task.)
 
 Each task supports:
 
 - `id`
 - `title`
 - `category`
-- `prompt`
+- `prompt` — use a literal `|-` block for any multi-line prompt
 - `verify`: array of shell commands run after the agent finishes (exit 0 = pass)
 - `timeoutSec`
+- `singleTurn` (optional): exit after the first model turn (single-shot tasks)
 - `judgeFocus`: guidance for the LLM judge
+
+## Request caching
+
+Provider responses are cached by default under `bench/runs/.cache/` (gitignored),
+keyed by a content hash of the request (model, messages, tools, effort). This
+makes re-running a task or re-judging an existing run deterministic and free.
+
+```bash
+npm run bench -- --task add-new-tool --model anthropic/claude-opus-4-8   # caches
+npm run bench -- --task add-new-tool --model anthropic/claude-opus-4-8 --no-cache
+```
+
+Pass `--no-cache` to force live provider calls. Cache writes are atomic and a
+corrupt or missing entry degrades to a live call (with a warning on stderr),
+never a crash. Bump `CACHE_VERSION` in `src/provider.js` to invalidate the cache
+after a result-shape change.
+
+## Process protocol (`--json-ipc`)
+
+The harness spawns `claudette.js --json-ipc` and exchanges newline-delimited JSON
+instead of parsing the human terminal UI. The harness sends
+`{"type":"prompt","text":...}` and `{"type":"exit"}`; the agent emits a pure
+JSONL event stream on stdout: `ready`, `turn`, `delta`, `tool_call`,
+`tool_result`, `assistant`, `done`, and `error`. No spinner, markdown, or banner
+output is written in this mode, so the stream stays machine-parseable.
 
 ## Eval Loops (`bench/evals.js`)
 

@@ -16,6 +16,16 @@ import * as deepseek from './deepseek.js';
 import * as groq from './groq.js';
 import * as huggingface from './huggingface.js';
 import { catalogProviders } from './providers.js';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const CACHE_DIR = path.join(PACKAGE_ROOT, 'bench', 'runs', '.cache');
+// Bump when the cached result shape or the key inputs change, so stale entries
+// from an older format never produce a false hit.
+const CACHE_VERSION = 'v1';
 
 // Cloud providers, in /models display order. Each exposes the same contract:
 // handles() · getModels() · chatStream() · hasCredentials() · KEY_ENV · LABEL.
@@ -51,13 +61,85 @@ export async function getModels() {
   return lists.flat();
 }
 
-export function chatStream(opts) {
+// Hash every request field that can change the output. Streaming/cancellation
+// plumbing (onDelta, onEvent, signal) is excluded because it doesn't affect the
+// model's response. stableStringify makes the digest independent of property
+// insertion order so equivalent requests from different call sites collide.
+export function getCacheKey(opts) {
+  const { signal, onDelta, onEvent, ...rest } = opts;
+  return crypto.createHash('sha256')
+    .update(`${CACHE_VERSION}\n${stableStringify(rest)}`)
+    .digest('hex');
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
+    return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export async function readCache(file) {
+  let raw;
+  try {
+    raw = await fs.readFile(file, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error(`\x1b[33m⚠ bench cache read failed (${path.basename(file)}): ${err.message}\x1b[0m`);
+    }
+    return null; // clean miss, or unreadable — fall through to a live call
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    console.error(`\x1b[33m⚠ bench cache entry corrupt, ignoring: ${path.basename(file)}\x1b[0m`);
+    return null;
+  }
+}
+
+export async function writeCache(file, result) {
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    // Atomic publish: write to a unique temp file then rename, so a concurrent
+    // reader sees either the previous entry or the complete new one, never a
+    // half-written file.
+    const tmp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(result, null, 2), 'utf8');
+    await fs.rename(tmp, file);
+  } catch (err) {
+    console.error(`\x1b[33m⚠ bench cache write failed (${path.basename(file)}): ${err.message}\x1b[0m`);
+  }
+}
+
+export async function chatStream(opts) {
+  // Caching is opt-in via the benchmark harness (CLAUDETTE_BENCH_CACHE=1) so
+  // interactive/server calls always hit the live provider.
+  const cacheFile = process.env.CLAUDETTE_BENCH_CACHE === '1'
+    ? path.join(CACHE_DIR, `${getCacheKey(opts)}.json`)
+    : null;
+
+  if (cacheFile) {
+    const cached = await readCache(cacheFile);
+    if (cached) {
+      // Replay the full text once so callers that render streamed deltas behave
+      // the same on a cache hit as on a live call.
+      if (opts.onDelta && cached.content) opts.onDelta(cached.content);
+      return cached;
+    }
+  }
+
   const provider = providerFor(opts.model);
   // For Ollama, strip an explicit `ollama/` prefix; cloud adapters strip their
   // own prefix internally.
   const model = provider === ollama ? normaliseOllama(opts.model) : opts.model;
-  return provider.chatStream({ ...opts, model });
+  const result = await provider.chatStream({ ...opts, model });
+
+  if (cacheFile) await writeCache(cacheFile, result);
+  return result;
 }
+
 
 /**
  * Agent/judge default models from the first credentialed cloud provider that

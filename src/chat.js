@@ -21,6 +21,8 @@ import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
 
+const jsonIpc = process.argv.includes('--json-ipc');
+
 // ─── Mutable app state ────────────────────────────────────────────────────────
 
 // Reasoning-effort levels accepted by --effort / /effort, in increasing depth.
@@ -114,7 +116,7 @@ export async function start() {
   // Create fresh session
   session = await createSession({ model, cwd: workspace });
 
-  ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
+  if (!jsonIpc) ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
 
   // Handle Ctrl+C: cancel stream if running, else exit
   process.on('SIGINT', () => {
@@ -124,24 +126,40 @@ export async function start() {
       ui.stopSpinner();
       stdout.write(`\n${'\x1b[90m'}(cancelled)\x1b[0m\n`);
     } else {
-      console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
+      if (!jsonIpc) console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
       exit(0);
     }
   });
 
-  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: true });
+  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: !jsonIpc });
 
   // Main REPL loop
   while (true) {
     let line;
     try {
-      line = await rl.question('\x1b[35m\x1b[1m>\x1b[0m ');
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'ready' }));
+      }
+      line = await rl.question(jsonIpc ? '' : '\x1b[35m\x1b[1m>\x1b[0m ');
     } catch {
       break; // Ctrl+D / EOF
     }
 
     line = line.trim();
     if (!line) continue;
+
+    if (jsonIpc) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === 'prompt') {
+          line = parsed.text;
+        } else if (parsed.type === 'exit') {
+          break;
+        }
+      } catch {
+        // Fallback for non-JSON lines
+      }
+    }
 
     if (line.startsWith('/')) {
       const cont = await handleCommand(line, rl);
@@ -164,7 +182,7 @@ export async function start() {
   }
 
   rl.close();
-  console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
+  if (!jsonIpc) console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
 }
 
 // ─── User message handler ─────────────────────────────────────────────────────
@@ -243,8 +261,11 @@ async function agentLoop(messages, rl) {
 
   while (iteration < MAX_ITERATIONS) {
     iteration++;
+    if (jsonIpc) {
+      console.log(JSON.stringify({ type: 'turn', iteration }));
+    }
     const label = iteration === 1 ? 'Thinking' : 'Working';
-    ui.startSpinner(label);
+    if (!jsonIpc) ui.startSpinner(label);
 
     const ac = new AbortController();
     currentAC = ac;
@@ -270,6 +291,10 @@ async function agentLoop(messages, rl) {
     let streamStarted = false;
     let mdStream = null;
     const onDelta = (delta) => {
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'delta', content: delta }));
+        return; // IPC mode emits only JSONL — no terminal rendering
+      }
       if (!streamStarted) {
         streamStarted = true;
         ui.stopSpinner();
@@ -278,6 +303,7 @@ async function agentLoop(messages, rl) {
       }
       mdStream.write(delta);
     };
+
 
     let result;
     try {
@@ -290,9 +316,13 @@ async function agentLoop(messages, rl) {
         ...(effort ? { effort } : {}),
       });
     } catch (err) {
-      ui.stopSpinner();
+      if (!jsonIpc) ui.stopSpinner();
       if (err.name === 'AbortError') return; // user cancelled
-      ui.printError(`Stream error: ${err.message}`);
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'error', error: err.message }));
+      } else {
+        ui.printError(`Stream error: ${err.message}`);
+      }
       return;
     } finally {
       process.stdin.removeListener('data', ctrlCHandler);
@@ -300,7 +330,7 @@ async function agentLoop(messages, rl) {
       rl.resume(); // restore readline after streaming
     }
 
-    if (!streamStarted) ui.stopSpinner();
+    if (!jsonIpc && !streamStarted) ui.stopSpinner();
 
     // ── Merge text-parsed tool calls with API tool calls ─────────────────────
     // Some models (qwen2.5-coder) emit some calls via API and others as JSON
@@ -322,38 +352,49 @@ async function agentLoop(messages, rl) {
 
     // ── No tool calls → normal response, done ──────────────────────────────
     if (!result.toolCalls?.length) {
-      if (!streamStarted && result.content) {
-        // Nothing was streamed (e.g. empty onDelta path) — render with markdown
-        ui.printAssistantStart();
-        ui.printAssistantMessage(result.content);
-      } else if (streamStarted) {
-        mdStream.end(); // flush a trailing partial line
-        stdout.write('\n');
+      if (!jsonIpc) {
+        if (!streamStarted && result.content) {
+          // Nothing was streamed (e.g. empty onDelta path) — render with markdown
+          ui.printAssistantStart();
+          ui.printAssistantMessage(result.content);
+        } else if (streamStarted) {
+          mdStream.end(); // flush a trailing partial line
+          stdout.write('\n');
+        }
+        ui.printAssistantEnd({
+          model,
+          tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) || null,
+        });
       }
-      ui.printAssistantEnd({
-        model,
-        tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) || null,
-      });
       session.messages.push({ role: 'assistant', content: result.content });
       await flushSessionSave(session);
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'assistant', content: result.content }));
+        console.log(JSON.stringify({ type: 'done', tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) }));
+      }
       return;
     }
 
     // ── Tool calls ─────────────────────────────────────────────────────────
-    if (!streamStarted && result.content) {
-      // Content wasn't streamed yet — render it before tool blocks
-      ui.printAssistantStart();
-      ui.printAssistantMessage(result.content);
-      stdout.write('\n');
-    } else if (streamStarted) {
-      mdStream.end(); // flush a trailing partial line
-      stdout.write('\n'); // newline after streamed text before tool blocks
+    if (!jsonIpc) {
+      if (!streamStarted && result.content) {
+        // Content wasn't streamed yet — render it before tool blocks
+        ui.printAssistantStart();
+        ui.printAssistantMessage(result.content);
+        stdout.write('\n');
+      } else if (streamStarted) {
+        mdStream.end(); // flush a trailing partial line
+        stdout.write('\n'); // newline after streamed text before tool blocks
+      }
     }
 
     // Record assistant turn with tool_calls
     const assistantMsg = { role: 'assistant', content: result.content ?? '', tool_calls: result.toolCalls };
     messages.push(assistantMsg);
     session.messages.push(assistantMsg);
+    if (jsonIpc) {
+      console.log(JSON.stringify({ type: 'assistant', content: result.content ?? '', toolCalls: result.toolCalls }));
+    }
 
     for (const call of result.toolCalls) {
       const { name, arguments: rawArgs } = call.function;
@@ -364,9 +405,13 @@ async function agentLoop(messages, rl) {
         args = { raw: rawArgs };
       }
 
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'tool_call', name, arguments: args }));
+      }
+
       // The permission prompt renders the call itself — printing the normal
       // tool-call line too showed the same call twice.
-      if (!needsApproval(name, args)) ui.printToolCall(name, args);
+      if (!jsonIpc && !needsApproval(name, args)) ui.printToolCall(name, args);
 
       // Permission check
       const allowed = await checkPermission(name, args, rl);
@@ -389,9 +434,14 @@ async function agentLoop(messages, rl) {
         isError = true;
       }
 
-      ui.printToolResult(name, toolResult, isError);
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'tool_result', name, result: toolResult, isError }));
+      }
+
+      if (!jsonIpc) ui.printToolResult(name, toolResult, isError);
 
       const resultMsg = { role: 'tool', content: toolResult, ...(call.id ? { tool_call_id: call.id } : {}) };
+
       messages.push(resultMsg);
       session.messages.push(resultMsg);
     }

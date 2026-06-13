@@ -7,11 +7,11 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { resolveOllamaBaseUrl } from '../src/config.js';
 import { chatStream, missingCredential, defaultCloudModels } from '../src/provider.js';
+import { loadTasks } from './tasks.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, '..');
-const TASKS_DIR = path.join(__dirname, 'tasks');
 const RUNS_DIR = path.join(__dirname, 'runs');
 // Worktrees live one level above the repo root so loadClaudeMd (which stops at
 // .git boundaries) never walks up and finds the repo's own CLAUDE.md.
@@ -21,7 +21,9 @@ const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  process.env.CLAUDETTE_BENCH_CACHE = args.noCache ? '0' : '1';
   const tasks = await loadTasks();
+
 
   if (args.list) {
     for (const task of tasks) {
@@ -264,14 +266,42 @@ function computeHardScore({ agentRun, verification, diffStat, gitStatus }) {
   };
 }
 
+// The agent runs under --json-ipc, so its stdout is a JSONL event stream
+// (turn/delta/assistant/tool_call/tool_result/done/error). Reconstruct a
+// human-readable workflow summary from those events. Any non-JSON line is
+// ignored, so stray output never corrupts the summary.
 function buildWorkflowSummary(stdout) {
-  const lines = String(stdout ?? '').split('\n');
-  const toolLines = lines.filter(line => line.includes('⏺') || line.includes('Allow this tool call?'));
-  const summary = [...toolLines, ...lines.slice(-40)].join('\n').trim();
-  return {
-    toolEvents: toolLines.length,
-    summary,
-  };
+  const events = [];
+  let toolEvents = 0;
+  for (const line of String(stdout ?? '').split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let msg;
+    try { msg = JSON.parse(trimmed); } catch { continue; }
+    switch (msg.type) {
+      case 'turn':
+        events.push(`── turn ${msg.iteration} ──`);
+        break;
+      case 'tool_call':
+        toolEvents++;
+        events.push(`⏺ ${msg.name}(${truncate(oneLine(JSON.stringify(msg.arguments ?? {})), 300)})`);
+        break;
+      case 'tool_result':
+        events.push(`  ⎿ ${msg.name} → ${msg.isError ? 'ERROR' : 'ok'}: ${truncate(oneLine(msg.result), 200)}`);
+        break;
+      case 'assistant':
+        if (msg.content && msg.content.trim()) events.push(`assistant: ${truncate(oneLine(msg.content), 400)}`);
+        break;
+      case 'error':
+        events.push(`error: ${msg.error}`);
+        break;
+    }
+  }
+  return { toolEvents, summary: events.join('\n').trim() };
+}
+
+function oneLine(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').trim();
 }
 
 async function judgeRun({ judgeModel, task, model, agentRun, workflow, verification, diffStat, diff, gitStatus }) {
@@ -346,9 +376,8 @@ async function judgeRun({ judgeModel, task, model, agentRun, workflow, verificat
 
 async function runAgentTask({ worktree, model, prompt, timeoutSec, singleTurn, transcriptFile, verbose }) {
   const command = 'node';
-  const args = [path.join(ROOT, 'claudette.js'), '-y', '--cwd', worktree, '--model', model];
+  const args = [path.join(ROOT, 'claudette.js'), '-y', '--cwd', worktree, '--model', model, '--json-ipc'];
   const started = Date.now();
-  const promptToken = '\x1b[35m\x1b[1m>\x1b[0m ';
   const child = spawn(command, args, {
     cwd: worktree,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -361,45 +390,72 @@ async function runAgentTask({ worktree, model, prompt, timeoutSec, singleTurn, t
   let forceKilled = false;
   let promptSent = false;
   let exitSent = false;
-  let promptCount = 0;
   let idleTimer = null;
+  let buffer = '';
 
   function sendExit() {
     if (exitSent) return;
     exitSent = true;
-    child.stdin.write('/exit\n');
-    child.stdin.end();
+    if (child.stdin.writable) {
+      child.stdin.write(JSON.stringify({ type: 'exit' }) + '\n');
+      child.stdin.end();
+    }
   }
 
-  function scheduleIdleExit() {
+  function scheduleIdleExit(ms = 30_000) {
     if (!promptSent || exitSent) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       sendExit();
-    }, 10_000);
+    }, ms);
   }
 
   child.stdout.on('data', chunk => {
     const s = chunk.toString();
     stdout += s;
-    if (verbose) process.stdout.write(s);
+    buffer += s;
 
-    promptCount += s.split(promptToken).length - 1;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
 
-    if (!promptSent && promptCount >= 1) {
-      promptSent = true;
-      child.stdin.write(`${prompt}\n`);
-      scheduleIdleExit();
-      return;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      try {
+        const msg = JSON.parse(trimmed);
+        scheduleIdleExit(); // reset idle timer on any structured message
+
+        if (msg.type === 'ready') {
+          if (!promptSent) {
+            promptSent = true;
+            child.stdin.write(JSON.stringify({ type: 'prompt', text: prompt }) + '\n');
+            scheduleIdleExit();
+          } else if (singleTurn) {
+            sendExit();
+          }
+        } else if (msg.type === 'done') {
+          sendExit();
+        }
+
+        if (verbose) {
+          if (msg.type === 'turn') {
+            console.log(`\x1b[34m[Agent Turn ${msg.iteration}]\x1b[0m`);
+          } else if (msg.type === 'delta') {
+            process.stdout.write(msg.content);
+          } else if (msg.type === 'tool_call') {
+            console.log(`\n\x1b[32m⏺ Calling Tool: ${msg.name}(${JSON.stringify(msg.arguments)})\x1b[0m`);
+          } else if (msg.type === 'tool_result') {
+            console.log(`\x1b[90m⎿ Tool Result: ${msg.name} -> ${msg.isError ? 'Error' : 'Success'}\x1b[0m`);
+          }
+        }
+      } catch {
+        // Fallback for non-JSON output (e.g. debugging logs or process errors)
+        if (verbose) process.stdout.write(trimmed + '\n');
+      }
     }
-
-    if (singleTurn && promptCount >= 2) {
-      sendExit();
-      return;
-    }
-
-    scheduleIdleExit();
   });
+
   child.stderr.on('data', chunk => {
     const s = chunk.toString();
     stderr += s;
@@ -439,6 +495,7 @@ async function runAgentTask({ worktree, model, prompt, timeoutSec, singleTurn, t
   };
 }
 
+
 async function runVerificationCommands(commands, cwd) {
   const results = [];
   for (const command of commands) {
@@ -474,17 +531,6 @@ async function git(args, cwd) {
   return result.stdout;
 }
 
-async function loadTasks() {
-  const entries = await fs.readdir(TASKS_DIR);
-  const tasks = [];
-  for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
-    const raw = await fs.readFile(path.join(TASKS_DIR, entry), 'utf8');
-    tasks.push(JSON.parse(raw));
-  }
-  return tasks.sort((a, b) => a.id.localeCompare(b.id));
-}
-
 function pickTask(tasks, id) {
   if (!id) return null;
   return tasks.find(task => task.id === id) ?? null;
@@ -503,6 +549,7 @@ function parseArgs(argv) {
     all: false,
     repeat: 1,
     verbose: false,
+    noCache: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -521,11 +568,13 @@ function parseArgs(argv) {
     else if (arg === '--all') args.all = true;
     else if (arg === '--repeat') args.repeat = Math.max(1, Number(argv[++i]));
     else if (arg === '--verbose' || arg === '-v') args.verbose = true;
+    else if (arg === '--no-cache') args.noCache = true;
     else throw new Error(`Unknown arg: ${arg}`);
   }
 
   return args;
 }
+
 
 // Default agent model when --model is omitted: cloud-first (any provider with
 // a key in env — no local Ollama needed), falling back to whatever the local
@@ -581,7 +630,11 @@ function round1(n) {
   return Math.round(n * 10) / 10;
 }
 
-main().catch(error => {
-  console.error(error.stack || error.message);
-  process.exit(1);
-});
+// Only run the CLI when executed directly (`node bench/run.js`), not when a
+// test imports this module for its helpers.
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  main().catch(error => {
+    console.error(error.stack || error.message);
+    process.exit(1);
+  });
+}
