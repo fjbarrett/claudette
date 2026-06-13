@@ -54,6 +54,48 @@ export class InputController {
   }
 }
 
+// Terminal-input state machine: assembles typed lines and bracketed pastes into
+// whole submissions. Text between the bracketed-paste markers (\x1b[200~ …
+// \x1b[201~) is kept as ONE submission even across many lines — fixing the bug
+// where each pasted newline became a separate queued follow-up. Pure and
+// callback-based so it's unit-testable; the terminal wiring lives in chat.js.
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
+
+export function createInputAssembler({ onLine, onCancel } = {}) {
+  let buf = '';
+  let pasting = false;
+
+  const submit = () => {
+    const content = buf.replace(/\r/g, '').replace(/\n+$/, '').trim();
+    buf = '';
+    if (content && onLine) onLine(content);
+  };
+
+  return function feed(input) {
+    let s = String(input ?? '');
+    while (s.length) {
+      if (pasting) {
+        const end = s.indexOf(PASTE_END);
+        if (end === -1) { buf += s; s = ''; }          // paste continues in a later chunk
+        else { buf += s.slice(0, end); s = s.slice(end + PASTE_END.length); pasting = false; }
+        continue;
+      }
+      const start = s.indexOf(PASTE_START);
+      const segment = start === -1 ? s : s.slice(0, start);
+      for (const ch of segment) {
+        const code = ch.charCodeAt(0);
+        if (code === 0x03) { buf = ''; onCancel?.(); }            // Ctrl+C
+        else if (code === 0x0d || code === 0x0a) submit();        // Enter
+        else if (code === 0x7f || code === 0x08) buf = buf.slice(0, -1); // Backspace
+        else if (code >= 0x20) buf += ch;                          // printable
+      }
+      if (start === -1) { s = ''; }
+      else { pasting = true; s = s.slice(start + PASTE_START.length); }
+    }
+  };
+}
+
 // Combine drained follow-ups into a single steering user message, preserving
 // order. Returning one message (not several) avoids adjacent user turns and an
 // extra provider request per queued line.
