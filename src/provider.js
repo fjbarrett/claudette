@@ -16,6 +16,13 @@ import * as deepseek from './deepseek.js';
 import * as groq from './groq.js';
 import * as huggingface from './huggingface.js';
 import { catalogProviders } from './providers.js';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const CACHE_DIR = path.join(PACKAGE_ROOT, 'bench', 'runs', '.cache');
 
 // Cloud providers, in /models display order. Each exposes the same contract:
 // handles() · getModels() · chatStream() · hasCredentials() · KEY_ENV · LABEL.
@@ -51,13 +58,55 @@ export async function getModels() {
   return lists.flat();
 }
 
-export function chatStream(opts) {
+function getCacheKey(opts) {
+  const serializable = {
+    model: opts.model,
+    messages: opts.messages,
+    tools: opts.tools,
+    effort: opts.effort,
+  };
+  const str = JSON.stringify(serializable);
+  return crypto.createHash('sha256').update(str).digest('hex');
+}
+
+export async function chatStream(opts) {
+  const isCacheEnabled = process.env.CLAUDETTE_BENCH_CACHE === '1';
+
+  if (isCacheEnabled) {
+    const key = getCacheKey(opts);
+    const cacheFile = path.join(CACHE_DIR, `${key}.json`);
+    try {
+      const cacheContent = await fs.readFile(cacheFile, 'utf8');
+      const cachedResult = JSON.parse(cacheContent);
+      if (opts.onDelta && cachedResult.content) {
+        opts.onDelta(cachedResult.content);
+      }
+      return cachedResult;
+    } catch (err) {
+      // Cache miss or read/parse error
+    }
+  }
+
   const provider = providerFor(opts.model);
   // For Ollama, strip an explicit `ollama/` prefix; cloud adapters strip their
   // own prefix internally.
   const model = provider === ollama ? normaliseOllama(opts.model) : opts.model;
-  return provider.chatStream({ ...opts, model });
+  const result = await provider.chatStream({ ...opts, model });
+
+  if (isCacheEnabled) {
+    const key = getCacheKey(opts);
+    const cacheFile = path.join(CACHE_DIR, `${key}.json`);
+    try {
+      await fs.mkdir(CACHE_DIR, { recursive: true });
+      await fs.writeFile(cacheFile, JSON.stringify(result, null, 2), 'utf8');
+    } catch (err) {
+      // Ignore write errors
+    }
+  }
+
+  return result;
 }
+
 
 /**
  * Agent/judge default models from the first credentialed cloud provider that

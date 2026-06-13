@@ -21,7 +21,9 @@ const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  process.env.CLAUDETTE_BENCH_CACHE = args.noCache ? '0' : '1';
   const tasks = await loadTasks();
+
 
   if (args.list) {
     for (const task of tasks) {
@@ -346,9 +348,8 @@ async function judgeRun({ judgeModel, task, model, agentRun, workflow, verificat
 
 async function runAgentTask({ worktree, model, prompt, timeoutSec, singleTurn, transcriptFile, verbose }) {
   const command = 'node';
-  const args = [path.join(ROOT, 'claudette.js'), '-y', '--cwd', worktree, '--model', model];
+  const args = [path.join(ROOT, 'claudette.js'), '-y', '--cwd', worktree, '--model', model, '--json-ipc'];
   const started = Date.now();
-  const promptToken = '\x1b[35m\x1b[1m>\x1b[0m ';
   const child = spawn(command, args, {
     cwd: worktree,
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -361,45 +362,72 @@ async function runAgentTask({ worktree, model, prompt, timeoutSec, singleTurn, t
   let forceKilled = false;
   let promptSent = false;
   let exitSent = false;
-  let promptCount = 0;
   let idleTimer = null;
+  let buffer = '';
 
   function sendExit() {
     if (exitSent) return;
     exitSent = true;
-    child.stdin.write('/exit\n');
-    child.stdin.end();
+    if (child.stdin.writable) {
+      child.stdin.write(JSON.stringify({ type: 'exit' }) + '\n');
+      child.stdin.end();
+    }
   }
 
-  function scheduleIdleExit() {
+  function scheduleIdleExit(ms = 30_000) {
     if (!promptSent || exitSent) return;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       sendExit();
-    }, 10_000);
+    }, ms);
   }
 
   child.stdout.on('data', chunk => {
     const s = chunk.toString();
     stdout += s;
-    if (verbose) process.stdout.write(s);
+    buffer += s;
 
-    promptCount += s.split(promptToken).length - 1;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
 
-    if (!promptSent && promptCount >= 1) {
-      promptSent = true;
-      child.stdin.write(`${prompt}\n`);
-      scheduleIdleExit();
-      return;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      try {
+        const msg = JSON.parse(trimmed);
+        scheduleIdleExit(); // reset idle timer on any structured message
+
+        if (msg.type === 'ready') {
+          if (!promptSent) {
+            promptSent = true;
+            child.stdin.write(JSON.stringify({ type: 'prompt', text: prompt }) + '\n');
+            scheduleIdleExit();
+          } else if (singleTurn) {
+            sendExit();
+          }
+        } else if (msg.type === 'done') {
+          sendExit();
+        }
+
+        if (verbose) {
+          if (msg.type === 'turn') {
+            console.log(`\x1b[34m[Agent Turn ${msg.iteration}]\x1b[0m`);
+          } else if (msg.type === 'delta') {
+            process.stdout.write(msg.content);
+          } else if (msg.type === 'tool_call') {
+            console.log(`\n\x1b[32m⏺ Calling Tool: ${msg.name}(${JSON.stringify(msg.arguments)})\x1b[0m`);
+          } else if (msg.type === 'tool_result') {
+            console.log(`\x1b[90m⎿ Tool Result: ${msg.name} -> ${msg.isError ? 'Error' : 'Success'}\x1b[0m`);
+          }
+        }
+      } catch {
+        // Fallback for non-JSON output (e.g. debugging logs or process errors)
+        if (verbose) process.stdout.write(trimmed + '\n');
+      }
     }
-
-    if (singleTurn && promptCount >= 2) {
-      sendExit();
-      return;
-    }
-
-    scheduleIdleExit();
   });
+
   child.stderr.on('data', chunk => {
     const s = chunk.toString();
     stderr += s;
@@ -439,6 +467,7 @@ async function runAgentTask({ worktree, model, prompt, timeoutSec, singleTurn, t
   };
 }
 
+
 async function runVerificationCommands(commands, cwd) {
   const results = [];
   for (const command of commands) {
@@ -474,16 +503,98 @@ async function git(args, cwd) {
   return result.stdout;
 }
 
+function parseYaml(text) {
+  const lines = text.split(/\r?\n/);
+  const result = {};
+  let currentKey = null;
+  let blockType = null; // 'literal' (|) or 'folded' (>) or 'array'
+  let blockIndent = 0;
+  let blockLines = [];
+
+  function flushBlock() {
+    if (!currentKey) return;
+    if (blockType === 'literal' || blockType === 'folded') {
+      let content = blockLines.join('\n');
+      if (blockType === 'folded') {
+        content = blockLines.join(' ').replace(/\s+/g, ' ').trim();
+      }
+      result[currentKey] = content;
+    } else if (blockType === 'array') {
+      result[currentKey] = blockLines;
+    }
+    currentKey = null;
+    blockType = null;
+    blockLines = [];
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+
+    const indent = line.length - line.trimStart().length;
+
+    if (blockType && indent > blockIndent) {
+      if (blockType === 'array') {
+        if (trimmed.startsWith('-')) {
+          blockLines.push(trimmed.slice(1).trim());
+        }
+      } else {
+        blockLines.push(line.slice(blockIndent + 2));
+      }
+      continue;
+    } else if (blockType) {
+      flushBlock();
+    }
+
+    const colonIdx = line.indexOf(':');
+    if (colonIdx === -1) continue;
+
+    const key = line.slice(0, colonIdx).trim();
+    const value = line.slice(colonIdx + 1).trim();
+
+    if (value === '|' || value === '>') {
+      currentKey = key;
+      blockType = value === '|' ? 'literal' : 'folded';
+      blockIndent = indent;
+    } else if (value === '' && i + 1 < lines.length && lines[i + 1].trim().startsWith('-')) {
+      currentKey = key;
+      blockType = 'array';
+      blockIndent = indent;
+    } else {
+      let parsedVal = value;
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        parsedVal = value.slice(1, -1);
+      } else if (value === 'true') {
+        parsedVal = true;
+      } else if (value === 'false') {
+        parsedVal = false;
+      } else if (!isNaN(value) && value !== '') {
+        parsedVal = Number(value);
+      }
+      result[key] = parsedVal;
+    }
+  }
+  flushBlock();
+  return result;
+}
+
 async function loadTasks() {
   const entries = await fs.readdir(TASKS_DIR);
   const tasks = [];
   for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
+    const ext = path.extname(entry).toLowerCase();
+    if (ext !== '.json' && ext !== '.yaml' && ext !== '.yml') continue;
     const raw = await fs.readFile(path.join(TASKS_DIR, entry), 'utf8');
-    tasks.push(JSON.parse(raw));
+    if (ext === '.json') {
+      tasks.push(JSON.parse(raw));
+    } else {
+      tasks.push(parseYaml(raw));
+    }
   }
   return tasks.sort((a, b) => a.id.localeCompare(b.id));
 }
+
 
 function pickTask(tasks, id) {
   if (!id) return null;
@@ -503,6 +614,7 @@ function parseArgs(argv) {
     all: false,
     repeat: 1,
     verbose: false,
+    noCache: false,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -521,11 +633,13 @@ function parseArgs(argv) {
     else if (arg === '--all') args.all = true;
     else if (arg === '--repeat') args.repeat = Math.max(1, Number(argv[++i]));
     else if (arg === '--verbose' || arg === '-v') args.verbose = true;
+    else if (arg === '--no-cache') args.noCache = true;
     else throw new Error(`Unknown arg: ${arg}`);
   }
 
   return args;
 }
+
 
 // Default agent model when --model is omitted: cloud-first (any provider with
 // a key in env — no local Ollama needed), falling back to whatever the local

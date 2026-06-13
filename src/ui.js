@@ -1,7 +1,10 @@
 // ANSI-based terminal rendering — no external dependencies
 import process from 'node:process';
 
+const jsonIpc = process.argv.includes('--json-ipc');
+
 const R = '\x1b[0m', B = '\x1b[1m', D = '\x1b[2m';
+
 const P = '\x1b[35m', C = '\x1b[36m', G = '\x1b[32m';
 const Y = '\x1b[33m', RE = '\x1b[31m', GR = '\x1b[90m', W = '\x1b[97m';
 
@@ -25,6 +28,7 @@ const FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
 let _spinTimer = null, _spinIdx = 0;
 
 export function startSpinner(label = 'Thinking') {
+  if (jsonIpc) return;
   if (_spinTimer) return;
   process.stdout.write('\n');
   _spinTimer = setInterval(() => {
@@ -33,6 +37,7 @@ export function startSpinner(label = 'Thinking') {
 }
 
 export function stopSpinner() {
+  if (jsonIpc) return;
   if (!_spinTimer) return;
   clearInterval(_spinTimer);
   _spinTimer = null;
@@ -44,6 +49,7 @@ export function cols() {
 }
 
 export function printBanner({ model, cwd, sessionId, effort, autoApprove }) {
+  if (jsonIpc) return;
   const sep = `${GR}${'─'.repeat(cols())}${R}`;
   console.log(`\n${B}${P}  ◆ Claudette${R}  ${GR}— multi-provider coding assistant${R}`);
   console.log(sep);
@@ -59,16 +65,19 @@ export function printBanner({ model, cwd, sessionId, effort, autoApprove }) {
 }
 
 export function printAssistantStart() {
+  if (jsonIpc) return;
   process.stdout.write(`\n${B}${P}◆${R} `);
 }
 
 export function printAssistantMessage(text) {
+  if (jsonIpc) return;
   const rendered = renderMarkdown(text);
   if (!rendered) return;
   process.stdout.write(rendered);
 }
 
 export function printAssistantEnd({ model: m, tokens } = {}) {
+  if (jsonIpc) return;
   const info = [m, tokens ? `~${tokens} tokens` : null].filter(Boolean).join(' · ');
   process.stdout.write(info ? `\n\n${GR}  ↳ ${info}${R}\n` : '\n');
 }
@@ -83,6 +92,7 @@ export function toolDisplayName(name) {
 }
 
 export function printToolCall(name, args) {
+  if (jsonIpc) return;
   const displayName = toolDisplayName(name);
   const primary =
     args.command   ? truncate(args.command, cols() - 20) :
@@ -95,6 +105,7 @@ export function printToolCall(name, args) {
 }
 
 export function printToolResult(name, output, isError = false) {
+  if (jsonIpc) return;
   const str   = String(output).trimEnd();
   const lines = str.split('\n');
   const col   = isError ? RE : GR;
@@ -148,6 +159,7 @@ function truncate(s, max) {
 }
 
 export function printPermissionPrompt(toolName, detail) {
+  if (jsonIpc) return;
   const displayName = toolDisplayName(toolName);
   const detailLines = detail.split('\n');
   const preview = detailLines.slice(0, 8);
@@ -163,12 +175,13 @@ export function printPermissionPrompt(toolName, detail) {
   console.log(`\n  ${Y}Allow this tool call?${R}`);
 }
 
-export function printError(msg)   { console.error(`\n  ${RE}✗ ${msg}${R}\n`); }
-export function printInfo(msg)    { console.log(`\n  ${C}ℹ ${msg}${R}`); }
-export function printSuccess(msg) { console.log(`\n  ${G}✓ ${msg}${R}`); }
-export function printWarning(msg) { console.log(`\n  ${Y}⚠ ${msg}${R}`); }
+export function printError(msg)   { if (jsonIpc) return; console.error(`\n  ${RE}✗ ${msg}${R}\n`); }
+export function printInfo(msg)    { if (jsonIpc) return; console.log(`\n  ${C}ℹ ${msg}${R}`); }
+export function printSuccess(msg) { if (jsonIpc) return; console.log(`\n  ${G}✓ ${msg}${R}`); }
+export function printWarning(msg) { if (jsonIpc) return; console.log(`\n  ${Y}⚠ ${msg}${R}`); }
 
 export function table(title, rows) {
+  if (jsonIpc) return;
   const width = cols() - 4;
   console.log(`\n  ${B}${title}${R}`);
   console.log(`  ${GR}${'─'.repeat(width)}${R}`);
@@ -182,6 +195,7 @@ export function table(title, rows) {
   }
   console.log();
 }
+
 
 // Per-line markdown renderer with persistent state (code-fence tracking), so
 // the same logic serves whole-message rendering and incremental streaming.
@@ -236,7 +250,9 @@ function renderMarkdown(text) {
  * formatted streaming. Call end() to flush a trailing partial line.
  */
 export function createMarkdownStream(write = chunk => process.stdout.write(chunk)) {
+  if (jsonIpc) return { write() {}, end() {} };
   const renderLine = createMarkdownLineRenderer();
+
   let buffer = '';
   let first = true;
 

@@ -1,0 +1,12 @@
+id: "write-and-run"
+title: "Write a script and verify its output"
+category: "coding"
+timeoutSec: 180
+singleTurn: true
+prompt: >
+  Create the file bench/scratch/stats.js. This project uses ESM (package.json has type:module), so use export keyword — do not use require() or module.exports. The file should export a named function stats(arr) that returns { min, max, mean } for a numeric array. At the bottom of the file, inline the self-test using console.assert directly (no import): call stats([1,2,3,4,5]) and assert min===1, max===5, mean===3. Run the file with node bench/scratch/stats.js and confirm all assertions pass with exit code 0. If the run fails, read the error, fix the issue, and re-run — do not stop until it exits cleanly.
+verify: 
+  - node bench/scratch/stats.js
+  - node --input-type=module --eval "import { stats } from './bench/scratch/stats.js'; const r = stats([10,20,30]); if (r.mean !== 20) throw new Error('mean wrong: ' + r.mean); console.log('ok');"
+judgeFocus: >
+  Did the agent write the function correctly on the first attempt or iterate to fix failures? Did it actually run the file and confirm output before claiming done?

@@ -1,0 +1,12 @@
+id: "count-lines-tool"
+title: "Add count_lines tool and write a passing test"
+category: "coding"
+timeoutSec: 240
+prompt: >
+  Call bash with EXACTLY this command (copy character-for-character, do not modify anything): node -e 'const fs=require("fs");const src=fs.readFileSync("src/tools.js","utf8");const anchor="    default: throw new Error";const idx=src.indexOf(anchor);if(idx===-1){console.error("anchor not found");process.exit(1);}const c="    case \u0027count_lines\u0027: {\n      if(!args.path)return \u0027Error: count_lines requires path\u0027;\n      const abs=guardPath(args.path,cwd,workspace);\n      const text=await fsp.readFile(abs,\u0027utf8\u0027);\n      return String(text.split(\u0027\\n\u0027).length);\n    }\n";fs.writeFileSync("src/tools.js",src.slice(0,idx)+c+src.slice(idx));require("fs").mkdirSync("bench/scratch",{recursive:true});require("fs").writeFileSync("bench/scratch/count-lines-test.js","import { executeTool } from \u0027../../src/tools.js\u0027;\n(async () => {\n  const r = await executeTool(\u0027count_lines\u0027, { path: \u0027src/tools.js\u0027 }, { cwd: \u0027.\u0027, workspace: \u0027.\u0027 });\n  if (!/^\\\\d+$/.test(r)) throw new Error(\u0027digits expected: \u0027 + r);\n  if (Number(r) <= 100) throw new Error(\u0027expected > 100: \u0027 + r);\n  console.log(\u0027passed:\u0027, r);\n})();\n");console.log("patched")' && node bench/scratch/count-lines-test.js
+verify: 
+  - node --check src/tools.js
+  - grep -q 'count_lines' src/tools.js
+  - node bench/scratch/count-lines-test.js
+judgeFocus: >
+  Did the agent add a count_lines TOOL_DEF entry, implement it in executeTool, create a working test file, and run it to exit 0? Penalise for missing the TOOL_DEF, missing the case in executeTool, a test that doesn't actually assert the value, or a test that fails at runtime.

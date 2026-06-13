@@ -21,6 +21,8 @@ import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
 
+const jsonIpc = process.argv.includes('--json-ipc');
+
 // ─── Mutable app state ────────────────────────────────────────────────────────
 
 // Reasoning-effort levels accepted by --effort / /effort, in increasing depth.
@@ -129,19 +131,36 @@ export async function start() {
     }
   });
 
-  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: true });
+  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: !jsonIpc });
 
   // Main REPL loop
   while (true) {
     let line;
     try {
-      line = await rl.question('\x1b[35m\x1b[1m>\x1b[0m ');
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'ready' }));
+      }
+      line = await rl.question(jsonIpc ? '' : '\x1b[35m\x1b[1m>\x1b[0m ');
     } catch {
       break; // Ctrl+D / EOF
     }
 
     line = line.trim();
     if (!line) continue;
+
+    if (jsonIpc) {
+      try {
+        const parsed = JSON.parse(line);
+        if (parsed.type === 'prompt') {
+          line = parsed.text;
+        } else if (parsed.type === 'exit') {
+          break;
+        }
+      } catch {
+        // Fallback for non-JSON lines
+      }
+    }
+
 
     if (line.startsWith('/')) {
       const cont = await handleCommand(line, rl);
@@ -243,6 +262,9 @@ async function agentLoop(messages, rl) {
 
   while (iteration < MAX_ITERATIONS) {
     iteration++;
+    if (jsonIpc) {
+      console.log(JSON.stringify({ type: 'turn', iteration }));
+    }
     const label = iteration === 1 ? 'Thinking' : 'Working';
     ui.startSpinner(label);
 
@@ -270,6 +292,9 @@ async function agentLoop(messages, rl) {
     let streamStarted = false;
     let mdStream = null;
     const onDelta = (delta) => {
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'delta', content: delta }));
+      }
       if (!streamStarted) {
         streamStarted = true;
         ui.stopSpinner();
@@ -278,6 +303,7 @@ async function agentLoop(messages, rl) {
       }
       mdStream.write(delta);
     };
+
 
     let result;
     try {
@@ -336,6 +362,10 @@ async function agentLoop(messages, rl) {
       });
       session.messages.push({ role: 'assistant', content: result.content });
       await flushSessionSave(session);
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'assistant', content: result.content }));
+        console.log(JSON.stringify({ type: 'done', tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) }));
+      }
       return;
     }
 
@@ -354,6 +384,9 @@ async function agentLoop(messages, rl) {
     const assistantMsg = { role: 'assistant', content: result.content ?? '', tool_calls: result.toolCalls };
     messages.push(assistantMsg);
     session.messages.push(assistantMsg);
+    if (jsonIpc) {
+      console.log(JSON.stringify({ type: 'assistant', content: result.content ?? '', toolCalls: result.toolCalls }));
+    }
 
     for (const call of result.toolCalls) {
       const { name, arguments: rawArgs } = call.function;
@@ -362,6 +395,10 @@ async function agentLoop(messages, rl) {
         args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
       } catch {
         args = { raw: rawArgs };
+      }
+
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'tool_call', name, arguments: args }));
       }
 
       // The permission prompt renders the call itself — printing the normal
@@ -389,9 +426,14 @@ async function agentLoop(messages, rl) {
         isError = true;
       }
 
+      if (jsonIpc) {
+        console.log(JSON.stringify({ type: 'tool_result', name, result: toolResult, isError }));
+      }
+
       ui.printToolResult(name, toolResult, isError);
 
       const resultMsg = { role: 'tool', content: toolResult, ...(call.id ? { tool_call_id: call.id } : {}) };
+
       messages.push(resultMsg);
       session.messages.push(resultMsg);
     }

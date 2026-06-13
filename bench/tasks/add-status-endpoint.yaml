@@ -1,0 +1,11 @@
+id: "add-status-endpoint"
+title: "Add GET /api/status endpoint to server.js"
+category: "coding"
+timeoutSec: 180
+prompt: >
+  Read server.js to understand how existing GET endpoints work (look at the /api/sessions handler as a model). Then add a new GET /api/status endpoint that returns JSON: {"status":"ok","model":<current default model name>,"timestamp":<ISO string>}. Add it near the other /api/ handlers. After editing, run: node --check server.js && grep -n 'api/status' server.js
+verify: 
+  - node --check server.js
+  - grep -q 'api/status' server.js
+judgeFocus: >
+  Did the agent read server.js first, add a well-formed /api/status handler that returns JSON with status/model/timestamp fields, and verify the edit? Penalise for rewriting unrelated code, adding the endpoint in the wrong place, or returning malformed JSON.
