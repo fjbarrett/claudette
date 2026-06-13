@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Fixed
+- Usage-dataset quality: a user-cancelled turn (Ctrl+C) now records
+  `status: "cancelled"` instead of `"failed"`, and the GPT-5 family
+  (`gpt-5`/`-mini`/`-nano`) is priced, so the cost meter and usage log no longer
+  report `$0.00` for the models you actually run.
 - Pasting a multi-line block while the agent works no longer fragments into one
   queued follow-up per line. Bracketed paste mode is enabled during a turn and a
   pasted block is coalesced into a single follow-up (`createInputAssembler`).

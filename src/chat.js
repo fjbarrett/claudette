@@ -438,7 +438,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       if (!jsonIpc) ui.stopSpinner();
       if (err.name === 'AbortError') {
         trace?.event('assistant_aborted', { iteration });
-        trace?.fail();
+        trace?.cancel(); // record as 'cancelled', not 'failed' — keeps the dataset clean
         await flushSessionSave(session);
         return; // user cancelled
       }
