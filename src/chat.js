@@ -424,7 +424,7 @@ async function runTurn(messages, rl, trace) {
     return;
   }
   sessionInput.setMode('working');
-  rl.pause();
+  try { rl.pause(); } catch { /* readline already closed (EOF) */ }
   process.stdin.resume();
   stdout.write('\x1b[?2004h'); // enable bracketed paste so a paste arrives as one unit
   ui.setLiveInputActive(true); // show what the user types while the turn runs
@@ -560,8 +560,10 @@ async function agentLoop(messages, rl, trace = null, input = null) {
     // permission prompts keep working).
     let ctrlCHandler = null;
     if (!input) {
-      // Pause readline so direct stdout.write() during streaming doesn't confuse it
-      rl.pause();
+      // Pause readline so direct stdout.write() during streaming doesn't confuse it.
+      // Guarded: pause() throws "readline was closed" if stdin already hit EOF
+      // (piped one-shot use, e.g. the Harbor adapter) — the turn must still run.
+      try { rl.pause(); } catch { /* readline already closed (EOF) */ }
       ctrlCHandler = (chunk) => {
         if (chunk[0] === 0x03 && currentAC) {
           currentAC.abort();
@@ -716,7 +718,17 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       await flushSessionSave(session);
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'assistant', content: result.content }));
-        console.log(JSON.stringify({ type: 'done', tokens: (result.promptTokens ?? 0) + (result.completionTokens ?? 0) }));
+        // Report the turn's accumulated usage (across tool iterations), matching
+        // the interactive cost meter; the last response alone under-counts.
+        const doneUsage = trace
+          ? trace.turn.metrics
+          : { promptTokens: result.promptTokens ?? 0, completionTokens: result.completionTokens ?? 0 };
+        console.log(JSON.stringify({
+          type: 'done',
+          tokens: (doneUsage.promptTokens ?? 0) + (doneUsage.completionTokens ?? 0),
+          promptTokens: doneUsage.promptTokens ?? 0,
+          completionTokens: doneUsage.completionTokens ?? 0,
+        }));
       }
       return;
     }
