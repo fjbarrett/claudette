@@ -100,3 +100,9 @@ with trim on.
 - Bench with only OPENROUTER_API_KEY: pass `--model`/`--judge` explicitly
   (OpenRouter catalog entry has no DEFAULT_MODELS, judge default falls back to a
   local Ollama model that isn't running).
+- Harbor adapter (`bench/harbor/`, 2026-07-05) works end-to-end: first
+  Terminal-Bench 2.0 run scored reward 1.0 on `openssl-selfsigned-cert`
+  (gpt-5-nano). Next: run a wider task slice with a stronger model; consider
+  tuning the verify-gate for non-npm task dirs (it burned ~10 iterations
+  hunting for a build to run); terminal-bench@2.1 not in the public registry
+  yet — re-check later.
