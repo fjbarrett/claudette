@@ -14,3 +14,5 @@ test_prompts.txt
 .claude/settings.local.json
 .DS_Store
 .venv-harbor/
+__pycache__/
+*.pyc
