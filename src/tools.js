@@ -5,15 +5,18 @@ import path from 'node:path';
 
 const execFile = promisify(_execFile);
 
-// Workspace boundary check using relative path
+// Workspace boundary check using relative path. Error messages are written to be
+// actionable: the usage logs showed the model repeating the same mistakes — paths
+// outside the workspace (31×) and missing paths (38×) — because the raw errors
+// gave it nothing to recover with.
 function guardPath(filePath, cwd, workspace) {
   if (!filePath || typeof filePath !== 'string') {
-    throw new Error(`Missing required 'path' argument (got: ${JSON.stringify(filePath)})`);
+    throw new Error(`Missing required 'path' argument (got: ${JSON.stringify(filePath)}). Pass a path relative to the workspace root, e.g. "src/index.js".`);
   }
   const abs = path.resolve(cwd, filePath);
   const rel = path.relative(workspace, abs);
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw new Error(`Path '${filePath}' is outside the workspace`);
+    throw new Error(`Path '${filePath}' is outside the workspace root. Use a path relative to the workspace (no leading '/' and no '..'); the workspace is the project you are working in.`);
   }
   return abs;
 }
@@ -173,7 +176,7 @@ export const TOOL_DEFS = [
 
 // ─── Executor dispatch ────────────────────────────────────────────────────────
 
-export async function executeTool(name, args, { cwd, workspace }) {
+export async function executeTool(name, args, { cwd, workspace, readCache } = {}) {
   switch (name) {
     case 'bash': {
       let cmd = args.command;
@@ -186,11 +189,46 @@ export async function executeTool(name, args, { cwd, workspace }) {
           cmd = interp ? `${interp} ${file}` : file;
         }
       }
-      if (!cmd) throw new Error("bash: missing required argument 'command'");
+      // Coerce + trim so a missing/blank/non-string command gives a clear error
+      // instead of bash's cryptic "-c: option requires an argument".
+      cmd = cmd == null ? '' : String(cmd);
+      if (!cmd.trim()) throw new Error("bash: missing required argument 'command' — pass the shell command as {\"command\": \"...\"}");
       return runBash(cmd, cwd);
     }
     case 'read_file': {
       if (!args.path) return 'Error: read_file requires {"path": "relative/path/to/file"}';
+      // Re-read guard. Usage logs showed the agent re-reading identical, unchanged
+      // files many times per turn (one file 23×; 69% of reads redundant), which
+      // stalls progress and bloats context. If this exact read (path+range) was
+      // already served this turn and the file's mtime is unchanged, return a short
+      // pointer instead of the contents. A different range or a changed file reads
+      // normally, so nothing is ever truly unreachable.
+      if (readCache) {
+        const key = `${args.offset ?? ''}|${args.limit ?? ''}`;
+        try {
+          const mtime = (await fsp.stat(guardPath(args.path, cwd, workspace))).mtimeMs;
+          const entry = readCache.get(args.path);
+          if (entry && entry.mtime === mtime) {
+            // Exact same range, unchanged → already in context.
+            if (entry.keys.has(key)) {
+              return `[read_file: "${args.path}" — you already read this exact range and the file hasn't changed. Its contents are above; not re-sending. Act on what you have, or read a DIFFERENT file.]`;
+            }
+            // Same file, different range, but read many times unchanged → the logs
+            // showed nano re-reading one file 17× across ranges and never editing.
+            if (entry.count >= 3) {
+              return `[read_file: you've already read "${args.path}" ${entry.count} times this turn and it hasn't changed. You have enough of this file — stop re-reading it and make your edit, or read a different file.]`;
+            }
+            const result = await readFile(args.path, cwd, workspace, { offset: args.offset, limit: args.limit });
+            entry.keys.add(key); entry.count++;
+            return result;
+          }
+          const result = await readFile(args.path, cwd, workspace, { offset: args.offset, limit: args.limit });
+          readCache.set(args.path, { mtime, keys: new Set([key]), count: 1 });
+          return result;
+        } catch {
+          // stat/guard failed (e.g. missing file) — fall through for the normal error path.
+        }
+      }
       return readFile(args.path, cwd, workspace, { offset: args.offset, limit: args.limit });
     }
     case 'write_file': {
@@ -208,15 +246,20 @@ export async function executeTool(name, args, { cwd, workspace }) {
       return runGlob(args.pattern, cwd);
     }
     case 'list_dir': {
-      return listDir(args.path ?? '.', Number(args.depth ?? 1), cwd, workspace);
+      // Treat an empty/blank path as the workspace root (models sometimes send "").
+      const dir = (typeof args.path === 'string' && args.path.trim()) ? args.path : '.';
+      return listDir(dir, Number(args.depth ?? 1), cwd, workspace);
     }
     case 'search_code': {
       if (!args.pattern) return 'Error: search_code requires {"pattern": "search regex", "path": "optional/dir"}';
-      return runSearchCode(args.pattern, args.path ?? '.', args.include, cwd, workspace);
+      // Empty/blank path → search the whole workspace (models often send "").
+      const sp = (typeof args.path === 'string' && args.path.trim()) ? args.path : '.';
+      return runSearchCode(args.pattern, sp, args.include, cwd, workspace);
     }
     case 'grep': {
       if (!args.pattern) return 'Error: grep requires {"pattern": "search regex", "path": "optional/dir"}';
-      return runGrep(args.pattern, args.path ?? '.', args.include, cwd);
+      const gp = (typeof args.path === 'string' && args.path.trim()) ? args.path : '.';
+      return runGrep(args.pattern, gp, args.include, cwd);
     }
     case 'fetch_url': {
       if (!args.url) return 'Error: fetch_url requires {"url": "https://..."}';
@@ -232,17 +275,33 @@ export async function executeTool(name, args, { cwd, workspace }) {
 
 // ─── Implementations ──────────────────────────────────────────────────────────
 
+// Default bash timeout. The old hard 30s killed real builds/tests (the logs show
+// "next build" and "get the web ui running" turns timing out); 120s lets them
+// finish. Override with CLAUDETTE_BASH_TIMEOUT (ms).
+export function resolveBashTimeout(env = process.env) {
+  const n = Number(env.CLAUDETTE_BASH_TIMEOUT);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 120_000;
+}
+
 async function runBash(command, cwd) {
+  const timeout = resolveBashTimeout();
   try {
     const { stdout, stderr } = await execFile('bash', ['-c', command], {
       cwd,
-      timeout: 30_000,
+      timeout,
       maxBuffer: 2 * 1024 * 1024,
     });
     const out = [stdout, stderr].filter(Boolean).join('\n').trim();
     return capBashOutput(out) || '(exit 0, no output)';
   } catch (err) {
-    if (err.killed) throw new Error('Command timed out after 30s');
+    if (err.killed) {
+      throw new Error(
+        `Command timed out after ${Math.round(timeout / 1000)}s. ` +
+        `If it just needs longer (a big build/test), raise CLAUDETTE_BASH_TIMEOUT. ` +
+        `If it's a long-running server like "next dev" / "npm start", don't run it here — ` +
+        `it never exits, so it can't run in the foreground; start it separately or just build/typecheck.`
+      );
+    }
     const out = [err.stdout, err.stderr].filter(Boolean).join('\n').trim();
     throw new Error(out || err.message);
   }
@@ -250,7 +309,18 @@ async function runBash(command, cwd) {
 
 async function readFile(filePath, cwd, workspace, { offset, limit } = {}) {
   const abs = guardPath(filePath, cwd, workspace);
-  const stat = await fsp.stat(abs);
+  let stat;
+  try {
+    stat = await fsp.stat(abs);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      // The model frequently guesses non-existent paths (59× in the logs). Point
+      // it at discovery tools instead of returning a bare ENOENT it can't act on.
+      const dir = path.dirname(filePath) || '.';
+      throw new Error(`File not found: '${filePath}'. Don't guess paths — run list_dir on "${dir}" to see what exists, or search_code to find the file by name/content.`);
+    }
+    throw err;
+  }
   if (stat.isDirectory()) {
     const entries = await fsp.readdir(abs, { withFileTypes: true });
     const lines = entries
@@ -445,15 +515,17 @@ async function patchFile(filePath, args, cwd, workspace) {
   let applied = 0;
   for (const patch of patches) {
     const { old_str: oldStr, new_str: newStr = '' } = patch;
+    // Same recovery-oriented errors as str_replace — failed patches were a common
+    // dead end in the logs (the model retried blindly instead of fixing the patch).
     if (oldStr === newStr) {
-      throw new Error(`Patch ${applied + 1}: no changes — old_str and new_str are identical in ${filePath}`);
+      throw new Error(`Patch ${applied + 1}: no changes — old_str and new_str are identical in ${filePath}. Put the UPDATED text in new_str (it must differ from old_str).`);
     }
     if (!content.includes(oldStr)) {
-      throw new Error(`Patch ${applied + 1}: old_str not found in ${filePath}`);
+      throw new Error(`Patch ${applied + 1}: old_str not found in ${filePath}.${similarLinesHint(content, oldStr)}`);
     }
     const occurrences = content.split(oldStr).length - 1;
     if (occurrences > 1) {
-      throw new Error(`Patch ${applied + 1}: old_str appears ${occurrences} times in ${filePath}`);
+      throw new Error(`Patch ${applied + 1}: old_str appears ${occurrences} times in ${filePath} — include surrounding lines to make it unique.`);
     }
     content = content.replace(oldStr, newStr);
     applied += 1;

@@ -25,6 +25,7 @@ export function usageDir() {
 // null for unpriced models — keep tokens as the ground truth for training.
 export function buildUsageRecord(turn, session) {
   const m = turn.metrics ?? {};
+  const events = turn.events ?? [];
   return {
     ts: turn.completedAt ?? new Date().toISOString(),
     sessionId: session?.id ?? null,
@@ -36,7 +37,13 @@ export function buildUsageRecord(turn, session) {
     totalTokens: m.totalTokens ?? 0,
     estCostUsd: estimateCost(turn.model, m),
     durationMs: m.durationMs ?? null,
-    toolCalls: (turn.events ?? []).filter(e => e.type === 'tool_call').length,
+    toolCalls: events.filter(e => e.type === 'tool_call').length,
+    // Context-management signal: lets the dataset show whether the runaway guard
+    // fired and whether history was auto-compacted, so per-turn input-token growth
+    // can be tracked before/after the context fixes.
+    iterations: events.filter(e => e.type === 'model_request_started').length,
+    hitToolCap: events.some(e => e.type === 'max_iterations'),
+    compacted: !!turn.compacted,
     prompt: turn.prompt ?? '',
     cwd: turn.cwd ?? null,
   };

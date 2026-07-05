@@ -54,6 +54,31 @@ export class InputController {
   }
 }
 
+// Strip terminal artifacts that leak into captured input. While a turn runs we
+// read stdin in raw mode and stream rendered output to the same terminal; a real
+// session logged a prompt of `cont  ⎿ Wrote 1335 chars (44 lines) to …` — the
+// user typed "cont" and an echoed tool-result line got captured with it. We:
+//   1. drop ANSI CSI/OSC escape sequences, and
+//   2. cut at the first ⏺ (tool-call) or ⎿ (tool-result) render glyph — anything
+//      from there on is echoed output, not something the user typed,
+// then strip remaining control chars (keeping tab/newline so pastes survive) and
+// trim. Pure so it's unit-tested in isolation.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const RENDER_GLYPHS_RE = /[⏺⎿]/u; // ⏺ ⎿
+export function sanitizeUserInput(text) {
+  let s = String(text ?? '').replace(ANSI_RE, '');
+  // Glyph-cut only single-line input: the leak we're fixing appends an echoed
+  // tool-result line to a typed line ("cont  ⎿ Wrote …"). A deliberate multi-line
+  // paste (a stack trace, a build log) is content the user wants kept whole, so
+  // don't truncate it even if a line happens to contain a box glyph.
+  if (!s.includes('\n')) {
+    const glyph = s.search(RENDER_GLYPHS_RE);
+    if (glyph !== -1) s = s.slice(0, glyph);
+  }
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '').replace(/[ \t]+$/gm, '').trim();
+}
+
 // Terminal-input state machine: assembles typed lines and bracketed pastes into
 // whole submissions. Text between the bracketed-paste markers (\x1b[200~ …
 // \x1b[201~) is kept as ONE submission even across many lines — fixing the bug
@@ -68,7 +93,7 @@ export function createInputAssembler({ onLine, onCancel, onChange } = {}) {
   const changed = () => onChange?.(buf); // current buffer, for live echo
 
   const submit = () => {
-    const content = buf.replace(/\r/g, '').replace(/\n+$/, '').trim();
+    const content = sanitizeUserInput(buf);
     buf = '';
     changed();
     if (content && onLine) onLine(content);
@@ -96,6 +121,35 @@ export function createInputAssembler({ onLine, onCancel, onChange } = {}) {
       if (start === -1) { s = ''; }
       else { pasting = true; s = s.slice(start + PASTE_START.length); }
     }
+  };
+}
+
+// Groups a rapid burst of input lines into one submission. At the idle prompt,
+// readline emits one 'line' event per newline, so pasting a multi-line block (a
+// stack trace, a build log) fragments into N separate prompts/commands. Lines
+// that arrive within `flushMs` of each other are joined into a single prompt;
+// a genuine pause flushes what's accumulated. `setTimer`/`clearTimer` are
+// injectable so the grouping is unit-testable without real timers.
+export function createBurstReader({ flushMs = 40, onPrompt, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  let lines = [];
+  let timer = null;
+  const emit = () => {
+    timer = null;
+    if (!lines.length) return;
+    const text = lines.join('\n');
+    lines = [];
+    onPrompt?.(text);
+  };
+  return {
+    push(line) {
+      lines.push(String(line ?? ''));
+      if (timer) clearTimer(timer);
+      timer = setTimer(emit, flushMs);
+    },
+    // Force out whatever is buffered (e.g. on stream close) so a trailing line
+    // that never saw a following pause isn't lost.
+    flush() { if (timer) clearTimer(timer); emit(); },
+    get pending() { return lines.length; },
   };
 }
 

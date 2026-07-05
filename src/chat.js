@@ -16,10 +16,10 @@ import path from 'node:path';
 import { getModels, chatStream, missingCredential } from './provider.js';
 import { TOOL_DEFS, executeTool } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
-import { loadClaudeMd, expandFiles } from './context.js';
+import { loadClaudeMd, expandFiles, trimToolOutputs } from './context.js';
 import { createTurnTrace, truncateLine } from './trace.js';
-import { estimateCost, formatUsd } from './cost.js';
-import { InputController, buildFollowUpMessage, createInputAssembler } from './input.js';
+import { estimateCost, formatUsd, formatTokens } from './cost.js';
+import { InputController, buildFollowUpMessage, createInputAssembler, sanitizeUserInput, createBurstReader } from './input.js';
 import { recordTurnUsage } from './usage.js';
 import { loadHistory, appendHistory } from './history.js';
 import * as ui from './ui.js';
@@ -48,14 +48,97 @@ export function resolveAutoApprove(argv = process.argv, env = process.env) {
 }
 
 // Tool iterations allowed per turn before the runaway guard pauses the loop.
-// Default 50 (was a hard 20, which cut off large multi-file builds); raise with
-// --max-iterations N or CLAUDETTE_MAX_ITERATIONS.
+// Default 150 (was a hard 20, then 50, both of which cut off large multi-file
+// builds); raise/lower with --max-iterations N or CLAUDETTE_MAX_ITERATIONS.
 export function resolveMaxIterations(argv = process.argv, env = process.env) {
   const flagIdx = argv.indexOf('--max-iterations');
   const raw = flagIdx !== -1 ? argv[flagIdx + 1] : env.CLAUDETTE_MAX_ITERATIONS;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 50;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 150;
 }
+
+// Turn a raw provider stream error into an actionable message. The usage logs
+// showed turns failing instantly (tools=0, in=0) on typo'd model slugs
+// (e.g. openrouter/openai/gpt-54-mini) with only a generic "Stream error", which
+// led to the same typo being retried — so detect model-not-found errors and
+// point at the fix (the slug / /models) instead.
+export function explainStreamError(err, model) {
+  const msg = err?.message ? String(err.message) : String(err);
+  const low = msg.toLowerCase();
+  const badModel =
+    /not a valid model|no endpoints found|model_not_found|unknown model|no such model|does not exist/.test(low) ||
+    (low.includes('model') && (low.includes('not found') || low.includes('invalid') || low.includes('404')));
+  if (badModel) {
+    return `Model "${model}" was rejected by the provider — check the slug ` +
+      `(run /models, or set a valid one with /model <provider/model>).\n  ${msg}`;
+  }
+  return `Stream error: ${msg}`;
+}
+
+// Action-forcing nudge. The logs showed gpt-5-nano re-reading the same files
+// dozens of times without ever editing (one turn: 40+ reads, 0 edits) — the
+// re-read guard makes that cheap but doesn't stop it, and the system-prompt hint
+// is ignored. After N consecutive read-only tool calls with no edit/command, we
+// append a firm steering line to the last tool result telling the model to act;
+// it re-arms after another N. Any action tool (edit/bash) resets the streak.
+const ACTION_TOOLS = new Set(['write_file', 'str_replace', 'patch_file', 'bash']);
+export function resolveActNudge(env = process.env) {
+  const n = Number(env.CLAUDETTE_ACT_NUDGE);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15; // 0 disables
+}
+export function createActNudger(threshold) {
+  let streak = 0;   // tool calls since the last SUCCESSFUL action (edit/command)
+  let firedAt = 0;  // streak value at the last nudge (for re-arming)
+  return {
+    // A successful action resets the streak (real progress). A read, or an action
+    // that ERRORED (e.g. a no-op patch), counts toward the streak — a failed edit
+    // is not progress, so it should still push toward the nudge.
+    record(toolName, isError = false) {
+      if (ACTION_TOOLS.has(toolName) && !isError) { streak = 0; firedAt = 0; }
+      else streak++;
+    },
+    // Returns a nudge string when the streak has crossed another `threshold`
+    // since the last nudge, else null. Call once per tool batch.
+    takeNudge() {
+      if (threshold > 0 && streak - firedAt >= threshold) {
+        firedAt = streak;
+        return `[automated nudge] You've made ${streak} tool calls without a successful edit or command. ` +
+          `You very likely have enough context now — make a concrete change (write_file / str_replace / patch_file) or run a command to make progress. ` +
+          `If something is blocking you, state exactly what. Stop re-reading files you've already seen.`;
+      }
+      return null;
+    },
+    get streak() { return streak; },
+  };
+}
+
+// Verification gate. A turn that edited files shouldn't finish without proving the
+// result works — the logs showed a Sonnet turn that "completed cleanly" (and cost
+// $2.55) but left the site broken because it never ran a build. When the model
+// tries to finish after editing without a passing check, the loop pushes it to run
+// one (build / typecheck / tests), capped to avoid loops. CLAUDETTE_VERIFY_GATE=0
+// disables it.
+export function resolveVerifyGate(env = process.env) {
+  return env.CLAUDETTE_VERIFY_GATE !== '0';
+}
+// A command segment counts as verification only when it STARTS with a known
+// build/test/typecheck/lint invocation — conservative on purpose: a false negative
+// just re-prompts (cheap), a false positive would let a broken result ship.
+// Long-running servers (npm run dev / start) are deliberately excluded — they
+// don't verify correctness.
+const VERIFY_RE = /^(sudo\s+)?(time\s+)?(npx\s+|pnpm\s+|yarn\s+|bun\s+)?(npm\s+(run\s+)?(build|test|lint|typecheck|type-check|check)\b|(pnpm|yarn|bun)\s+(run\s+)?(build|test|lint|typecheck|check)\b|next\s+(build|lint)\b|vite\s+build\b|tsc\b|eslint\b|ruff\b|flake8\b|mypy\b|pyright\b|pytest\b|jest\b|vitest\b|phpunit\b|rspec\b|node\s+--(check|test)\b|go\s+(build|test|vet)\b|cargo\s+(build|test|check|clippy)\b|make\b|mvn\b|gradle\b|python3?\s+-m\s+(pytest|unittest|mypy|py_compile)\b)/i;
+export function looksLikeVerification(command) {
+  return String(command || '').split(/&&|\|\||;|\n/).some(seg => VERIFY_RE.test(seg.trim()));
+}
+export function buildVerifyNudge(verifyRan) {
+  if (verifyRan) {
+    return '[automated check] Your last build/test/typecheck did not pass. Fix the errors and re-run it — do not finish with a failing check.';
+  }
+  return "[automated check] You edited files but haven't verified the result works. Before finishing, run the project's build, typecheck, or tests " +
+    '(e.g. `npm run build`, `npx tsc --noEmit`, or the test command) and fix any errors. Do not report the task complete until a check passes. ' +
+    'If it can only be exercised by a long-running server (e.g. `npm run dev`) that cannot finish here, say so explicitly and explain how you otherwise confirmed the change works.';
+}
+const VERIFY_MAX = 2; // gate fires at most twice per turn (initial + one fix cycle)
 
 let model      = null;
 let session    = null;
@@ -68,6 +151,31 @@ let sessionInput = new InputController(); // follow-up queue for mid-run steerin
 
 // Permission memory: set of tool names or "bash:<cmd>" the user said "always" to
 const alwaysAllow = new Set();
+
+// Read one prompt from the idle REPL, coalescing a pasted multi-line block into a
+// single submission. readline emits one 'line' per newline, so without this a
+// paste (a stack trace, a build log) fragments into N prompts — the first lines
+// even getting misread as slash/`!` commands. Lines arriving within a short burst
+// are joined; a real pause flushes. Rejects on stream close (Ctrl+D / EOF).
+function readCoalescedPrompt(rl, promptStr, { flushMs = 40 } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, val) => { if (settled) return; settled = true; teardown(); fn(val); };
+    function teardown() {
+      rl.removeListener('line', onLine);
+      rl.removeListener('close', onClose);
+    }
+    const reader = createBurstReader({ flushMs, onPrompt: (text) => finish(resolve, text) });
+    const onLine = (l) => reader.push(l);
+    // EOF (Ctrl+D / piped `echo … | claudette` / heredoc): flush any buffered line
+    // first so a prompt submitted right before close isn't dropped, THEN reject.
+    const onClose = () => { reader.flush(); finish(reject, new Error('EOF')); };
+    rl.on('line', onLine);
+    rl.once('close', onClose);
+    rl.setPrompt(promptStr);
+    rl.prompt();
+  });
+}
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 export async function start() {
@@ -151,24 +259,33 @@ export async function start() {
   // them like a normal shell (newest-first, per the readline contract).
   const history = jsonIpc ? [] : await loadHistory(workspace);
   const rl = readline.createInterface({ input: stdin, output: stdout, terminal: !jsonIpc, history, historySize: 1000 });
+  let rlClosed = false;
+  rl.on('close', () => { rlClosed = true; });
 
   // Main REPL loop
   while (true) {
+    if (rlClosed) break; // stdin reached EOF (Ctrl+D / piped input drained)
     let line;
     try {
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'ready' }));
+        line = await rl.question(''); // structured line protocol — no coalescing
+      } else {
+        // Coalesce a pasted multi-line block into one prompt (idle prompt only).
+        line = await readCoalescedPrompt(rl, '\x1b[35m\x1b[1m>\x1b[0m ');
       }
-      line = await rl.question(jsonIpc ? '' : '\x1b[35m\x1b[1m>\x1b[0m ');
     } catch {
       break; // Ctrl+D / EOF
     }
 
-    line = line.trim();
+    // Strip echoed tool-render glyphs / ANSI that can leak from raw-mode capture
+    // during the previous turn (jsonIpc carries structured JSON, so leave it).
+    line = jsonIpc ? line.trim() : sanitizeUserInput(line);
     if (!line) continue;
 
     // Persist the entered line to this directory's history for next session.
-    if (!jsonIpc) appendHistory(workspace, line);
+    // (Skip under the test runner so spawned CLI tests don't write history files.)
+    if (!jsonIpc && process.env.NODE_ENV !== 'test') appendHistory(workspace, line);
 
     if (jsonIpc) {
       try {
@@ -207,8 +324,49 @@ export async function start() {
   if (!jsonIpc) console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
 }
 
+// ─── Context management ───────────────────────────────────────────────────────
+
+// Rough token estimate (~4 chars/token) of the stored conversation.
+function estimateHistoryTokens(messages) {
+  return messages.reduce((acc, m) => {
+    const len = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
+    return acc + Math.ceil(len / 4);
+  }, 0);
+}
+
+function compactThreshold() {
+  return Number(process.env.CLAUDETTE_COMPACT_TOKENS) || 60_000;
+}
+
+// Summarize prior history into a single recap when it grows past the threshold,
+// so a long session stops re-sending everything each turn. On by default; set
+// CLAUDETTE_AUTO_COMPACT=0 to disable. The turn trace (session.turns) keeps the
+// full event record either way.
+async function maybeAutoCompact() {
+  if (process.env.CLAUDETTE_AUTO_COMPACT === '0') return false;
+  if (!session || session.messages.length < 6) return false;
+  const tokens = estimateHistoryTokens(session.messages);
+  if (tokens < compactThreshold()) return false;
+  ui.printInfo(`Auto-compacting context (~${Math.round(tokens / 1000)}k tokens)…`);
+  try {
+    const summary = await summariseMessages(session.messages);
+    session.messages = [{ role: 'user', content: `[Conversation summary]: ${summary}` }];
+    await flushSessionSave(session);
+    ui.printSuccess('Compacted older history into a summary.');
+    return true;
+  } catch (err) {
+    ui.printWarning(`Auto-compact skipped: ${err.message}`);
+    return false;
+  }
+}
+
 // ─── User message handler ─────────────────────────────────────────────────────
 async function handleMessage(text, rl) {
+  // Compress prior history before this turn if it has grown large, so a long
+  // session doesn't keep re-sending everything. (Within a turn, trimToolOutputs
+  // handles tool-output growth.)
+  const compacted = await maybeAutoCompact();
+
   // Expand @file references
   const { text: expandedText, files } = await expandFiles(text, workspace, workspace);
   if (files.length) ui.printInfo(`Including: ${files.join(', ')}`);
@@ -220,7 +378,7 @@ async function handleMessage(text, rl) {
   // Start a turn trace (session.turns[]) so this turn can be debugged later.
   if (!Array.isArray(session.turns)) session.turns = [];
   const trace = createTurnTrace({
-    prompt: text, model, cwd: workspace, expandedFiles: files,
+    prompt: text, model, cwd: workspace, expandedFiles: files, compacted,
     onFinish: (turn) => recordTurnUsage(turn, session), // append per-turn usage log
   });
   session.turns.push(trace.turn);
@@ -235,13 +393,10 @@ async function handleMessage(text, rl) {
     return;
   }
 
-  // Warn when context is getting large
-  const approxTokens = session.messages.reduce((acc, m) => {
-    const len = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content ?? '').length;
-    return acc + Math.ceil(len / 4);
-  }, 0);
+  // Warn when context is getting large (below the auto-compact threshold).
+  const approxTokens = estimateHistoryTokens(session.messages);
   if (approxTokens > 25_000) {
-    ui.printWarning(`Context ~${Math.round(approxTokens / 1000)}k tokens — type /compact to compress history`);
+    ui.printWarning(`Context ~${Math.round(approxTokens / 1000)}k tokens — /compact (or it auto-compacts past ${Math.round(compactThreshold() / 1000)}k)`);
   }
 
   // Load CLAUDE.md context
@@ -375,6 +530,18 @@ async function agentLoop(messages, rl, trace = null, input = null) {
   const tools = toolsOn ? TOOL_DEFS : [];
   let iteration = 0;
   const MAX_ITERATIONS = resolveMaxIterations(); // runaway guard; configurable
+  // Per-turn read cache: short-circuits identical re-reads of unchanged files.
+  // Usage logs showed the agent re-reading the same files dozens of times in one
+  // turn (one file 23×; 69% of reads redundant), stalling progress and bloating
+  // context. Cleared each turn so a later turn always sees current files.
+  const readCache = new Map();
+  // Forces action when the model only reads and never edits (see createActNudger).
+  const nudger = createActNudger(resolveActNudge());
+  if (!jsonIpc) ui.setUsageStatus(''); // reset the live token/cost readout for this turn
+  // Verification gate state (see resolveVerifyGate): did this turn edit files, and
+  // has a build/test/typecheck actually passed since?
+  const verifyGate = resolveVerifyGate();
+  let turnEdited = false, verifyRan = false, verifyOk = false, verifyNudges = 0;
 
   while (iteration < MAX_ITERATIONS) {
     iteration++;
@@ -434,7 +601,9 @@ async function agentLoop(messages, rl, trace = null, input = null) {
     try {
       result = await chatStream({
         model,
-        messages,
+        // Collapse old tool outputs in the payload (not in stored history) so a
+        // long tool loop doesn't re-send every file read on every iteration.
+        messages: trimToolOutputs(messages),
         tools,
         signal: ac.signal,
         onDelta,
@@ -454,17 +623,29 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'error', error: err.message }));
       } else {
-        ui.printError(`Stream error: ${err.message}`);
+        ui.printError(explainStreamError(err, model));
       }
       return;
     } finally {
       if (ctrlCHandler) process.stdin.removeListener('data', ctrlCHandler);
       currentAC = null;
-      if (!input) rl.resume(); // restore readline after streaming (turn wrapper owns it otherwise)
+      // restore readline after streaming (turn wrapper owns it otherwise).
+      // Guard: stdin can hit EOF mid-turn (piped input), closing rl — resuming a
+      // closed readline throws "readline was closed" and would crash the turn.
+      if (!input) { try { rl.resume(); } catch { /* readline already closed (EOF) */ } }
     }
 
     if (!jsonIpc && !streamStarted) ui.stopSpinner();
     trace?.addUsage({ promptTokens: result.promptTokens, completionTokens: result.completionTokens });
+    // Live token/cost readout on the next spinner frame (realtime, à la Claude Code).
+    if (!jsonIpc && trace) {
+      const m = trace.turn.metrics;
+      const cost = formatUsd(estimateCost(model, m));
+      ui.setUsageStatus(
+        `↑${formatTokens(m.promptTokens)} ↓${formatTokens(m.completionTokens)}` +
+        (cost ? ` · ${cost}` : '') + ` · iter ${iteration}/${MAX_ITERATIONS}`
+      );
+    }
 
     // ── Merge text-parsed tool calls with API tool calls ─────────────────────
     // Some models (qwen2.5-coder) emit some calls via API and others as JSON
@@ -512,6 +693,21 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       // Safe boundary: deliver follow-ups queued during this turn and keep the
       // same agent loop alive instead of finishing.
       if (await deliverQueuedFollowUps(input, messages, trace)) continue;
+
+      // Verification gate: don't let a turn that edited files finish without a
+      // passing build/test/typecheck. (session.messages already has the assistant
+      // turn from above; the payload `messages` needs it before we continue.)
+      if (verifyGate && turnEdited && !verifyOk && verifyNudges < VERIFY_MAX) {
+        messages.push({ role: 'assistant', content: result.content ?? '' });
+        const note = { role: 'user', content: buildVerifyNudge(verifyRan) };
+        messages.push(note);
+        session.messages.push(note);
+        verifyNudges++;
+        trace?.event('verify_nudge', { verifyRan, attempt: verifyNudges });
+        if (!jsonIpc) ui.printInfo('Edits not verified — asking the model to build/typecheck/test before finishing.');
+        await flushSessionSave(session);
+        continue;
+      }
 
       if (trace) {
         trace.complete();
@@ -580,7 +776,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       let toolResult;
       let isError = false;
       try {
-        toolResult = String(await executeTool(name, args, { cwd: workspace, workspace }));
+        toolResult = String(await executeTool(name, args, { cwd: workspace, workspace, readCache }));
       } catch (err) {
         toolResult = `Error: ${err.message}`;
         isError = true;
@@ -596,6 +792,24 @@ async function agentLoop(messages, rl, trace = null, input = null) {
 
       messages.push(resultMsg);
       session.messages.push(resultMsg);
+      nudger.record(name, isError); // a failed action doesn't count as progress
+      // Verification-gate tracking: note successful edits, and whether a build/
+      // test/typecheck ran and passed (most-recent result wins).
+      if (!isError && (name === 'write_file' || name === 'str_replace' || name === 'patch_file')) turnEdited = true;
+      if (name === 'bash' && looksLikeVerification(args.command)) { verifyRan = true; verifyOk = !isError; }
+    }
+
+    // If the model has only been reading/searching for a while with no edits,
+    // append a forcing nudge to the last tool result (no new message → keeps the
+    // tool_call/tool_result pairing valid for every provider).
+    const nudge = nudger.takeNudge();
+    if (nudge) {
+      const last = messages[messages.length - 1];
+      const sLast = session.messages[session.messages.length - 1];
+      if (last && last.role === 'tool') last.content += `\n\n${nudge}`;
+      if (sLast && sLast.role === 'tool') sLast.content += `\n\n${nudge}`;
+      trace?.event('act_nudge', { streak: nudger.streak });
+      if (!jsonIpc) ui.printInfo(`Nudging the model to act (${nudger.streak} reads without an edit).`);
     }
 
     await flushSessionSave(session);
@@ -1159,14 +1373,15 @@ function extractExactBashCommand(text) {
 
 function buildSystemPrompt(claudeMd, effort) {
   const lines = [
-    'You are Ollama Code, an AI coding assistant running in the terminal.',
+    'You are Claudette, an AI coding assistant running in the terminal.',
     'You have access to tools: bash, read_file, write_file, str_replace, patch_file, list_dir, glob, grep, search_code, fetch_url.',
     'Guidelines:',
     '- Always read files before editing them.',
     '- Prefer patch_file or str_replace for targeted edits over rewriting whole files.',
     '- Be concise. When writing code, provide complete working implementations.',
-    '- Use tools proactively to explore the codebase before making changes.',
-    '- Run tests or linters after making changes when they exist.',
+    '- Explore only as much as the task needs, then act. Do NOT re-read a file you already read this turn — its contents are still above; re-reading the same file wastes context and stalls progress (a changed file or a new line range is fine).',
+    '- Once you understand the relevant code, make the edit. Favor a concrete change you can verify over continued reading; you do not need to read the whole project before acting.',
+    '- VERIFY before claiming done: after editing, run the project\'s build, typecheck, or tests (e.g. `npm run build`, `npx tsc --noEmit`, `pytest`) and fix any errors. Never report a task complete without evidence it works — a clean edit is not proof. If a check fails, fix it and re-run until it passes.',
     '- All file paths must be relative to the workspace root — never use /tmp or absolute paths outside the workspace.',
     '- To run a file, use bash with e.g. {"command": "python3 fizzbuzz.py"} — run it in the workspace, not a copy.',
     '- Never describe or summarize a file\'s contents without reading it first with read_file. Do not guess.',

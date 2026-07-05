@@ -51,3 +51,12 @@ export function formatUsd(n) {
   if (n === 0) return '$0.00';
   return n < 0.01 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
 }
+
+// Compact token count for the live status line: 812 → "812", 48234 → "48.2k",
+// 1731705 → "1.7M".
+export function formatTokens(n) {
+  const v = Number(n) || 0;
+  if (v < 1000) return String(v);
+  if (v < 1e6) return `${(v / 1e3).toFixed(v < 10e3 ? 1 : 0)}k`;
+  return `${(v / 1e6).toFixed(1)}M`;
+}

@@ -16,7 +16,7 @@ export function truncateLine(value, max = 160) {
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
 }
 
-export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], onEvent = null, onFinish = null } = {}) {
+export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], compacted = false, onEvent = null, onFinish = null } = {}) {
   const turn = {
     id: randomUUID(),
     prompt: truncateLine(prompt, 160),
@@ -26,6 +26,7 @@ export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], onEven
     model,
     cwd,
     expandedFiles,
+    compacted, // history was auto-compacted just before this turn
     metrics: { durationMs: null, promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     events: [],
   };

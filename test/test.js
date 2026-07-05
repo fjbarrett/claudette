@@ -432,6 +432,37 @@ describe('context.js', async () => {
   });
 });
 
+// ─── Context management (tool-output trimming) ───────────────────────────────
+// Collapsing old tool outputs in the payload is the cheap, deterministic fix for
+// the context blowup (real sessions hit 1M+ input tokens in one turn from ~30
+// accumulated file reads re-sent every iteration).
+
+describe('context.js (tool-output trimming)', async () => {
+  const { trimToolOutputs } = await import('../src/context.js');
+
+  test('collapses old large tool results, keeps the most recent N, never mutates input', () => {
+    const msgs = [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }];
+    for (let i = 0; i < 10; i++) {
+      msgs.push({ role: 'assistant', content: '', tool_calls: [{ id: 'c' + i, function: { name: 'read_file', arguments: '{}' } }] });
+      msgs.push({ role: 'tool', tool_call_id: 'c' + i, content: 'X'.repeat(5000) });
+    }
+    const trimmed = trimToolOutputs(msgs, { keep: 6 });
+    const collapsed = trimmed.filter(m => m.role === 'tool' && m.content.startsWith('[earlier'));
+    const full = trimmed.filter(m => m.role === 'tool' && m.content === 'X'.repeat(5000));
+    assert.equal(collapsed.length, 4, 'older results collapsed');
+    assert.equal(full.length, 6, 'most recent 6 kept full');
+    assert.ok(collapsed.every(m => m.tool_call_id), 'collapsed messages keep tool_call_id (provider pairing stays valid)');
+    assert.equal(msgs.filter(m => m.role === 'tool' && m.content.length === 5000).length, 10, 'stored history is not mutated');
+  });
+
+  test('short histories and small results are returned unchanged', () => {
+    const few = [{ role: 'tool', content: 'ok' }, { role: 'tool', content: 'done' }];
+    assert.equal(trimToolOutputs(few), few, 'few tool results → same reference');
+    const manySmall = Array.from({ length: 10 }, () => ({ role: 'tool', content: 'tiny' }));
+    assert.equal(trimToolOutputs(manySmall), manySmall, 'all-small results → nothing worth collapsing');
+  });
+});
+
 // ─── Tools module tests ───────────────────────────────────────────────────────
 
 describe('tools.js', async () => {
@@ -449,6 +480,71 @@ describe('tools.js', async () => {
     const { executeTool } = await import('../src/tools.js');
     const out = await executeTool('bash', { command: 'echo hello-world' }, { cwd: tmpDir, workspace: tmpDir });
     assert.ok(out.includes('hello-world'), 'got stdout');
+  });
+
+  test('executeTool read_file: a missing file returns an actionable error (not bare ENOENT)', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    let msg = '';
+    try {
+      await executeTool('read_file', { path: 'does/not/exist.js' }, { cwd: tmpDir, workspace: tmpDir });
+    } catch (e) { msg = e.message; }
+    assert.match(msg, /File not found/, 'names the problem');
+    assert.match(msg, /list_dir|search_code/, 'points at discovery tools to recover');
+    assert.ok(!/ENOENT/.test(msg), 'no raw fs noise');
+  });
+
+  test('executeTool list_dir: empty/blank path defaults to the workspace root', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'marker-file.txt'), 'x');
+    for (const p of ['', '   ', undefined]) {
+      const out = await executeTool('list_dir', { path: p }, { cwd: tmpDir, workspace: tmpDir });
+      assert.ok(out.includes('marker-file.txt'), `path=${JSON.stringify(p)} lists the root, no thrown error`);
+    }
+  });
+
+  test('executeTool read_file: re-read guard short-circuits an unchanged repeat read', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const fp = path.join(tmpDir, 'guarded.txt');
+    await fsp.writeFile(fp, 'ORIGINAL CONTENT LINE\n');
+    const readCache = new Map();
+    const ctx = { cwd: tmpDir, workspace: tmpDir, readCache };
+
+    const first = await executeTool('read_file', { path: 'guarded.txt' }, ctx);
+    assert.ok(first.includes('ORIGINAL CONTENT'), 'first read returns content');
+
+    const second = await executeTool('read_file', { path: 'guarded.txt' }, ctx);
+    assert.match(second, /already read this exact range|hasn't changed/, 'identical unchanged re-read is short-circuited');
+    assert.ok(!second.includes('ORIGINAL CONTENT'), 'content is not re-sent');
+
+    // A changed file re-reads normally (mtime moves).
+    await fsp.writeFile(fp, 'EDITED CONTENT LINE\n');
+    await fsp.utimes(fp, new Date(), new Date(Date.now() + 2000)); // ensure mtime advances
+    const third = await executeTool('read_file', { path: 'guarded.txt' }, ctx);
+    assert.ok(third.includes('EDITED CONTENT'), 'changed file is re-read');
+
+    // A different line range is a different key — not deduped.
+    const ranged = await executeTool('read_file', { path: 'guarded.txt', offset: 1, limit: 1 }, ctx);
+    assert.ok(ranged.includes('EDITED CONTENT'), 'a different range reads normally');
+
+    // Without a readCache (e.g. eval harness / server), behavior is unchanged.
+    const noCache = await executeTool('read_file', { path: 'guarded.txt' }, { cwd: tmpDir, workspace: tmpDir });
+    assert.ok(noCache.includes('EDITED CONTENT'), 'no cache → always reads');
+  });
+
+  test('executeTool read_file: caps repeated reads of one unchanged file (different ranges)', async () => {
+    // The real failure: nano read web/app/lib/data.ts ~12× across varying line
+    // ranges and never edited. Per-file cap stops that even when offset/limit vary.
+    const { executeTool } = await import('../src/tools.js');
+    const fp = path.join(tmpDir, 'hot.txt');
+    await fsp.writeFile(fp, Array.from({ length: 40 }, (_, i) => `line ${i + 1}`).join('\n') + '\n');
+    const ctx = { cwd: tmpDir, workspace: tmpDir, readCache: new Map() };
+    const r1 = await executeTool('read_file', { path: 'hot.txt', offset: 1, limit: 5 }, ctx);
+    const r2 = await executeTool('read_file', { path: 'hot.txt', offset: 6, limit: 5 }, ctx);
+    const r3 = await executeTool('read_file', { path: 'hot.txt', offset: 11, limit: 5 }, ctx);
+    assert.ok(r1.includes('line 1') && r2.includes('line 6') && r3.includes('line 11'), 'first few distinct ranges are served');
+    const r4 = await executeTool('read_file', { path: 'hot.txt', offset: 16, limit: 5 }, ctx);
+    assert.match(r4, /already read .* \d+ times this turn/, '4th read of the same unchanged file is capped');
+    assert.ok(!r4.includes('line 16'), 'capped read does not return content');
   });
 
   test('executeTool bash: captures stderr', async () => {
@@ -754,6 +850,51 @@ describe('tools.js', async () => {
       () => executeTool('patch_file', { path: 'patch3.txt', old_str: 'MISSING', new_str: 'x' }, { cwd: tmpDir, workspace: tmpDir }),
       /not found/
     );
+  });
+
+  test('executeTool patch_file: a no-op (identical) patch explains how to recover', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.writeFile(path.join(tmpDir, 'patch-noop.txt'), 'hello world');
+    let msg = '';
+    try {
+      await executeTool('patch_file', { path: 'patch-noop.txt', old_str: 'hello', new_str: 'hello' }, { cwd: tmpDir, workspace: tmpDir });
+    } catch (e) { msg = e.message; }
+    assert.match(msg, /identical/);
+    assert.match(msg, /new_str/, 'tells the model to put the updated text in new_str');
+  });
+
+  test('resolveBashTimeout: default 120s, env override, invalid → default', async () => {
+    const { resolveBashTimeout } = await import('../src/tools.js');
+    assert.equal(resolveBashTimeout({}), 120_000);
+    assert.equal(resolveBashTimeout({ CLAUDETTE_BASH_TIMEOUT: '5000' }), 5000);
+    assert.equal(resolveBashTimeout({ CLAUDETTE_BASH_TIMEOUT: 'nope' }), 120_000);
+  });
+
+  test('executeTool bash: a timeout returns guidance (raise timeout / don\'t run servers)', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const prev = process.env.CLAUDETTE_BASH_TIMEOUT;
+    process.env.CLAUDETTE_BASH_TIMEOUT = '300'; // 0.3s
+    try {
+      let msg = '';
+      try {
+        await executeTool('bash', { command: 'sleep 2' }, { cwd: tmpDir, workspace: tmpDir });
+      } catch (e) { msg = e.message; }
+      assert.match(msg, /timed out after/);
+      assert.match(msg, /CLAUDETTE_BASH_TIMEOUT|never exits|next dev/, 'gives a recovery hint');
+    } finally {
+      if (prev === undefined) delete process.env.CLAUDETTE_BASH_TIMEOUT; else process.env.CLAUDETTE_BASH_TIMEOUT = prev;
+    }
+  });
+
+  test('executeTool bash: a blank command gives a clear error (not cryptic shell output)', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    for (const c of ['', '   ', undefined]) {
+      await assert.rejects(
+        () => executeTool('bash', { command: c }, { cwd: tmpDir, workspace: tmpDir }),
+        /missing required argument 'command'/,
+        `command=${JSON.stringify(c)}`
+      );
+    }
   });
 
   test('executeTool patch_file: throws when old_str matches multiple times', async () => {
@@ -1792,7 +1933,7 @@ describe('CLI (claudette.js)', async () => {
   test('CLI /help lists commands', async () => {
     const { stdout } = await runCliWithInput(['/help\n']);
     assert.ok(stdout.includes('/model') || stdout.includes('help'), '/help output');
-    assert.ok(stdout.includes('/feature') && stdout.includes('/publish'), 'shows git workflow commands');
+    assert.ok(stdout.includes('/diff') && stdout.includes('/commit'), 'shows git workflow commands');
   });
 
   test('CLI parser normalizes grep-like tool calls to search_code', async () => {
@@ -1890,6 +2031,35 @@ describe('CLI (claudette.js)', async () => {
   test('CLI unknown command prints warning', async () => {
     const { stdout } = await runCliWithInput(['/notacommand\n']);
     assert.ok(stdout.includes('Unknown') || stdout.includes('unknown'), 'shows unknown command warning');
+  });
+
+  test('CLI processes a piped command even when stdin closes immediately (EOF flush)', async () => {
+    // `echo "/help" | claudette` — the line and EOF arrive together. The burst
+    // reader must flush the buffered line on close instead of dropping it.
+    const out = await new Promise((resolve, reject) => {
+      const proc = spawn('node', ['claudette.js'], { cwd: ROOT, env: { ...process.env, NODE_ENV: 'test' }, stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stdout += d);
+      proc.on('close', () => resolve(stdout));
+      proc.on('error', reject);
+      const timer = setTimeout(() => { proc.kill('SIGTERM'); resolve(stdout); }, 20000);
+      proc.on('close', () => clearTimeout(timer));
+      proc.stdin.write('/help\n');
+      proc.stdin.end(); // EOF immediately after the line — the race that dropped input
+    });
+    assert.ok(/\/diff|\/commit|commands/i.test(out), 'the piped /help command was processed, not dropped');
+    assert.ok(!/Fatal: readline was closed/.test(out), 'no closed-readline crash on EOF');
+  });
+
+  test('CLI coalesces a pasted multi-line block into ONE prompt (not N fragments)', async () => {
+    // One stdin write with embedded newlines = the burst a terminal paste produces.
+    // All-slash lines so it needs no model: if fragmented, readline would fire three
+    // 'line' events → three "Unknown command" warnings; coalesced, it is one command.
+    const { stdout } = await runCliWithInput(['/zzzpaste1\n/zzzpaste2\n/zzzpaste3\n'], { inputDelayMs: 700 });
+    const warnings = (stdout.match(/Unknown command:/g) || []).length;
+    assert.equal(warnings, 1, `pasted block handled as one prompt (saw ${warnings} unknown-command warnings)`);
+    assert.ok(stdout.includes('/zzzpaste1'), 'the (coalesced) command is the first pasted line');
   });
 
   test('CLI /new creates fresh session', async () => {
@@ -2245,6 +2415,15 @@ describe('cost & request tuning', async () => {
     assert.equal(formatUsd(1.5), '$1.50');
   });
 
+  test('formatTokens: compact counts for the live status line', async () => {
+    const { formatTokens } = await import('../src/cost.js');
+    assert.equal(formatTokens(0), '0');
+    assert.equal(formatTokens(812), '812');
+    assert.equal(formatTokens(4823), '4.8k');
+    assert.equal(formatTokens(48234), '48k');
+    assert.equal(formatTokens(1731705), '1.7M');
+  });
+
   test('capBashOutput truncates large output (head+tail) and leaves small output intact', async () => {
     const { capBashOutput } = await import('../src/tools.js');
     const big = 'A'.repeat(40_000);
@@ -2477,6 +2656,27 @@ describe('src/usage.js (token-spend log)', async () => {
     assert.equal(rec.ts, '2026-06-12T00:00:00.000Z');
   });
 
+  test('buildUsageRecord records context-management signals (iterations/cap/compacted)', () => {
+    const turn = {
+      id: 't2', model: 'openrouter/openai/gpt-5-nano', status: 'completed', compacted: true,
+      metrics: { promptTokens: 9, completionTokens: 1, totalTokens: 10 },
+      events: [
+        { type: 'model_request_started' }, { type: 'tool_call' }, { type: 'tool_result' },
+        { type: 'model_request_started' }, { type: 'tool_call' }, { type: 'tool_result' },
+        { type: 'max_iterations' },
+      ],
+    };
+    const rec = buildUsageRecord(turn, { id: 's2' });
+    assert.equal(rec.iterations, 2, 'one per model request');
+    assert.equal(rec.hitToolCap, true, 'max_iterations event → cap hit');
+    assert.equal(rec.compacted, true, 'reflects pre-turn auto-compaction');
+    // Defaults when the signals are absent.
+    const plain = buildUsageRecord({ id: 't3', metrics: {}, events: [] }, { id: 's3' });
+    assert.equal(plain.iterations, 0);
+    assert.equal(plain.hitToolCap, false);
+    assert.equal(plain.compacted, false);
+  });
+
   test('appendUsage writes one parseable JSONL record per call', async () => {
     const dir = await makeTmpDir();
     appendUsage({ a: 1 }, { dir });
@@ -2493,7 +2693,50 @@ describe('src/usage.js (token-spend log)', async () => {
 // into one steering message at a safe boundary — never a second agent loop.
 
 describe('src/input.js (follow-up queue)', async () => {
-  const { InputController, buildFollowUpMessage, createInputAssembler } = await import('../src/input.js');
+  const { InputController, buildFollowUpMessage, createInputAssembler, sanitizeUserInput, createBurstReader } = await import('../src/input.js');
+
+  // ── Prompt sanitization (echoed tool-render glyphs leaking into input) ──
+  test('sanitizeUserInput: cuts a single typed line at a leaked tool-render glyph', () => {
+    // The real bug: typed "cont" + an echoed write_file result line got captured together.
+    assert.equal(sanitizeUserInput('cont  ⎿ Wrote 1335 chars (44 lines) to src/run_pipeline.py'), 'cont');
+    assert.equal(sanitizeUserInput('fix it ⏺ Read(foo.js)'), 'fix it');
+  });
+
+  test('sanitizeUserInput: strips ANSI escapes but keeps real text', () => {
+    assert.equal(sanitizeUserInput('\x1b[35m\x1b[1mhello\x1b[0m world'), 'hello world');
+  });
+
+  test('sanitizeUserInput: a deliberate multi-line paste keeps its newlines (not glyph-cut)', () => {
+    const paste = 'line one\n  ⎿ this looks like output but it is pasted content\nline three';
+    assert.equal(sanitizeUserInput(paste), paste.replace(/[ \t]+$/gm, ''), 'multi-line content preserved verbatim');
+  });
+
+  // ── Burst grouping (paste coalescing at the idle prompt) ──
+  test('createBurstReader: a rapid burst of lines coalesces into one prompt', () => {
+    // Drive with a synchronous fake scheduler so the grouping is deterministic.
+    let scheduled = null;
+    const setTimer = (fn) => { scheduled = fn; return 1; };
+    const clearTimer = () => { scheduled = null; };
+    const prompts = [];
+    const r = createBurstReader({ flushMs: 40, onPrompt: p => prompts.push(p), setTimer, clearTimer });
+    r.push('GET / 500'); r.push('  at handler'); r.push('  at next'); // paste: 3 lines, no pause
+    assert.equal(prompts.length, 0, 'nothing emitted until the burst settles');
+    scheduled();                                                      // the pause fires
+    assert.deepEqual(prompts, ['GET / 500\n  at handler\n  at next'], 'joined into one prompt');
+  });
+
+  test('createBurstReader: a paused second line is a separate prompt; flush drains the tail', () => {
+    let scheduled = null;
+    const setTimer = (fn) => { scheduled = fn; return 1; };
+    const clearTimer = () => { scheduled = null; };
+    const prompts = [];
+    const r = createBurstReader({ onPrompt: p => prompts.push(p), setTimer, clearTimer });
+    r.push('first'); scheduled();           // settles alone
+    r.push('second');                        // typed later
+    r.flush();                               // e.g. on EOF
+    assert.deepEqual(prompts, ['first', 'second'], 'distinct prompts, no merge across the pause');
+  });
+
 
   test('assembler: a typed line submits on Enter', () => {
     const lines = [];
@@ -2591,15 +2834,87 @@ describe('src/input.js (follow-up queue)', async () => {
 // ─── chat.js: effort + bypass settings ────────────────────────────────────────
 
 describe('chat.js (effort + bypass)', async () => {
-  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS, resolveMaxIterations } =
+  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS, resolveMaxIterations, explainStreamError, resolveActNudge, createActNudger, resolveVerifyGate, looksLikeVerification, buildVerifyNudge } =
     await import('../src/chat.js');
 
-  test('resolveMaxIterations defaults to 50 and is configurable', () => {
-    assert.equal(resolveMaxIterations([], {}), 50, 'sane default (raised from the old hard 20)');
+  test('resolveVerifyGate: on by default, CLAUDETTE_VERIFY_GATE=0 disables', () => {
+    assert.equal(resolveVerifyGate({}), true);
+    assert.equal(resolveVerifyGate({ CLAUDETTE_VERIFY_GATE: '0' }), false);
+    assert.equal(resolveVerifyGate({ CLAUDETTE_VERIFY_GATE: '1' }), true);
+  });
+
+  test('looksLikeVerification: recognizes build/test/typecheck, ignores reads and servers', () => {
+    for (const c of ['npm run build', 'npm test', 'npx tsc --noEmit', 'pytest -q', 'cd web && npm run build', 'go test ./...', 'cargo check', 'eslint . && npm run build', 'node --check src/util.js', 'python3 -m py_compile app.py']) {
+      assert.ok(looksLikeVerification(c), `should count: ${c}`);
+    }
+    for (const c of ['cat build.md', 'ls test/', 'grep -r test src', 'npm run dev', 'npm start', 'next dev', 'node app.js', 'node -v', 'echo build']) {
+      assert.ok(!looksLikeVerification(c), `should NOT count: ${c}`);
+    }
+  });
+
+  test('buildVerifyNudge: distinct messages for never-ran vs failing', () => {
+    assert.match(buildVerifyNudge(false), /haven't verified|run the project's build/);
+    assert.match(buildVerifyNudge(true), /did not pass|do not finish with a failing/);
+  });
+
+  test('resolveActNudge: default 15, env override, 0 disables', () => {
+    assert.equal(resolveActNudge({}), 15);
+    assert.equal(resolveActNudge({ CLAUDETTE_ACT_NUDGE: '8' }), 8);
+    assert.equal(resolveActNudge({ CLAUDETTE_ACT_NUDGE: '0' }), 0, '0 is honored (disables)');
+    assert.equal(resolveActNudge({ CLAUDETTE_ACT_NUDGE: 'junk' }), 15, 'bad value → default');
+  });
+
+  test('createActNudger: fires after N read-only calls, re-arms, and an action resets it', () => {
+    const n = createActNudger(3);
+    assert.equal(n.takeNudge(), null, 'nothing before any reads');
+    n.record('read_file'); n.record('list_dir');
+    assert.equal(n.takeNudge(), null, 'below threshold → no nudge');
+    n.record('search_code'); // streak now 3
+    const first = n.takeNudge();
+    assert.match(first, /without a successful edit or command/, 'fires at the threshold');
+    assert.equal(n.takeNudge(), null, 're-armed — does not fire again immediately');
+    n.record('read_file'); n.record('read_file'); n.record('read_file'); // +3 more
+    assert.ok(n.takeNudge(), 'fires again after another N read-only calls');
+    n.record('str_replace'); // a successful edit resets the streak
+    assert.equal(n.streak, 0, 'successful action clears the streak');
+    assert.equal(n.takeNudge(), null, 'no nudge right after acting');
+  });
+
+  test('createActNudger: a FAILED action does not count as progress', () => {
+    const n = createActNudger(3);
+    n.record('read_file');
+    n.record('patch_file', true); // a no-op / errored patch — not progress
+    n.record('read_file');        // streak should be 3 (read, failed-patch, read)
+    assert.equal(n.streak, 3, 'failed action increments, does not reset');
+    assert.ok(n.takeNudge(), 'still nudges — the model is not actually making progress');
+    n.record('write_file', false); // a successful write resets
+    assert.equal(n.streak, 0);
+  });
+
+  test('createActNudger: threshold 0 disables nudging entirely', () => {
+    const n = createActNudger(0);
+    for (let i = 0; i < 50; i++) n.record('read_file');
+    assert.equal(n.takeNudge(), null, 'disabled → never nudges');
+  });
+
+  test('explainStreamError flags a bad model id (logs showed typo\'d slugs failing opaquely)', () => {
+    const m = 'openrouter/openai/gpt-54-mini';
+    for (const raw of ['gpt-54-mini is not a valid model ID', 'No endpoints found for that model', 'HTTP 404: model not found']) {
+      const out = explainStreamError(new Error(raw), m);
+      assert.match(out, /rejected by the provider/, raw);
+      assert.ok(out.includes(m) && /\/models/.test(out), 'points at the slug + /models');
+    }
+    // Unrelated errors keep the plain prefix.
+    const other = explainStreamError(new Error('connection reset'), m);
+    assert.match(other, /^Stream error: connection reset/);
+  });
+
+  test('resolveMaxIterations defaults to 150 and is configurable', () => {
+    assert.equal(resolveMaxIterations([], {}), 150, 'sane default (raised from the old hard 20, then 50)');
     assert.equal(resolveMaxIterations(['node', 'claudette.js', '--max-iterations', '200'], {}), 200, 'flag wins');
     assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: '120' }), 120, 'env honored');
-    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: 'nonsense' }), 50, 'bad value → default');
-    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: '0' }), 50, 'zero rejected');
+    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: 'nonsense' }), 150, 'bad value → default');
+    assert.equal(resolveMaxIterations([], { CLAUDETTE_MAX_ITERATIONS: '0' }), 150, 'zero rejected');
   });
 
   test('isValidEffort accepts the documented levels and rejects others', () => {

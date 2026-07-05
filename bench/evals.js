@@ -43,6 +43,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chatStream, defaultCloudModels } from '../src/provider.js';
 import { TOOL_DEFS, executeTool } from '../src/tools.js';
 import { parseTextToolCalls } from '../src/chat.js';
+import { trimToolOutputs } from '../src/context.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -61,17 +62,24 @@ const SYSTEM_PROMPT = [
  * Run one iteration of a case: fresh sandbox, agent loop, expectation check.
  * `chatFn` is injectable so tests can drive the loop with a scripted model.
  */
-export async function runEvalIteration(caseDef, { model, chatFn = chatStream, keepSandbox = false } = {}) {
+export async function runEvalIteration(caseDef, { model, chatFn = chatStream, keepSandbox = false, trim = true } = {}) {
   const sandbox = await fs.mkdtemp(path.join(os.tmpdir(), `claudette-eval-${caseDef.id}-`));
   const started = Date.now();
   const record = {
     caseId: caseDef.id,
     model,
     sandbox,
+    trim,
     toolCalls: [],
     finalText: '',
     turns: 0,
     durationMs: 0,
+    // Token accounting so the context-management effect is measurable: total
+    // input tokens billed across the loop, and the single largest request (the
+    // blowup the trimming targets — re-sent tool outputs accumulate per turn).
+    promptTokens: 0,
+    completionTokens: 0,
+    peakInputTokens: 0,
     pass: false,
     failures: [],
     error: null,
@@ -94,10 +102,18 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
       record.turns = turn;
       const result = await chatFn({
         model,
-        messages,
+        // Mirror the interactive agent loop: collapse old tool outputs in the
+        // payload (not in stored `messages`) so a long tool loop stops re-sending
+        // every file read. `trim:false` measures the un-trimmed baseline.
+        messages: trim ? trimToolOutputs(messages) : messages,
         tools: TOOL_DEFS,
         onDelta: () => {},
       });
+
+      const inTok = result.promptTokens ?? 0;
+      record.promptTokens += inTok;
+      record.completionTokens += result.completionTokens ?? 0;
+      if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
 
       // Merge text-emitted tool calls the same way the interactive CLI does.
       let toolCalls = result.toolCalls ?? [];
@@ -275,15 +291,17 @@ async function main() {
     );
   }
 
+  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}`);
   const results = [];
   for (const caseDef of selected) {
     const repeat = args.repeat ?? caseDef.repeat ?? 1;
     const iterations = [];
     for (let i = 1; i <= repeat; i++) {
       process.stdout.write(`─ ${caseDef.id} (${i}/${repeat}) ... `);
-      const record = await runEvalIteration(caseDef, { model, keepSandbox: args.keep });
+      const record = await runEvalIteration(caseDef, { model, keepSandbox: args.keep, trim: args.trim });
       iterations.push(record);
-      console.log(record.pass ? 'pass' : `FAIL  [${record.failures.join(' | ')}]`);
+      const tok = `in=${record.promptTokens} peak=${record.peakInputTokens} out=${record.completionTokens}`;
+      console.log(`${record.pass ? 'pass' : `FAIL  [${record.failures.join(' | ')}]`}  (${record.toolCalls.length} tools, ${tok})`);
       if (args.verbose) {
         for (const call of record.toolCalls) {
           console.log(`    ${call.isError ? '✗' : '·'} ${call.name}(${truncate(JSON.stringify(call.args), 120)})`);
@@ -291,14 +309,19 @@ async function main() {
       }
     }
     const passes = iterations.filter(r => r.pass).length;
+    const avg = (sel) => Math.round(iterations.reduce((a, r) => a + sel(r), 0) / iterations.length);
     results.push({
       caseId: caseDef.id,
       title: caseDef.title,
       model,
+      trim: args.trim,
       repeat,
       passes,
       passAtK: passes > 0,
       passAllK: passes === repeat,
+      avgPromptTokens: avg(r => r.promptTokens),
+      avgPeakInputTokens: avg(r => r.peakInputTokens),
+      avgCompletionTokens: avg(r => r.completionTokens),
       iterations,
     });
   }
@@ -306,7 +329,11 @@ async function main() {
   console.log('\n═══ Eval summary ═══');
   for (const r of results) {
     const rate = `${r.passes}/${r.repeat}`;
-    console.log(`${r.caseId.padEnd(24)} ${rate.padEnd(6)} pass@k=${r.passAtK ? 'yes' : 'NO'}  pass^k=${r.passAllK ? 'yes' : 'no'}`);
+    console.log(
+      `${r.caseId.padEnd(24)} ${rate.padEnd(6)} pass@k=${r.passAtK ? 'yes' : 'NO'}  ` +
+      `pass^k=${r.passAllK ? 'yes' : 'no'}  avgIn=${String(r.avgPromptTokens).padStart(7)} ` +
+      `avgPeakIn=${String(r.avgPeakInputTokens).padStart(7)} avgOut=${String(r.avgCompletionTokens).padStart(6)}`
+    );
   }
 
   await fs.mkdir(REPORTS_DIR, { recursive: true });
@@ -321,7 +348,7 @@ async function main() {
 }
 
 function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false };
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false, trim: true };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -332,6 +359,8 @@ function parseArgs(argv) {
     else if (arg === '--keep') args.keep = true;
     else if (arg === '--verbose') args.verbose = true;
     else if (arg === '--no-cache') args.noCache = true;
+    else if (arg === '--trim') args.trim = true;       // context trimming on (default)
+    else if (arg === '--no-trim') args.trim = false;   // baseline: re-send everything
     else throw new Error(`Unknown flag: ${arg}`);
   }
   return args;

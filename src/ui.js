@@ -42,12 +42,19 @@ export const s = {
 const FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
 let _spinTimer = null, _spinIdx = 0;
 
+// Live usage shown on the spinner row while the agent works (realtime token/cost
+// readout, à la Claude Code). Set from the agent loop after each model request;
+// read fresh on every frame so it updates in place during the "Working…" wait.
+let _usageStatus = '';
+export function setUsageStatus(text) { _usageStatus = String(text ?? ''); }
+
 export function startSpinner(label = 'Thinking') {
   if (jsonIpc) return;
   if (_spinTimer) return;
   process.stdout.write('\n');
   _spinTimer = setInterval(() => {
-    process.stdout.write(`\r  ${P}${FRAMES[_spinIdx++ % FRAMES.length]}${R} ${D}${label}…${R}  `);
+    const suffix = _usageStatus ? `   ${GR}${_usageStatus}${R}` : '';
+    process.stdout.write(`\r\x1b[2K  ${P}${FRAMES[_spinIdx++ % FRAMES.length]}${R} ${D}${label}…${R}${suffix}`);
   }, 80);
 }
 

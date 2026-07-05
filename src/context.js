@@ -43,6 +43,34 @@ export async function loadClaudeMd(cwd) {
 }
 
 /**
+ * Collapse old tool-result content in the model payload so large outputs (file
+ * reads, command dumps) aren't re-sent verbatim on every agent iteration — the
+ * dominant driver of context-token blowup (real sessions hit 1M+ input tokens in
+ * a single turn from ~30 accumulated file reads). The most recent `keep` tool
+ * results stay full (the model is still acting on them); older large ones become
+ * a short placeholder. Returns a new array; the stored history is never mutated,
+ * so transcripts/debugging keep the full content.
+ */
+export function trimToolOutputs(messages, { keep = 6, minChars = 600 } = {}) {
+  const toolPositions = [];
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i] && messages[i].role === 'tool') toolPositions.push(i);
+  }
+  if (toolPositions.length <= keep) return messages;
+
+  const collapse = new Set(toolPositions.slice(0, toolPositions.length - keep));
+  let changed = false;
+  const out = messages.map((m, i) => {
+    if (!collapse.has(i)) return m;
+    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+    if (content.length <= minChars) return m; // small results aren't worth collapsing
+    changed = true;
+    return { ...m, content: `[earlier tool output omitted to save context — ${content.length} chars; re-read the file or re-run the command if you need it again]` };
+  });
+  return changed ? out : messages;
+}
+
+/**
  * Replace @path tokens in text with file contents.
  * Returns { text, files: string[] }
  */
