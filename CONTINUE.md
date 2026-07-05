@@ -4,10 +4,18 @@ Use this file to resume an interrupted active task. Read `AGENTS.md`,
 `CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
 handoff for work in progress.
 
-## Active branch — `feature/context-management` (uncommitted)
+## Active branch — `feature/context-management` (committed `2b9cb6b`, pushed)
 
-Log-driven hardening of context + input handling. Everything below is uncommitted
-on `feature/context-management`. Full suite: **200 pass / 14 fail**; all 14 are
+**2026-07-05 repo repair:** `.git/objects` was lost in a ~Jun 29 copy of the repo.
+Restored from origin (origin/main = the branch point, 5e8072c). The branch's 5
+original commits were unrecoverable as history but their content survived in the
+working tree and is now recommitted as `2b9cb6b` and pushed to origin. Ref/reflog
+backups from before the repair: session scratchpad `git-backup/`. Bench harness
+re-validated end-to-end post-repair (eval bash-echo pass; bench targeted-edit
+overall 9.2 on openrouter/openai/gpt-5-nano).
+
+Log-driven hardening of context + input handling, all now in `2b9cb6b`.
+Full suite at last check: **200 pass / 14 fail**; all 14 are
 pre-existing env-dependent (live-provider Stress suite + `/api/models` + message
 stream). `git diff --check` clean.
 
@@ -88,4 +96,7 @@ with trim on.
 - Prose-pollution: the 04:00 failed turn's prompt had leaked assistant text
   ("…Absolutely. If you're") with no glyph — sanitizeUserInput can't catch that;
   root-cause the in-turn capture mixing streamed output into the follow-up buffer.
-- Decide commit/PR for this branch.
+- Branch is committed and pushed; decide whether to open a PR to main.
+- Bench with only OPENROUTER_API_KEY: pass `--model`/`--judge` explicitly
+  (OpenRouter catalog entry has no DEFAULT_MODELS, judge default falls back to a
+  local Ollama model that isn't running).
