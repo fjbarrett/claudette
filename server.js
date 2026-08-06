@@ -13,7 +13,9 @@ import { createTurnTrace } from "./src/trace.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const HOST = process.env.HOST ?? "0.0.0.0";
+// Loopback by default: this server has no auth and exposes the workspace, so it
+// must not be reachable from the LAN unless someone opts in with HOST=0.0.0.0.
+const HOST = process.env.HOST ?? "127.0.0.1";
 const PORT = Number(process.env.PORT ?? 4321);
 const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
 const WORKSPACE_ROOT = path.resolve(process.env.WORKSPACE_ROOT ?? __dirname);
@@ -153,7 +155,7 @@ async function serveStatic(req, res, url) {
 
   const relativePath = url.pathname === "/" ? "/index.html" : url.pathname;
   const filePath = path.join(PUBLIC_DIR, path.normalize(relativePath));
-  if (!filePath.startsWith(PUBLIC_DIR)) {
+  if (!isInsideRoot(filePath, PUBLIC_DIR)) {
     sendJson(res, 403, { error: "Forbidden." });
     return;
   }
@@ -393,9 +395,17 @@ async function expandPromptContext(text, cwd) {
   return { text: expandedText, files };
 }
 
+// Containment check mirroring guardPath in src/tools.js. A string prefix match is
+// not a boundary: with root "/x/claudette", "/x/claudette-evil" starts with it and
+// would pass. Compare the relative path instead.
+function isInsideRoot(absolutePath, root) {
+  const rel = path.relative(root, absolutePath);
+  return !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
 function resolveWorkspaceFile(inputPath, cwd) {
   const absolutePath = path.resolve(cwd, inputPath);
-  if (!absolutePath.startsWith(WORKSPACE_ROOT)) {
+  if (!isInsideRoot(absolutePath, WORKSPACE_ROOT)) {
     throw new Error("Requested file is outside the workspace.");
   }
   return absolutePath;
@@ -403,7 +413,7 @@ function resolveWorkspaceFile(inputPath, cwd) {
 
 function normalizeWorkspacePath(inputPath) {
   const absolutePath = path.resolve(inputPath);
-  if (!absolutePath.startsWith(WORKSPACE_ROOT)) {
+  if (!isInsideRoot(absolutePath, WORKSPACE_ROOT)) {
     return WORKSPACE_ROOT;
   }
   return absolutePath;

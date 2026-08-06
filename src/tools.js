@@ -2,6 +2,8 @@ import { execFile as _execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 
 const execFile = promisify(_execFile);
 
@@ -397,10 +399,17 @@ function similarLinesHint(content, oldStr) {
 }
 
 async function runGlob(pattern, cwd) {
-  // bash globstar handles ** reliably
-  const script = `shopt -s globstar nullglob dotglob 2>/dev/null; files=(${pattern}); printf '%s\\n' "\${files[@]}"`;
+  // Belt and braces: `glob` is auto-approved (no permission prompt), so refuse
+  // command-substitution syntax outright before bash ever sees it.
+  if (pattern.includes('`') || pattern.includes('$(')) return '(no matches)';
+  // bash globstar handles ** reliably, but the pattern is model-controlled, so it
+  // must never be interpolated into the script text — `$(...)` and backticks would
+  // execute. Passed as a positional parameter it stays data: `files=($1)` still
+  // word-splits and glob-expands, while bash does not re-run command substitution
+  // on parameter expansion.
+  const script = `shopt -s globstar nullglob dotglob 2>/dev/null; files=($1); printf '%s\\n' "\${files[@]}"`;
   try {
-    const { stdout } = await execFile('bash', ['-c', script], { cwd, timeout: 10_000 });
+    const { stdout } = await execFile('bash', ['-c', script, 'glob', pattern], { cwd, timeout: 10_000 });
     const files = stdout.trim().split('\n')
       .filter(f => f && !f.includes('node_modules') && !f.includes('/.git/'));
     if (!files.length) return '(no matches)';
@@ -469,6 +478,40 @@ async function runSearchCode(pattern, searchPath, include, cwd, workspace) {
   }
 }
 
+// Loopback, private, and link-local ranges. fetch_url is auto-approved, so a
+// model-chosen URL must not be able to reach the host's own network or a cloud
+// metadata endpoint (169.254.169.254).
+function isPrivateAddress(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    if (a === 0 || a === 10 || a === 127) return true;          // 0.0.0.0/8, 10/8, loopback
+    if (a === 172 && b >= 16 && b <= 31) return true;           // 172.16/12
+    if (a === 192 && b === 168) return true;                    // 192.168/16
+    if (a === 169 && b === 254) return true;                    // link-local / metadata
+    return false;
+  }
+  const ipv6 = ip.toLowerCase();
+  if (ipv6 === '::1' || ipv6 === '::') return true;             // loopback, unspecified
+  if (/^f[cd]/.test(ipv6) || ipv6.startsWith('fe80')) return true; // unique-local, link-local
+  const mapped = ipv6.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);   // IPv4-mapped, e.g. ::ffff:127.0.0.1
+  return mapped ? isPrivateAddress(mapped[1]) : false;
+}
+
+// Resolve first: a public hostname can point at a private IP, so the hostname
+// alone proves nothing.
+async function assertPublicHost(parsed) {
+  const host = parsed.hostname.replace(/^\[|\]$/g, ''); // URL keeps [] around IPv6 literals
+  let address;
+  try {
+    ({ address } = await dns.lookup(host));
+  } catch {
+    throw new Error(`Could not resolve host: ${host}`);
+  }
+  if (isPrivateAddress(address)) {
+    throw new Error(`Refusing to fetch ${host} — it resolves to a private or loopback address (${address}). fetch_url only reaches public hosts.`);
+  }
+}
+
 async function fetchUrl(url) {
   let parsed;
   try {
@@ -480,9 +523,23 @@ async function fetchUrl(url) {
     throw new Error('Only http and https URLs are allowed');
   }
 
-  const response = await fetch(parsed, {
-    headers: { 'User-Agent': 'ollama-code/1.0' },
-  });
+  // Follow redirects by hand so every hop gets the same private-address check —
+  // otherwise a public URL could just 302 to http://169.254.169.254/.
+  let response;
+  for (let hop = 0; ; hop++) {
+    if (hop > 5) throw new Error('Too many redirects');
+    await assertPublicHost(parsed);
+    response = await fetch(parsed, {
+      headers: { 'User-Agent': 'ollama-code/1.0' },
+      redirect: 'manual',
+    });
+    const location = response.status >= 300 && response.status < 400 ? response.headers.get('location') : null;
+    if (!location) break;
+    parsed = new URL(location, parsed);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('Only http and https URLs are allowed');
+    }
+  }
   if (!response.ok) {
     throw new Error(`Fetch failed: ${response.status} ${response.statusText}`);
   }

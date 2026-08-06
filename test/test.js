@@ -782,9 +782,11 @@ describe('tools.js', async () => {
     assert.ok(deep.includes('leaf.txt'), 'depth 2 shows grandchild');
   });
 
-  test('executeTool fetch_url: strips HTML and returns text', async () => {
+  test('executeTool fetch_url: refuses loopback and private destinations', async () => {
     const { executeTool } = await import('../src/tools.js');
-    // Use a local http server to avoid network dependency
+    // fetch_url is auto-approved, so it must not reach the host's own network.
+    // A live local server proves the request is refused before connecting, not
+    // just failing to connect.
     const miniServer = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<html><body><p>Hello fetch world</p></body></html>');
@@ -792,10 +794,31 @@ describe('tools.js', async () => {
     await new Promise(resolve => miniServer.listen(0, '127.0.0.1', resolve));
     const { port } = miniServer.address();
     try {
-      const out = await executeTool('fetch_url', { url: `http://127.0.0.1:${port}/` }, { cwd: tmpDir, workspace: tmpDir });
-      assert.ok(out.includes('Hello fetch world'), 'extracts text from HTML');
+      await assert.rejects(
+        () => executeTool('fetch_url', { url: `http://127.0.0.1:${port}/` }, { cwd: tmpDir, workspace: tmpDir }),
+        /private or loopback/,
+        'loopback is blocked'
+      );
     } finally {
       await new Promise(resolve => miniServer.close(resolve));
+    }
+    for (const host of ['10.0.0.1', '192.168.1.1', '172.16.0.1', '169.254.169.254', '0.0.0.0', '[::1]']) {
+      await assert.rejects(
+        () => executeTool('fetch_url', { url: `http://${host}/` }, { cwd: tmpDir, workspace: tmpDir }),
+        /private or loopback/,
+        `${host} is blocked`
+      );
+    }
+  });
+
+  test('executeTool glob: pattern cannot execute shell commands', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    // The pattern is model-controlled and glob is auto-approved, so command
+    // substitution must never run. Marker file proves nothing executed.
+    const marker = path.join(tmpDir, 'pwned');
+    for (const pattern of [`$(touch ${marker})`, `\`touch ${marker}\``, `x; touch ${marker}`]) {
+      await executeTool('glob', { pattern }, { cwd: tmpDir, workspace: tmpDir });
+      assert.ok(!fs.existsSync(marker), `pattern did not execute: ${pattern}`);
     }
   });
 
