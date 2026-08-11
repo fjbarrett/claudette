@@ -2147,8 +2147,12 @@ describe('CLI (claudette.js)', async () => {
   });
 
   test('CLI /models lists available models', async () => {
+    // Asserted on vendor names (qwen/llama/gemma) before, which only held if the
+    // developer happened to have those pulled. Assert on the model this suite
+    // actually serves.
     const { stdout } = await runCliWithInput(['/models\n']);
-    assert.ok(stdout.includes('qwen') || stdout.includes('llama') || stdout.includes('gemma'), 'shows models');
+    assert.ok(stdout.includes('mock-cli'), 'lists the reachable model');
+    assert.ok(/Available Models/i.test(stdout), 'renders the model table');
   });
 
   test('CLI /config shows config table', async () => {
@@ -2209,7 +2213,9 @@ describe('CLI (claudette.js)', async () => {
     // `echo "/help" | claudette` — the line and EOF arrive together. The burst
     // reader must flush the buffered line on close instead of dropping it.
     const out = await new Promise((resolve, reject) => {
-      const proc = spawn('node', ['claudette.js'], { cwd: ROOT, env: { ...process.env, NODE_ENV: 'test' }, stdio: ['pipe', 'pipe', 'pipe'] });
+      // Needs the mock model list too — the CLI refuses to start without one, so
+      // this passed locally and failed in CI.
+      const proc = spawn('node', ['claudette.js'], { cwd: ROOT, env: { ...process.env, NODE_ENV: 'test', OLLAMA_BASE_URL: modelBaseUrl }, stdio: ['pipe', 'pipe', 'pipe'] });
       let stdout = '';
       proc.stdout.on('data', d => stdout += d);
       proc.stderr.on('data', d => stdout += d);
