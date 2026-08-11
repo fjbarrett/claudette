@@ -105,6 +105,22 @@ queued as prose and sent to the model — so `/exit` during a turn steers rather
 than exits. Ctrl+C is the documented interrupt. Decide the intended behaviour
 before changing it.
 
+### Repetition guard (done 2026-08-11)
+Built after a live session on `24p.mov` re-issued the same five curl commands 30
+times running, for 37 minutes. `createRepeatDetector` compares each response by
+`responseSignature(calls)` — tool names + normalised arguments, prose excluded —
+and nudges when the same signature repeats 3× (`CLAUDETTE_REPEAT_GUARD`, 0
+disables). Two ignored nudges end the turn with status `'repeating'`.
+
+Why nothing caught it before: the act nudge counts read-only streaks and a
+**successful** `bash` resets that streak, so a loop of successful identical
+commands looked like progress every iteration. `maxIterations` (150) was the only
+backstop, ~2h away at 75s/iteration. The guard stops it in ~9.
+
+Checked *after* the batch executes (keeps tool_call/tool_result pairing valid)
+and in the else-branch of the follow-up drain, so an automated nudge never stacks
+a second adjacent user message on a delivered follow-up.
+
 ### Model bake-off — PAUSED mid-run (2026-08-11)
 Stopped at the user's request. Complete: 8 local + 2 frontier, 5 eval cases each
 (`scratchpad/bakeoff.tsv`). Winner `qwen3.6:35b-a3b-opencode` (5/5, 55s).
