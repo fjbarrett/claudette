@@ -496,6 +496,13 @@ async function agentLoop(messages, rl, trace = null, input = null) {
   const maxIterations = resolveMaxIterations();
   if (!jsonIpc) ui.setUsageStatus(''); // reset the live token/cost readout for this turn
 
+  // One controller for the whole turn, so Ctrl+C reaches a running tool and not
+  // just the model request. It used to be set at request_start and cleared at
+  // request_end, which left tool execution — the long part, a `npm run build`
+  // that hangs — with nothing listening: Ctrl+C exited the process instead.
+  const turnAC = new AbortController();
+  currentAC = turnAC;
+
   // Per-iteration terminal state.
   let ctrlCHandler = null;
   let streamStarted = false;
@@ -512,7 +519,6 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       }
 
       case 'request_start': {
-        currentAC = data.controller;
         // When the turn wrapper is capturing follow-ups (auto-approve TTY), it
         // owns stdin and Ctrl+C for the whole turn. Otherwise do the
         // per-iteration readline pause + raw Ctrl+C handling here (so Ctrl+C
@@ -551,7 +557,6 @@ async function agentLoop(messages, rl, trace = null, input = null) {
 
       case 'request_end': {
         if (ctrlCHandler) { process.stdin.removeListener('data', ctrlCHandler); ctrlCHandler = null; }
-        currentAC = null;
         // Guard: stdin can hit EOF mid-turn (piped input), closing rl — resuming
         // a closed readline throws and would crash the turn.
         if (!input) { try { rl.resume(); } catch { /* readline already closed (EOF) */ } }
@@ -688,31 +693,39 @@ async function agentLoop(messages, rl, trace = null, input = null) {
     }
   };
 
-  const result = await runAgent({
-    model,
-    messages,
-    tools: toolsOn ? TOOL_DEFS : [],
-    toolContext: { cwd: workspace, workspace },
-    effort,
-    maxIterations,
-    emit,
-    onDelta: (delta) => {
-      if (jsonIpc) console.log(JSON.stringify({ type: 'delta', content: delta }));
-      else mdStream?.write(delta);
-    },
-    approve: (name, args) => checkPermission(name, args, rl),
-    takeFollowUps: () => takeQueuedFollowUps(input, trace),
-    // Don't silently die mid-task. In an interactive terminal, offer to keep
-    // going; a fresh iteration budget continues the same turn (and trace).
-    onMaxIterations: async ({ iterations }) => {
-      if (autoApprove || jsonIpc || !process.stdin.isTTY) return false;
-      let answer = '';
-      try {
-        answer = String(await rl.question(`\n\x1b[90m⚠ Hit ${iterations} tool iterations. Keep going? [y/N] \x1b[0m`)).trim().toLowerCase();
-      } catch { /* no usable input — fall through to stop */ }
-      return answer === 'y' || answer === 'yes';
-    },
-  });
+  let result;
+  try {
+    result = await runAgent({
+      model,
+      messages,
+      signal: turnAC.signal,
+      tools: toolsOn ? TOOL_DEFS : [],
+      toolContext: { cwd: workspace, workspace },
+      effort,
+      maxIterations,
+      emit,
+      onDelta: (delta) => {
+        if (jsonIpc) console.log(JSON.stringify({ type: 'delta', content: delta }));
+        else mdStream?.write(delta);
+      },
+      approve: (name, args) => checkPermission(name, args, rl),
+      takeFollowUps: () => takeQueuedFollowUps(input, trace),
+      // Don't silently die mid-task. In an interactive terminal, offer to keep
+      // going; a fresh iteration budget continues the same turn (and trace).
+      onMaxIterations: async ({ iterations }) => {
+        if (autoApprove || jsonIpc || !process.stdin.isTTY) return false;
+        let answer = '';
+        try {
+          answer = String(await rl.question(`\n\x1b[90m⚠ Hit ${iterations} tool iterations. Keep going? [y/N] \x1b[0m`)).trim().toLowerCase();
+        } catch { /* no usable input — fall through to stop */ }
+        return answer === 'y' || answer === 'yes';
+      },
+    });
+  } finally {
+    // Release the turn controller, so Ctrl+C at the idle prompt exits rather
+    // than aborting a turn that already finished.
+    if (currentAC === turnAC) currentAC = null;
+  }
 
   if (result.status === 'max_iterations') {
     if (trace) { trace.complete(); await flushSessionSave(session); }

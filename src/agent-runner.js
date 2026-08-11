@@ -170,7 +170,7 @@ export async function runAgent({
   toolContext = {},
   chatFn = chatStream,
   effort = null,
-  signal = null,
+  signal = undefined,
   maxIterations = resolveMaxIterations(),
   actNudge = resolveActNudge(),
   verifyGate = resolveVerifyGate(),

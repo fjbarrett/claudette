@@ -22,12 +22,21 @@ export async function getModels() {
  * Calls onDelta(delta) for each text chunk as it arrives.
  * Returns { content, toolCalls, promptTokens, completionTokens }
  */
+// Ollama defaults num_ctx to 4096, which truncates an agent loop almost
+// immediately, so we always send one. 32k is a safe default for a laptop; models
+// that advertise far more (qwen3.6 exposes 256k) were still capped at 32k with no
+// way to raise it, hence the override.
+export function resolveNumCtx(env = process.env) {
+  const n = Number(env.CLAUDETTE_NUM_CTX);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 32768;
+}
+
 export async function chatStream({ model, messages, tools = [], onDelta, signal }) {
   const body = {
     model,
     messages,
     stream: true,
-    options: { temperature: 0, num_ctx: 32768 },
+    options: { temperature: 0, num_ctx: resolveNumCtx() },
   };
   let toolMode = tools.length ? 'native' : 'none';
   let res = await postChat({

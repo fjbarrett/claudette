@@ -1896,6 +1896,35 @@ describe('server.js HTTP API', async () => {
     try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${sid}.json`)); } catch {}
   });
 
+  test('an oversized request body is rejected, not buffered', async () => {
+    // The server is unauthenticated and on loopback; without a cap it would
+    // happily read a gigabyte into memory.
+    const huge = 'x'.repeat(2 * 1024 * 1024);
+    const { status, body } = await httpPost(`${BASE}/api/sessions`, { title: huge });
+    assert.equal(status, 413);
+    assert.match(body.error ?? '', /exceeds/i);
+  });
+
+  test('a malformed JSON body gets 400, not 500', async () => {
+    const { status, body } = await httpPost(`${BASE}/api/sessions`, '{not json');
+    assert.equal(status, 400);
+    assert.match(body.error ?? '', /valid JSON/i);
+  });
+
+  test('a second concurrent turn on one session is refused', async () => {
+    // Two overlapping POSTs both loaded the session, both appended, and the
+    // slower save clobbered the faster one — the first turn's messages vanished.
+    const { body: created } = await httpPost(`${BASE}/api/sessions`, {});
+    const sid = created.session.id;
+    const [a, b] = await Promise.all([
+      httpPostStream(`${BASE}/api/sessions/${sid}/messages`, { content: 'first', model: LIVE_MODEL ?? 'nope:latest' }),
+      httpPostStream(`${BASE}/api/sessions/${sid}/messages`, { content: 'second', model: LIVE_MODEL ?? 'nope:latest' }),
+    ]);
+    const statuses = [a.status, b.status].sort();
+    assert.deepEqual(statuses, [200, 409], 'exactly one turn is admitted');
+    try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${sid}.json`)); } catch {}
+  });
+
   test('POST /api/sessions/:id/messages 400 for empty content', async () => {
     const { body: created } = await httpPost(`${BASE}/api/sessions`, {});
     const sid = created.session.id;
@@ -3488,6 +3517,172 @@ describe('src/retry.js (retry, backoff, stall)', async () => {
 });
 
 // ─── src/completion.js: Tab completion ────────────────────────────────────────
+
+// ─── Workspace boundary, shell-free glob, interruptible tools ────────────────
+
+describe('tools.js (boundary, glob, cancellation)', async () => {
+  const { executeTool, globToRegExp } = await import('../src/tools.js');
+
+  let ws;
+  before(async () => {
+    ws = await fsp.realpath(await makeTmpDir());
+    await fsp.mkdir(path.join(ws, 'src', 'deep'), { recursive: true });
+    await fsp.mkdir(path.join(ws, 'node_modules', 'junk'), { recursive: true });
+    await fsp.writeFile(path.join(ws, 'src', 'a.js'), 'a', 'utf8');
+    await fsp.writeFile(path.join(ws, 'src', 'deep', 'b.js'), 'b', 'utf8');
+    await fsp.writeFile(path.join(ws, 'src', 'notes.md'), 'n', 'utf8');
+    await fsp.writeFile(path.join(ws, 'top.js'), 't', 'utf8');
+    await fsp.writeFile(path.join(ws, 'node_modules', 'junk', 'evil.js'), 'x', 'utf8');
+  });
+  after(async () => { await cleanDir(ws); });
+
+  const run = (name, args) => executeTool(name, args, { cwd: ws, workspace: ws });
+
+  // A lexical path check is not a boundary: `ln -s /etc/passwd notes.txt` is
+  // innocent-looking and used to read straight out of the workspace.
+  test('a symlink pointing outside the workspace is refused', async () => {
+    const secret = path.join(os.tmpdir(), `claudette-outside-${randomUUID()}.txt`);
+    await fsp.writeFile(secret, 'TOP SECRET', 'utf8');
+    const link = path.join(ws, 'innocent.txt');
+    await fsp.symlink(secret, link);
+    try {
+      await assert.rejects(run('read_file', { path: 'innocent.txt' }), /symlink that resolves outside/);
+      await assert.rejects(run('write_file', { path: 'innocent.txt', content: 'x' }), /symlink that resolves outside/);
+      assert.equal(await fsp.readFile(secret, 'utf8'), 'TOP SECRET', 'the target was not overwritten');
+    } finally {
+      await fsp.rm(link, { force: true });
+      await fsp.rm(secret, { force: true });
+    }
+  });
+
+  test('a symlink to a directory outside the workspace is refused', async () => {
+    const outsideDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-outdir-'));
+    await fsp.writeFile(path.join(outsideDir, 'secret.txt'), 'nope', 'utf8');
+    const link = path.join(ws, 'escape');
+    await fsp.symlink(outsideDir, link);
+    try {
+      await assert.rejects(run('read_file', { path: 'escape/secret.txt' }), /symlink that resolves outside/);
+      // A file that does not exist yet must be checked just as strictly.
+      await assert.rejects(run('write_file', { path: 'escape/new.txt', content: 'x' }), /symlink that resolves outside/);
+    } finally {
+      await fsp.rm(link, { force: true });
+      await cleanDir(outsideDir);
+    }
+  });
+
+  test('ordinary paths inside the workspace still work', async () => {
+    assert.equal(await run('read_file', { path: 'src/a.js' }), 'a');
+    assert.match(await run('write_file', { path: 'fresh/new.txt', content: 'hi' }), /Wrote/);
+    assert.equal(await fsp.readFile(path.join(ws, 'fresh', 'new.txt'), 'utf8'), 'hi');
+  });
+
+  test('the lexical escape is still refused, with its own message', async () => {
+    await assert.rejects(run('read_file', { path: '../../etc/passwd' }), /outside the workspace root/);
+  });
+
+  test('globToRegExp: ** crosses directories, * and ? do not', () => {
+    assert.ok(globToRegExp('**/*.js').test('src/deep/b.js'));
+    assert.ok(globToRegExp('**/*.js').test('top.js'), '**/ matches zero directories');
+    assert.ok(globToRegExp('src/*.js').test('src/a.js'));
+    assert.ok(!globToRegExp('src/*.js').test('src/deep/b.js'), '* stops at a separator');
+    assert.ok(globToRegExp('src/?.js').test('src/a.js'));
+    assert.ok(!globToRegExp('src/?.js').test('src/ab.js'));
+  });
+
+  test('globToRegExp escapes regex metacharacters in the pattern', () => {
+    // Without escaping, `a.js` would match `axjs` and `(x)` would be a group.
+    assert.ok(!globToRegExp('a.js').test('axjs'));
+    assert.ok(globToRegExp('we(ird).js').test('we(ird).js'));
+    assert.ok(globToRegExp('a+b.js').test('a+b.js'));
+  });
+
+  test('glob matches without a shell and skips node_modules', async () => {
+    const out = await run('glob', { pattern: '**/*.js' });
+    const files = out.split('\n');
+    assert.ok(files.includes('src/a.js') && files.includes('src/deep/b.js') && files.includes('top.js'));
+    assert.ok(!files.includes('src/notes.md'), 'pattern filtered');
+    assert.ok(!out.includes('node_modules'), 'never descends into node_modules');
+  });
+
+  // glob is auto-approved, so the pattern is attacker-influenced text that used
+  // to reach `bash -c`. There is no shell in the path now.
+  test('glob treats shell metacharacters as literal pattern text', async () => {
+    const canary = path.join(ws, 'canary.txt');
+    await fsp.rm(canary, { force: true });
+    for (const pattern of ['$(touch canary.txt)', '`touch canary.txt`', '; touch canary.txt', '*.js; touch canary.txt']) {
+      const out = await run('glob', { pattern });
+      assert.equal(out, '(no matches)', `no match for ${pattern}`);
+    }
+    assert.equal(fs.existsSync(canary), false, 'nothing executed');
+  });
+
+  test('glob will not report a symlink that leaves the workspace', async () => {
+    const outside = path.join(os.tmpdir(), `claudette-glob-${randomUUID()}.js`);
+    await fsp.writeFile(outside, 'x', 'utf8');
+    const link = path.join(ws, 'linked.js');
+    await fsp.symlink(outside, link);
+    try {
+      const out = await run('glob', { pattern: '*.js' });
+      assert.ok(!out.split('\n').includes('linked.js'), 'escaping symlink omitted');
+      assert.ok(out.split('\n').includes('top.js'), 'real files still listed');
+    } finally {
+      await fsp.rm(link, { force: true });
+      await fsp.rm(outside, { force: true });
+    }
+  });
+
+  // Ctrl+C during a long foreground command. Before, executeTool ignored the
+  // signal and you waited for `npm run build` no matter what.
+  test('an aborted bash command stops and says it was interrupted', async () => {
+    const ac = new AbortController();
+    const started = Date.now();
+    setTimeout(() => ac.abort(), 150);
+    await assert.rejects(
+      executeTool('bash', { command: 'sleep 30' }, { cwd: ws, workspace: ws, signal: ac.signal }),
+      /interrupted by the user/i,
+    );
+    assert.ok(Date.now() - started < 5000, 'returned immediately, not after 30s');
+  });
+
+  test('an abort is not misreported as a timeout', async () => {
+    // Both arrive as a killed child; telling the model "it timed out" would send
+    // it off tuning CLAUDETTE_BASH_TIMEOUT for something the user did.
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 100);
+    await assert.rejects(
+      executeTool('bash', { command: 'sleep 20' }, { cwd: ws, workspace: ws, signal: ac.signal }),
+      (err) => !/timed out/i.test(err.message),
+    );
+  });
+
+  test('a normal command is unaffected by an un-aborted signal', async () => {
+    const ac = new AbortController();
+    const out = await executeTool('bash', { command: 'echo alive' }, { cwd: ws, workspace: ws, signal: ac.signal });
+    assert.match(out, /alive/);
+  });
+
+  test('a null signal is accepted, not passed through to execFile', async () => {
+    // execFile validates options.signal as AbortSignal-or-undefined and rejects
+    // null outright, so a caller with no signal to give (the eval harness) broke
+    // every command before it ran.
+    const out = await executeTool('bash', { command: 'echo nosignal' }, { cwd: ws, workspace: ws, signal: null });
+    assert.match(out, /nosignal/);
+    const viaGrep = await executeTool('search_code', { pattern: 'nosignal-not-present' }, { cwd: ws, workspace: ws, signal: null });
+    assert.equal(typeof viaGrep, 'string');
+  });
+});
+
+describe('ollama.js (context window)', async () => {
+  const { resolveNumCtx } = await import('../src/ollama.js');
+
+  test('num_ctx defaults to 32k and is overridable', () => {
+    // Ollama's own default is 4096, which truncates an agent loop almost at once.
+    assert.equal(resolveNumCtx({}), 32768);
+    assert.equal(resolveNumCtx({ CLAUDETTE_NUM_CTX: '131072' }), 131072);
+    assert.equal(resolveNumCtx({ CLAUDETTE_NUM_CTX: 'nonsense' }), 32768);
+    assert.equal(resolveNumCtx({ CLAUDETTE_NUM_CTX: '0' }), 32768, 'zero would mean no context at all');
+  });
+});
 
 describe('src/completion.js (tab completion)', async () => {
   const { completeSlashCommand, completeAtPath, SLASH_COMMANDS } = await import('../src/completion.js');
