@@ -93,8 +93,29 @@ export function resolveVerifyGate(env = process.env) {
 // don't verify correctness.
 const VERIFY_RE = /^(sudo\s+)?(time\s+)?(npx\s+|pnpm\s+|yarn\s+|bun\s+)?(npm\s+(run\s+)?(build|test|lint|typecheck|type-check|check)\b|(pnpm|yarn|bun)\s+(run\s+)?(build|test|lint|typecheck|check)\b|next\s+(build|lint)\b|vite\s+build\b|tsc\b|eslint\b|ruff\b|flake8\b|mypy\b|pyright\b|pytest\b|jest\b|vitest\b|phpunit\b|rspec\b|node\s+--(check|test)\b|go\s+(build|test|vet)\b|cargo\s+(build|test|check|clippy)\b|make\b|mvn\b|gradle\b|python3?\s+-m\s+(pytest|unittest|mypy|py_compile)\b)/i;
 
+// Running the thing you just wrote is verification too. The list above only knows
+// package-manager and test-runner invocations, so on a Terminal-Bench task with no
+// package.json the gate kept firing at an agent that WAS verifying: it ran
+// `python3 check_cert.py` five times and got nudged after every one, turning an
+// 8-call task into 20 calls and 80k input tokens.
+const RUN_SCRIPT_RE = /^(sudo\s+)?(time\s+)?(python3?|node|deno|bun|ruby|perl|php|bash|sh|zsh)\s+(\S+\/)?(\S+\.(py|js|mjs|cjs|ts|rb|pl|php|sh))\s*$|^\.\/\S+\s*$/i;
+
+// …with one exception. These names are conventionally a server's entry point, and
+// starting a server proves nothing — it just blocks until the bash timeout. A
+// script that genuinely checks something is not called `app.js`.
+const SERVER_ENTRY_RE = /^(app|server|index|main|start|dev)\.(js|mjs|cjs|ts|py)$/i;
+
 export function looksLikeVerification(command) {
-  return String(command || '').split(/&&|\|\||;|\n/).some(seg => VERIFY_RE.test(seg.trim()));
+  return String(command || '')
+    .split(/&&|\|\||;|\n/)
+    .some(seg => {
+      const s = seg.trim();
+      if (VERIFY_RE.test(s)) return true;
+      const script = RUN_SCRIPT_RE.exec(s);
+      if (!script) return false;
+      const basename = (script[5] ?? s).split('/').pop();
+      return !SERVER_ENTRY_RE.test(basename);
+    });
 }
 
 export function buildVerifyNudge(verifyRan) {

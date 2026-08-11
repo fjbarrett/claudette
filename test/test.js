@@ -3450,6 +3450,27 @@ describe('src/agent-runner.js (shared loop)', async () => {
     assert.ok(messages.some(m => m.role === 'user' && m.content === 'also do this'));
   });
 
+  // Found on a real Terminal-Bench run: the agent verified with
+  // `python3 check_cert.py`, the gate didn't recognise it, and kept nudging —
+  // an 8-call task became 20 calls and 80k input tokens.
+  test('running the script you just wrote counts as verification', async () => {
+    const { looksLikeVerification } = await import('../src/agent-runner.js');
+    for (const cmd of ['python3 /app/check_cert.py', 'node build.js', './run.sh',
+                       'bash verify.sh', 'python3 -m pytest', 'npm test', 'cargo test']) {
+      assert.equal(looksLikeVerification(cmd), true, `${cmd} verifies`);
+    }
+    // Still narrow enough to be meaningful: looking around is not verifying.
+    for (const cmd of ['cat notes.txt', 'ls -la', 'echo hello', 'git status',
+                       'python3 -c "print(1)"', 'npm run dev']) {
+      assert.equal(looksLikeVerification(cmd), false, `${cmd} does not verify`);
+    }
+    // Starting a server proves nothing — it blocks until the bash timeout — and
+    // these names are conventionally an entry point, not a check.
+    for (const cmd of ['node app.js', 'node server.js', 'python3 main.py']) {
+      assert.equal(looksLikeVerification(cmd), false, `${cmd} is a server start`);
+    }
+  });
+
   test('the verification gate blocks finishing after an unverified edit', async () => {
     const messages = [{ role: 'user', content: 'edit it' }];
     const run = await runAgent({
