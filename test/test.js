@@ -2090,6 +2090,55 @@ describe('CLI (claudette.js)', async () => {
     assert.equal(chat.__test_extractExactBashCommand, undefined, 'no test hook left behind');
   });
 
+  test('pickDefaultModel needs tool support above all else', async () => {
+    const { pickDefaultModel } = await import('../src/chat.js');
+    // A model that cannot call tools cannot run the agent loop, however nice it
+    // looks otherwise.
+    const picked = pickDefaultModel([
+      { name: 'pretty-coder:7b', size: 4e9, capabilities: ['completion'] },
+      { name: 'plain:32b', size: 20e9, capabilities: ['completion', 'tools'] },
+    ]);
+    assert.equal(picked, 'plain:32b');
+  });
+
+  test('pickDefaultModel prefers coding-tuned, then smaller', async () => {
+    const { pickDefaultModel } = await import('../src/chat.js');
+    const tools = ['tools'];
+    assert.equal(
+      pickDefaultModel([
+        { name: 'general:8b', size: 5e9, capabilities: tools },
+        { name: 'qwen2.5-coder:7b', size: 4.7e9, capabilities: tools },
+      ]),
+      'qwen2.5-coder:7b',
+      'coding-tuned wins',
+    );
+    assert.equal(
+      pickDefaultModel([
+        { name: 'big-coder:70b', size: 40e9, capabilities: tools },
+        { name: 'small-coder:7b', size: 4e9, capabilities: tools },
+      ]),
+      'small-coder:7b',
+      'among equals, smaller wins — speed is what makes the loop usable',
+    );
+  });
+
+  test('pickDefaultModel skips embedding and vision-only models', async () => {
+    const { pickDefaultModel } = await import('../src/chat.js');
+    const picked = pickDefaultModel([
+      { name: 'nomic-embed-text', size: 3e8, capabilities: ['tools'] },
+      { name: 'llama-guard:8b', size: 5e9, capabilities: ['tools'] },
+      { name: 'workhorse:14b', size: 9e9, capabilities: ['tools'] },
+    ]);
+    assert.equal(picked, 'workhorse:14b');
+  });
+
+  test('pickDefaultModel does not punish cloud entries for reporting no capabilities', async () => {
+    const { pickDefaultModel } = await import('../src/chat.js');
+    // Cloud models carry no capability list — unknown, not empty.
+    assert.equal(pickDefaultModel([{ name: 'openrouter/openai/gpt-5-nano' }]), 'openrouter/openai/gpt-5-nano');
+    assert.equal(pickDefaultModel([]), null);
+  });
+
   test('permissionKey scopes bash approval to the exact command', async () => {
     const { permissionKey } = await import('../src/chat.js');
     // "always" on one command must not authorise a different one.
