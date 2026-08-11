@@ -1,0 +1,44 @@
+name: CI
+
+# The suite has 240+ tests and none of them ran automatically. Everything here is
+# offline: the CLI and server tests drive a mock Ollama over loopback, so no
+# provider key is needed. `npm test` skips the `Stress:` suite, which needs a real
+# local model — run that with `npm run test:live`.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20.x', '22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # No dependencies — the whole project is zero-dep by design, so there is
+      # nothing to install and nothing to cache.
+      - name: Syntax-check every module
+        run: |
+          for f in $(git ls-files '*.js'); do node --check "$f"; done
+      - name: Test
+        run: npm test
+        env:
+          NODE_ENV: test
+
+  bench-tasks:
+    # Task files are data the harness parses at runtime; a malformed one only
+    # surfaces mid-benchmark, an hour into a paid run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.x'
+      - name: Every bench task parses and validates
+        run: node -e "import('./bench/tasks.js').then(m => m.loadTasks()).then(t => console.log(t.length + ' tasks OK'))"

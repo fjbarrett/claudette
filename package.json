@@ -10,6 +10,8 @@
     "start": "node server.js",
     "cli": "node claudette.js",
     "dev": "node claudette.js",
+    "test": "NODE_ENV=test node --test --test-skip-pattern '^Stress' test/test.js",
+    "test:live": "NODE_ENV=test node --test test/test.js",
     "bench": "node bench/run.js",
     "bench:leaderboard": "node bench/leaderboard.js --write",
     "bench:list": "node bench/run.js --list",
