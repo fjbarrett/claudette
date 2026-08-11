@@ -115,6 +115,7 @@ npm run bench -- --task <id> --model <provider/model> --judge <provider/model>
 npm run bench:list
 npm run bench:leaderboard
 npm run eval -- --all --model <provider/model>   # fast in-process tool-usage evals
+npm run eval -- --all --model <m> --json        # one JSON document, for comparing models
 ```
 
 For comparable public numbers, claudette runs as a **Terminal-Bench 2.x agent**
