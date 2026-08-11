@@ -168,7 +168,10 @@ export async function chatStream(opts) {
         if (process.env.CLAUDETTE_QUIET_RETRIES !== '1') {
           console.error(
             `\x1b[33m⚠ ${provider.LABEL ?? 'provider'} request failed (${err.status ?? err.code ?? 'network'}), ` +
-            `retry ${attempt} in ${Math.round(delay / 1000)}s: ${truncate(err.message, 160)}\x1b[0m`
+            // Sub-second delays used to round to "in 0s", which read as "it did
+            // not wait at all" while debugging a failed run.
+            `retry ${attempt} in ${delay < 1000 ? `${delay}ms` : `${(delay / 1000).toFixed(1)}s`}: ` +
+            `${truncate(err.message, 160)}\x1b[0m`
           );
         }
       },

@@ -3876,7 +3876,7 @@ describe('src/agent-runner.js (shared loop)', async () => {
 
 describe('src/retry.js (retry, backoff, stall)', async () => {
   const {
-    isRetryable, retryAfterMs, backoffMs, withRetry, providerHttpError,
+    isRetryable, retryAfterMs, backoffMs, isConnectionFailure, withRetry, providerHttpError,
     resolveMaxRetries, resolveStallTimeout, RETRYABLE_STATUS,
   } = await import('../src/retry.js');
 
@@ -3913,12 +3913,39 @@ describe('src/retry.js (retry, backoff, stall)', async () => {
   });
 
   test('backoffMs grows, stays capped, and respects Retry-After', () => {
-    const full = { random: () => 1 }; // full jitter at its maximum
-    assert.equal(backoffMs(0, null, full), 500);
-    assert.equal(backoffMs(1, null, full), 1000);
-    assert.equal(backoffMs(9, null, full), 20_000, 'capped');
-    assert.equal(backoffMs(0, null, { random: () => 0 }), 0, 'jitter can go to zero');
-    assert.equal(backoffMs(0, { retryAfterMs: 9000 }, full), 9000, 'server hint wins when larger');
+    const high = { random: () => 1 }; // jitter at its maximum
+    assert.equal(backoffMs(0, null, high), 500);
+    assert.equal(backoffMs(1, null, high), 1000);
+    assert.equal(backoffMs(9, null, high), 30_000, 'capped');
+    assert.equal(backoffMs(0, { retryAfterMs: 9000 }, high), 9000, 'server hint wins when larger');
+  });
+
+  // Full jitter drew from [0, exponential], so an unlucky draw retried instantly:
+  // three attempts inside a second, which cannot outlast anything real.
+  test('backoffMs never collapses to zero, even on the unluckiest draw', () => {
+    const low = { random: () => 0 };
+    assert.equal(backoffMs(0, null, low), 250, 'half of the exponential is the floor');
+    assert.equal(backoffMs(1, null, low), 500);
+    assert.ok(backoffMs(0, null, low) < backoffMs(0, null, { random: () => 1 }), 'still jittered');
+  });
+
+  // Measured: Ollama auto-updated itself mid-run and took 8.4s to come back. At
+  // the 500ms base the whole retry budget was under a second, so the turn died.
+  test('isConnectionFailure separates "no socket" from "answered with an error"', () => {
+    assert.ok(isConnectionFailure(new Error('fetch failed')));
+    assert.ok(isConnectionFailure(Object.assign(new Error('x'), { cause: { code: 'ECONNREFUSED' } })));
+    assert.ok(!isConnectionFailure(Object.assign(new Error('rate limited'), { status: 429 })),
+      'a 429 answered the socket — it needs milliseconds, not seconds');
+    assert.ok(!isConnectionFailure(new Error('bad model slug')));
+  });
+
+  test('backoffMs waits seconds, not milliseconds, when the server is not answering', () => {
+    const err = Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNREFUSED' } });
+    const low = { random: () => 0 };
+    assert.equal(backoffMs(0, err, low), 1500);
+    assert.equal(backoffMs(1, err, low), 3000);
+    const budget = backoffMs(0, err, low) + backoffMs(1, err, low);
+    assert.ok(budget >= 4000, `default budget ${budget}ms should span a local server restart`);
   });
 
   test('withRetry retries a transient failure and then succeeds', async () => {
@@ -4384,6 +4411,82 @@ describe('bench/evals.js (eval loops)', async () => {
     assert.ok(record.failures.some(f => f.includes('missing tool call: str_replace')), 'flags missing str_replace');
     assert.ok(record.failures.some(f => f.includes('forbidden tool was called: write_file')), 'flags forbidden write_file');
     assert.ok(record.failures.some(f => f.includes('does not include')), 'flags wrong file content');
+  });
+
+  // The tie-break assertions. Correctness alone stopped separating models once
+  // several of them passed every case, so a case can also require that nothing
+  // else got clobbered and that the answer was not brute-forced.
+  test('runEvalIteration: excludes catches a rewrite that drops untouched content', async () => {
+    const rewritten = 'export const TIMEOUT = 90;\n'; // RETRIES line lost
+    const record = await runEvalIteration({
+      id: 'mock-excludes',
+      prompt: 'bump the timeout',
+      files: { 'config.js': 'export const TIMEOUT = 30;\nexport const RETRIES = 3;\n' },
+      maxTurns: 4,
+      expect: {
+        files: { 'config.js': { includes: ['TIMEOUT = 90', 'RETRIES = 3'], excludes: 'TIMEOUT = 30' } },
+      },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        { content: '', toolCalls: [{ id: 't1', function: { name: 'write_file', arguments: JSON.stringify({ path: 'config.js', content: rewritten }) } }] },
+        { content: 'done' },
+      ]),
+    });
+
+    assert.ok(!record.pass, 'the asked-for change landed but collateral damage fails the case');
+    assert.ok(record.failures.some(f => f.includes('does not include "RETRIES = 3"')), 'flags the dropped line');
+    assert.ok(!record.failures.some(f => f.includes('still includes')), 'excludes on the old value is satisfied');
+  });
+
+  test('runEvalIteration: absent expects a file the model must not create', async () => {
+    const record = await runEvalIteration({
+      id: 'mock-absent',
+      prompt: 'edit in place',
+      files: { 'config.js': 'x\n' },
+      maxTurns: 4,
+      expect: { files: { 'config.js.bak': { absent: true } } },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        { content: '', toolCalls: [{ id: 't1', function: { name: 'bash', arguments: '{"command":"cp config.js config.js.bak"}' } }] },
+        { content: 'done' },
+      ]),
+    });
+
+    assert.ok(!record.pass);
+    assert.ok(record.failures.some(f => f.includes('config.js.bak should not exist')));
+
+    const clean = await runEvalIteration({
+      id: 'mock-absent-ok',
+      prompt: 'edit in place',
+      files: { 'config.js': 'x\n' },
+      maxTurns: 4,
+      expect: { files: { 'config.js.bak': { absent: true } } },
+    }, { model: 'mock', chatFn: scriptedModel([{ content: 'done' }]) });
+    assert.ok(clean.pass, 'a missing file satisfies absent');
+  });
+
+  test('runEvalIteration: maxToolCalls fails a correct-but-flailing run', async () => {
+    const readCall = { id: 't1', function: { name: 'bash', arguments: '{"command":"true"}' } };
+    const record = await runEvalIteration({
+      id: 'mock-budget',
+      prompt: 'do it efficiently',
+      maxTurns: 8,
+      expect: { answer: { matches: 'done' }, maxToolCalls: 2 },
+    }, {
+      model: 'mock',
+      chatFn: scriptedModel([
+        { content: '', toolCalls: [readCall] },
+        { content: '', toolCalls: [readCall] },
+        { content: '', toolCalls: [readCall] },
+        { content: 'done' },
+      ]),
+    });
+
+    assert.ok(!record.pass, 'right answer, too many calls');
+    assert.ok(record.failures.some(f => f.includes('used 3 tool calls, budget is 2')));
+    assert.ok(!record.failures.some(f => f.includes('final answer')), 'the answer itself matched');
   });
 
   test('runEvalIteration stops at maxTurns without a final answer', async () => {

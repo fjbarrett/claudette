@@ -1,0 +1,25 @@
+{
+  "id": "ambiguous-anchor",
+  "title": "Recovers from a non-unique str_replace anchor by adding surrounding context",
+  "prompt": "In src/routes.js, change the timeout for the /upload route from 30 to 120. The /health route must keep its timeout of 30. Use str_replace for the edit.",
+  "maxTurns": 10,
+  "repeat": 1,
+  "files": {
+    "src/routes.js": "import { healthCheck, uploadHandler } from './handlers.js';\n\nexport const routes = [\n  {\n    path: '/health',\n    handler: healthCheck,\n    timeout: 30,\n  },\n  {\n    path: '/upload',\n    handler: uploadHandler,\n    timeout: 30,\n  },\n];\n"
+  },
+  "expect": {
+    "tools": [
+      { "name": "str_replace", "args": { "path": "src/routes.js" } }
+    ],
+    "forbid": ["write_file"],
+    "files": {
+      "src/routes.js": {
+        "includes": [
+          "path: '/health',\n    handler: healthCheck,\n    timeout: 30,",
+          "path: '/upload',\n    handler: uploadHandler,\n    timeout: 120,"
+        ]
+      }
+    },
+    "maxToolCalls": 8
+  }
+}

@@ -77,13 +77,34 @@ export function resolveStallTimeout(env = process.env) {
 }
 
 /**
- * Exponential backoff with full jitter, floored by any server Retry-After hint.
- * Jitter matters with parallel calls: without it, N callers that hit the same
- * 429 all wake at the same instant and trigger the next one.
+ * Is this "the server is not answering the socket" rather than "the server
+ * answered with an error"? The two need very different waits: a 429 clears in
+ * milliseconds, a process that has gone away needs seconds to come back.
  */
-export function backoffMs(attempt, err, { base = 500, cap = 20_000, random = Math.random } = {}) {
-  const exponential = Math.min(cap, base * 2 ** attempt);
-  const jittered = Math.round(random() * exponential);
+export function isConnectionFailure(err) {
+  if (typeof err?.status === 'number') return false; // it answered, just not OK
+  const code = err?.cause?.code ?? err?.code;
+  if (code && RETRYABLE_CODES.has(code)) return true;
+  return /fetch failed|socket hang up|econnrefused|econnreset/i.test(String(err?.message ?? ''));
+}
+
+/**
+ * Exponential backoff with half jitter, floored by any server Retry-After hint.
+ * Jitter matters with parallel calls: without it, N callers that hit the same
+ * 429 all wake at the same instant and trigger the next one. It is *half*
+ * jitter, not full, because full jitter draws from [0, exponential] and can
+ * return ~0 — three attempts inside 800ms, which is not a retry policy.
+ *
+ * Connection failures start from a much larger base. Measured cause: Ollama
+ * auto-updated itself mid-run, SIGTERMed the server, and took 8.4s to come back
+ * — an eternity next to the old 500ms base, so the run died with the whole
+ * eval case's context thrown away. Local model servers restart; cloud
+ * endpoints refuse connections during a deploy. Waiting is cheap, re-running is not.
+ */
+export function backoffMs(attempt, err, { base, cap = 30_000, random = Math.random } = {}) {
+  const start = base ?? (isConnectionFailure(err) ? 3_000 : 500);
+  const exponential = Math.min(cap, start * 2 ** attempt);
+  const jittered = Math.round(exponential / 2 + random() * (exponential / 2));
   const hinted = Number(err?.retryAfterMs);
   return Number.isFinite(hinted) ? Math.max(hinted, jittered) : jittered;
 }

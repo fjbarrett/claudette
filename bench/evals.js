@@ -20,10 +20,17 @@
 //       "tools":  [ {"name": "read_file", "args": {"path": "src/config.js"}},
 //                   {"name": "str_replace"} ],      // ordered subsequence
 //       "forbid": ["write_file"],                   // must never be called
-//       "files":  { "src/config.js": {"includes": "90"} },
+//       "files":  { "src/config.js": {"includes": "90", "excludes": "30"},
+//                   "src/config.js.bak": {"absent": true} },
+//       "maxToolCalls": 6,                          // efficiency budget
 //       "answer": { "matches": "done" }             // regex on final text
 //     }
 //   }
+//
+// `includes`/`excludes` take a string or an array of them. `excludes` is how a
+// case catches collateral damage — the asked-for change landed, but the model
+// rewrote the file and lost the rest. `maxToolCalls` is how correctness ties
+// break: several models get the right answer, fewer get it without flailing.
 //
 // Arg matching: expected string values must be contained in the actual value
 // (substring), everything else compares strictly. Repeating a case N times
@@ -201,12 +208,32 @@ export async function evaluateExpectations(record, expect, sandbox) {
     try {
       content = await fs.readFile(path.join(sandbox, rel), 'utf8');
     } catch {
-      failures.push(`expected file missing: ${rel}`);
+      // `absent: true` is the only expectation a missing file satisfies.
+      if (!check.absent) failures.push(`expected file missing: ${rel}`);
       continue;
     }
-    if (check.includes && !content.includes(check.includes)) {
-      failures.push(`file ${rel} does not include ${JSON.stringify(check.includes)}`);
+    if (check.absent) {
+      failures.push(`file ${rel} should not exist`);
+      continue;
     }
+    for (const want of [].concat(check.includes ?? [])) {
+      if (!content.includes(want)) {
+        failures.push(`file ${rel} does not include ${JSON.stringify(want)}`);
+      }
+    }
+    // `excludes` is what catches collateral damage: the edit landed, but the
+    // model rewrote the file and dropped everything it was not asked to touch.
+    for (const unwanted of [].concat(check.excludes ?? [])) {
+      if (content.includes(unwanted)) {
+        failures.push(`file ${rel} still includes ${JSON.stringify(unwanted)}`);
+      }
+    }
+  }
+
+  // A budget, not a cap: the loop is not interrupted, the case just fails when a
+  // model brute-forces its way to a correct answer. Ties on correctness break here.
+  if (expect.maxToolCalls != null && record.toolCalls.length > expect.maxToolCalls) {
+    failures.push(`used ${record.toolCalls.length} tool calls, budget is ${expect.maxToolCalls}`);
   }
 
   if (expect.answer?.matches) {
