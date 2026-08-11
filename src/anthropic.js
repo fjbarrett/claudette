@@ -8,6 +8,7 @@
 // Canonical addressing is `anthropic/<id>`; the legacy `anthropic:<id>` colon
 // form is still accepted as an input alias.
 import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
+import { providerHttpError } from './retry.js';
 
 const PREFIX = 'anthropic/';
 const LEGACY_PREFIX = 'anthropic:';
@@ -116,7 +117,7 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
 
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`Anthropic chat (${res.status}): ${txt}`);
+    throw providerHttpError('Anthropic', res, txt);
   }
 
   const result = await parseSSE(res.body, onDelta);

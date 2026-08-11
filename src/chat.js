@@ -14,14 +14,18 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 import { getModels, chatStream, missingCredential } from './provider.js';
-import { TOOL_DEFS, executeTool } from './tools.js';
-import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions } from './session.js';
-import { loadClaudeMd, expandFiles, trimToolOutputs } from './context.js';
+import { TOOL_DEFS } from './tools.js';
+import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions, archiveMessages } from './session.js';
+import { flushTranscripts } from './transcript.js';
+import { loadClaudeMd, expandFiles } from './context.js';
+import { parseTextToolCalls } from './tool-call-parser.js';
+import { runAgent, resolveMaxIterations } from './agent-runner.js';
 import { createTurnTrace, truncateLine } from './trace.js';
 import { estimateCost, formatUsd, formatTokens } from './cost.js';
-import { InputController, buildFollowUpMessage, createInputAssembler, sanitizeUserInput, createBurstReader } from './input.js';
+import { InputController, buildFollowUpMessage, createInputAssembler, sanitizeUserInput, createBurstReader, createLineQueue } from './input.js';
 import { recordTurnUsage } from './usage.js';
 import { loadHistory, appendHistory } from './history.js';
+import { createCompleter } from './completion.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -47,15 +51,14 @@ export function resolveAutoApprove(argv = process.argv, env = process.env) {
   return v != null && v !== '' && v !== '0' && String(v).toLowerCase() !== 'false';
 }
 
-// Tool iterations allowed per turn before the runaway guard pauses the loop.
-// Default 150 (was a hard 20, then 50, both of which cut off large multi-file
-// builds); raise/lower with --max-iterations N or CLAUDETTE_MAX_ITERATIONS.
-export function resolveMaxIterations(argv = process.argv, env = process.env) {
-  const flagIdx = argv.indexOf('--max-iterations');
-  const raw = flagIdx !== -1 ? argv[flagIdx + 1] : env.CLAUDETTE_MAX_ITERATIONS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 150;
-}
+// The loop itself lives in agent-runner.js so the CLI, the eval harness, and
+// future subagents all run the same agent. Re-exported here because this module
+// has been the public surface for them since before the extraction.
+export {
+  resolveMaxIterations, resolveActNudge, createActNudger,
+  resolveVerifyGate, looksLikeVerification, buildVerifyNudge,
+  dropOrphanToolMessages,
+} from './agent-runner.js';
 
 // Turn a raw provider stream error into an actionable message. The usage logs
 // showed turns failing instantly (tools=0, in=0) on typo'd model slugs
@@ -74,71 +77,6 @@ export function explainStreamError(err, model) {
   }
   return `Stream error: ${msg}`;
 }
-
-// Action-forcing nudge. The logs showed gpt-5-nano re-reading the same files
-// dozens of times without ever editing (one turn: 40+ reads, 0 edits) — the
-// re-read guard makes that cheap but doesn't stop it, and the system-prompt hint
-// is ignored. After N consecutive read-only tool calls with no edit/command, we
-// append a firm steering line to the last tool result telling the model to act;
-// it re-arms after another N. Any action tool (edit/bash) resets the streak.
-const ACTION_TOOLS = new Set(['write_file', 'str_replace', 'patch_file', 'bash']);
-export function resolveActNudge(env = process.env) {
-  const n = Number(env.CLAUDETTE_ACT_NUDGE);
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 15; // 0 disables
-}
-export function createActNudger(threshold) {
-  let streak = 0;   // tool calls since the last SUCCESSFUL action (edit/command)
-  let firedAt = 0;  // streak value at the last nudge (for re-arming)
-  return {
-    // A successful action resets the streak (real progress). A read, or an action
-    // that ERRORED (e.g. a no-op patch), counts toward the streak — a failed edit
-    // is not progress, so it should still push toward the nudge.
-    record(toolName, isError = false) {
-      if (ACTION_TOOLS.has(toolName) && !isError) { streak = 0; firedAt = 0; }
-      else streak++;
-    },
-    // Returns a nudge string when the streak has crossed another `threshold`
-    // since the last nudge, else null. Call once per tool batch.
-    takeNudge() {
-      if (threshold > 0 && streak - firedAt >= threshold) {
-        firedAt = streak;
-        return `[automated nudge] You've made ${streak} tool calls without a successful edit or command. ` +
-          `You very likely have enough context now — make a concrete change (write_file / str_replace / patch_file) or run a command to make progress. ` +
-          `If something is blocking you, state exactly what. Stop re-reading files you've already seen.`;
-      }
-      return null;
-    },
-    get streak() { return streak; },
-  };
-}
-
-// Verification gate. A turn that edited files shouldn't finish without proving the
-// result works — the logs showed a Sonnet turn that "completed cleanly" (and cost
-// $2.55) but left the site broken because it never ran a build. When the model
-// tries to finish after editing without a passing check, the loop pushes it to run
-// one (build / typecheck / tests), capped to avoid loops. CLAUDETTE_VERIFY_GATE=0
-// disables it.
-export function resolveVerifyGate(env = process.env) {
-  return env.CLAUDETTE_VERIFY_GATE !== '0';
-}
-// A command segment counts as verification only when it STARTS with a known
-// build/test/typecheck/lint invocation — conservative on purpose: a false negative
-// just re-prompts (cheap), a false positive would let a broken result ship.
-// Long-running servers (npm run dev / start) are deliberately excluded — they
-// don't verify correctness.
-const VERIFY_RE = /^(sudo\s+)?(time\s+)?(npx\s+|pnpm\s+|yarn\s+|bun\s+)?(npm\s+(run\s+)?(build|test|lint|typecheck|type-check|check)\b|(pnpm|yarn|bun)\s+(run\s+)?(build|test|lint|typecheck|check)\b|next\s+(build|lint)\b|vite\s+build\b|tsc\b|eslint\b|ruff\b|flake8\b|mypy\b|pyright\b|pytest\b|jest\b|vitest\b|phpunit\b|rspec\b|node\s+--(check|test)\b|go\s+(build|test|vet)\b|cargo\s+(build|test|check|clippy)\b|make\b|mvn\b|gradle\b|python3?\s+-m\s+(pytest|unittest|mypy|py_compile)\b)/i;
-export function looksLikeVerification(command) {
-  return String(command || '').split(/&&|\|\||;|\n/).some(seg => VERIFY_RE.test(seg.trim()));
-}
-export function buildVerifyNudge(verifyRan) {
-  if (verifyRan) {
-    return '[automated check] Your last build/test/typecheck did not pass. Fix the errors and re-run it — do not finish with a failing check.';
-  }
-  return "[automated check] You edited files but haven't verified the result works. Before finishing, run the project's build, typecheck, or tests " +
-    '(e.g. `npm run build`, `npx tsc --noEmit`, or the test command) and fix any errors. Do not report the task complete until a check passes. ' +
-    'If it can only be exercised by a long-running server (e.g. `npm run dev`) that cannot finish here, say so explicitly and explain how you otherwise confirmed the change works.';
-}
-const VERIFY_MAX = 2; // gate fires at most twice per turn (initial + one fix cycle)
 
 let model      = null;
 let session    = null;
@@ -175,6 +113,33 @@ function readCoalescedPrompt(rl, promptStr, { flushMs = 40 } = {}) {
     rl.setPrompt(promptStr);
     rl.prompt();
   });
+}
+
+/** Value following a flag on argv, or null when the flag is absent/bare. */
+function flagValue(flag, argv = process.argv) {
+  const i = argv.indexOf(flag);
+  return i !== -1 && argv[i + 1] && !argv[i + 1].startsWith('-') ? argv[i + 1] : null;
+}
+
+/** Most recently updated saved session — what `--continue` reattaches to. */
+async function loadLatestSession() {
+  const all = await listSessions();
+  if (!all.length) throw new Error('no saved sessions to continue');
+  return loadSession(all[0].id);
+}
+
+/**
+ * One prompt, one answer, exit — `claudette -p "…"`. Runs the same agent as the
+ * REPL (tools, permissions via auto-approve, trace, usage log), then flushes.
+ * Exits non-zero when the turn failed, so a script can branch on it.
+ */
+async function runHeadless(prompt) {
+  const rl = { pause() {}, resume() {}, async question() { return 'n'; } };
+  await handleMessage(prompt, rl);
+  await flushSessionSave(session);
+  await flushTranscripts();
+  const last = session.turns?.[session.turns.length - 1];
+  if (last?.status === 'failed') exit(1);
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -237,8 +202,38 @@ export async function start() {
     }
   }
 
-  // Create fresh session
-  session = await createSession({ model, cwd: workspace });
+  // --resume <id> / --continue: pick up an existing conversation instead of
+  // starting cold. `/resume` already existed inside the REPL, but reattaching
+  // meant launching, reading /sessions, and typing the id every time.
+  const resumeArg = flagValue('--resume');
+  const wantsContinue = process.argv.includes('--continue') || process.argv.includes('-c');
+  session = null;
+  if (resumeArg || wantsContinue) {
+    try {
+      session = resumeArg ? await loadSession(resumeArg) : await loadLatestSession();
+      model = modelArg ?? session.model ?? model;
+      workspace = session.cwd ?? workspace;
+      if (!jsonIpc) ui.printInfo(`Resumed ${session.id.slice(0, 8)} — ${session.title} (${session.messages.length} messages)`);
+    } catch (err) {
+      ui.printError(`Could not resume: ${err.message}`);
+      exit(1);
+    }
+  }
+  session ??= await createSession({ model, cwd: workspace });
+
+  // -p / --print: one prompt, one answer, exit. The headless entry point every
+  // script and CI job wants; --json-ipc is the structured sibling.
+  const wantsPrint = process.argv.includes('-p') || process.argv.includes('--print');
+  if (wantsPrint) {
+    const printPrompt = flagValue('-p') ?? flagValue('--print');
+    if (!printPrompt) {
+      // Silently dropping into the REPL here would hang a script forever.
+      ui.printError('-p / --print needs a prompt, e.g. claudette -p "why does the build fail?"');
+      exit(2);
+    }
+    await runHeadless(printPrompt);
+    return;
+  }
 
   if (!jsonIpc) ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
 
@@ -258,18 +253,31 @@ export async function start() {
   // Seed readline with this directory's prior-session prompts so up-arrow recalls
   // them like a normal shell (newest-first, per the readline contract).
   const history = jsonIpc ? [] : await loadHistory(workspace);
-  const rl = readline.createInterface({ input: stdin, output: stdout, terminal: !jsonIpc, history, historySize: 1000 });
+  const rl = readline.createInterface({
+    input: stdin, output: stdout, terminal: !jsonIpc, history, historySize: 1000,
+    // Tab completes slash commands and @paths (never in IPC mode — that stream
+    // carries JSON, and a stray completion would corrupt it).
+    ...(jsonIpc ? {} : { completer: createCompleter(() => workspace) }),
+  });
   let rlClosed = false;
   rl.on('close', () => { rlClosed = true; });
+  // IPC drives a line protocol, so every line must be buffered: `rl.question()`
+  // listens only while awaited, which silently dropped prompts 2..N (and all of
+  // them when stdin is a file redirect that arrives in one burst).
+  const ipcLines = jsonIpc ? createLineQueue(rl) : null;
 
   // Main REPL loop
   while (true) {
-    if (rlClosed) break; // stdin reached EOF (Ctrl+D / piped input drained)
+    if (!jsonIpc && rlClosed) break; // stdin reached EOF (Ctrl+D / piped input drained)
+    // Don't advertise `ready` into a closed, drained stream — a driver would be
+    // told to send a prompt that can never arrive.
+    if (jsonIpc && ipcLines.closed && !ipcLines.pending) break;
     let line;
     try {
       if (jsonIpc) {
         console.log(JSON.stringify({ type: 'ready' }));
-        line = await rl.question(''); // structured line protocol — no coalescing
+        line = await ipcLines.next(); // structured line protocol — no coalescing
+        if (line === null) break;     // stdin closed and the buffer is drained
       } else {
         // Coalesce a pasted multi-line block into one prompt (idle prompt only).
         line = await readCoalescedPrompt(rl, '\x1b[35m\x1b[1m>\x1b[0m ');
@@ -321,6 +329,7 @@ export async function start() {
   }
 
   rl.close();
+  await flushTranscripts(); // transcript writes are throttled during a turn
   if (!jsonIpc) console.log('\n\x1b[90mGoodbye.\x1b[0m\n');
 }
 
@@ -350,9 +359,12 @@ async function maybeAutoCompact() {
   ui.printInfo(`Auto-compacting context (~${Math.round(tokens / 1000)}k tokens)…`);
   try {
     const summary = await summariseMessages(session.messages);
+    // Snapshot before the summary replaces the conversation — the transcript is
+    // regenerated from session.messages, so without this the original is gone.
+    const archive = await archiveMessages(session, 'autocompact');
     session.messages = [{ role: 'user', content: `[Conversation summary]: ${summary}` }];
     await flushSessionSave(session);
-    ui.printSuccess('Compacted older history into a summary.');
+    ui.printSuccess(`Compacted older history into a summary (full history kept at ${path.basename(archive)}).`);
     return true;
   } catch (err) {
     ui.printWarning(`Auto-compact skipped: ${err.message}`);
@@ -386,12 +398,6 @@ async function handleMessage(text, rl) {
   trace.event('files_expanded', { count: files.length, files });
 
   void scheduleSessionSave(session);
-
-  const exactCommand = extractExactBashCommand(expandedText);
-  if (exactCommand) {
-    await runExactBashShortcut(exactCommand, trace);
-    return;
-  }
 
   // Warn when context is getting large (below the auto-compact threshold).
   const approxTokens = estimateHistoryTokens(session.messages);
@@ -472,382 +478,247 @@ function handleTurnInputLine(line, input) {
   if (item) ui.printQueued(item, input.size);
 }
 
-async function runExactBashShortcut(command, trace = null) {
-  ui.printToolCall('bash', { command });
-  trace?.event('tool_call', { name: 'bash', preview: truncateLine(command, 200) });
-  try {
-    const output = await executeTool('bash', { command }, { cwd: workspace, workspace });
-    ui.printToolResult('bash', output);
-    trace?.event('tool_result', { name: 'bash', isError: false, chars: String(output).length });
-    const assistantMsg = 'Executed the exact bash command from the prompt.';
-    session.messages.push({ role: 'assistant', content: assistantMsg });
-    session.messages.push({ role: 'tool', content: output, name: 'bash' });
-    if (trace) {
-      trace.complete();
-      trace.event('assistant_completed', { chars: assistantMsg.length, ...trace.turn.metrics });
-    }
-    await flushSessionSave(session);
-  } catch (err) {
-    ui.printToolResult('bash', err.message, true);
-    trace?.event('tool_result', { name: 'bash', isError: true, chars: String(err.message).length });
-    session.messages.push({
-      role: 'tool',
-      content: `Exact-command shortcut failed: ${err.message}`,
-      name: 'bash',
-    });
-
-    const claudeMd = await loadClaudeMd(workspace);
-    const messages = [
-      { role: 'system', content: buildSystemPrompt(claudeMd, effort) },
-      ...session.messages,
-      {
-        role: 'user',
-        content: `The exact bash command from the prompt failed.\nCommand:\n${command}\n\nError:\n${err.message}\n\nInspect the relevant file(s), repair the issue, and verify the task.`,
-      },
-    ];
-    // Continue the same turn trace through the recovery loop.
-    await agentLoop(messages, nullReadline(), trace);
-  }
-}
-
-// Drain queued follow-ups into one steering user message and append it to the
-// live conversation + persisted history. Returns true when something was
-// delivered. Called only at safe boundaries (between model requests).
-async function deliverQueuedFollowUps(input, messages, trace) {
+// Take everything queued during the turn as one steering user message. Returns
+// null when the queue is empty. The runner appends and announces it; this only
+// builds it and reports it to the user.
+async function takeQueuedFollowUps(input, trace) {
   const items = input ? input.drain() : [];
-  if (!items.length) return false;
-  const msg = buildFollowUpMessage(items);
+  if (!items.length) return null;
   ui.printFollowUpDelivery(items);
-  messages.push(msg);
-  session.messages.push(msg);
   trace?.event('followup_delivered', { count: items.length });
-  await flushSessionSave(session);
-  return true;
+  return buildFollowUpMessage(items);
 }
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
+// Thin shell over runAgent(): the loop is in agent-runner.js, and everything
+// here is terminal, permission, and session wiring hung off its hooks.
 async function agentLoop(messages, rl, trace = null, input = null) {
-  const tools = toolsOn ? TOOL_DEFS : [];
-  let iteration = 0;
-  const MAX_ITERATIONS = resolveMaxIterations(); // runaway guard; configurable
-  // Per-turn read cache: short-circuits identical re-reads of unchanged files.
-  // Usage logs showed the agent re-reading the same files dozens of times in one
-  // turn (one file 23×; 69% of reads redundant), stalling progress and bloating
-  // context. Cleared each turn so a later turn always sees current files.
-  const readCache = new Map();
-  // Forces action when the model only reads and never edits (see createActNudger).
-  const nudger = createActNudger(resolveActNudge());
+  const maxIterations = resolveMaxIterations();
   if (!jsonIpc) ui.setUsageStatus(''); // reset the live token/cost readout for this turn
-  // Verification gate state (see resolveVerifyGate): did this turn edit files, and
-  // has a build/test/typecheck actually passed since?
-  const verifyGate = resolveVerifyGate();
-  let turnEdited = false, verifyRan = false, verifyOk = false, verifyNudges = 0;
 
-  while (iteration < MAX_ITERATIONS) {
-    iteration++;
-    if (jsonIpc) {
-      console.log(JSON.stringify({ type: 'turn', iteration }));
-    }
-    const label = iteration === 1 ? 'Thinking' : 'Working';
-    if (!jsonIpc) ui.startSpinner(label);
+  // Per-iteration terminal state.
+  let ctrlCHandler = null;
+  let streamStarted = false;
+  let mdStream = null;
 
-    const ac = new AbortController();
-    currentAC = ac;
-
-    // When the turn wrapper is capturing follow-ups (auto-approve TTY), it owns
-    // stdin and Ctrl+C for the whole turn. Otherwise do the per-iteration
-    // readline pause + raw Ctrl+C handling here (so Ctrl+C still cancels and
-    // permission prompts keep working).
-    let ctrlCHandler = null;
-    if (!input) {
-      // Pause readline so direct stdout.write() during streaming doesn't confuse it.
-      // Guarded: pause() throws "readline was closed" if stdin already hit EOF
-      // (piped one-shot use, e.g. the Harbor adapter) — the turn must still run.
-      try { rl.pause(); } catch { /* readline already closed (EOF) */ }
-      ctrlCHandler = (chunk) => {
-        if (chunk[0] === 0x03 && currentAC) {
-          currentAC.abort();
-          currentAC = null;
-          ui.stopSpinner();
-          stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
-        }
-      };
-      process.stdin.resume();
-      process.stdin.on('data', ctrlCHandler);
-    }
-
-    // Live streaming: stop spinner on first token, render deltas through the
-    // incremental markdown stream (line-buffered so formatting is correct).
-    let streamStarted = false;
-    let mdStream = null;
-    const onDelta = (delta) => {
-      if (jsonIpc) {
-        console.log(JSON.stringify({ type: 'delta', content: delta }));
-        return; // IPC mode emits only JSONL — no terminal rendering
+  const emit = async (type, data) => {
+    switch (type) {
+      case 'iteration_start': {
+        if (jsonIpc) console.log(JSON.stringify({ type: 'turn', iteration: data.iteration }));
+        else ui.startSpinner(data.iteration === 1 ? 'Thinking' : 'Working');
+        streamStarted = false;
+        mdStream = null;
+        break;
       }
-      if (!streamStarted) {
+
+      case 'request_start': {
+        currentAC = data.controller;
+        // When the turn wrapper is capturing follow-ups (auto-approve TTY), it
+        // owns stdin and Ctrl+C for the whole turn. Otherwise do the
+        // per-iteration readline pause + raw Ctrl+C handling here (so Ctrl+C
+        // still cancels and permission prompts keep working).
+        if (!input) {
+          // Guarded: pause() throws "readline was closed" if stdin already hit
+          // EOF (piped one-shot use, e.g. the Harbor adapter) — the turn must
+          // still run.
+          try { rl.pause(); } catch { /* readline already closed (EOF) */ }
+          ctrlCHandler = (chunk) => {
+            if (chunk[0] === 0x03 && currentAC) {
+              currentAC.abort();
+              currentAC = null;
+              ui.stopSpinner();
+              stdout.write(`\n\x1b[90m(cancelled)\x1b[0m\n`);
+            }
+          };
+          process.stdin.resume();
+          process.stdin.on('data', ctrlCHandler);
+        }
+        trace?.event('model_request_started', { model, iteration: data.iteration });
+        break;
+      }
+
+      case 'stream_started': {
+        if (jsonIpc) break;
         streamStarted = true;
-        trace?.event('assistant_stream_started', { iteration });
+        trace?.event('assistant_stream_started', { iteration: data.iteration });
         ui.stopSpinner();
         ui.printAssistantStart();
         // During capture, route streamed output through printAboveLive so it
         // never lands on the user's live input row.
         mdStream = ui.createMarkdownStream(input ? ui.printAboveLive : undefined);
+        break;
       }
-      mdStream.write(delta);
-    };
 
-
-    let result;
-    trace?.event('model_request_started', { model, iteration });
-    try {
-      result = await chatStream({
-        model,
-        // Collapse old tool outputs in the payload (not in stored history) so a
-        // long tool loop doesn't re-send every file read on every iteration.
-        messages: trimToolOutputs(messages),
-        tools,
-        signal: ac.signal,
-        onDelta,
-        ...(effort ? { effort } : {}),
-      });
-    } catch (err) {
-      if (!jsonIpc) ui.stopSpinner();
-      if (err.name === 'AbortError') {
-        trace?.event('assistant_aborted', { iteration });
-        trace?.cancel(); // record as 'cancelled', not 'failed' — keeps the dataset clean
-        await flushSessionSave(session);
-        return; // user cancelled
+      case 'request_end': {
+        if (ctrlCHandler) { process.stdin.removeListener('data', ctrlCHandler); ctrlCHandler = null; }
+        currentAC = null;
+        // Guard: stdin can hit EOF mid-turn (piped input), closing rl — resuming
+        // a closed readline throws and would crash the turn.
+        if (!input) { try { rl.resume(); } catch { /* readline already closed (EOF) */ } }
+        if (!jsonIpc && (data.error || !streamStarted)) ui.stopSpinner();
+        break;
       }
-      trace?.event('assistant_failed', { error: err.message, iteration });
-      trace?.fail();
-      await flushSessionSave(session);
-      if (jsonIpc) {
-        console.log(JSON.stringify({ type: 'error', error: err.message }));
-      } else {
-        ui.printError(explainStreamError(err, model));
-      }
-      return;
-    } finally {
-      if (ctrlCHandler) process.stdin.removeListener('data', ctrlCHandler);
-      currentAC = null;
-      // restore readline after streaming (turn wrapper owns it otherwise).
-      // Guard: stdin can hit EOF mid-turn (piped input), closing rl — resuming a
-      // closed readline throws "readline was closed" and would crash the turn.
-      if (!input) { try { rl.resume(); } catch { /* readline already closed (EOF) */ } }
-    }
 
-    if (!jsonIpc && !streamStarted) ui.stopSpinner();
-    trace?.addUsage({ promptTokens: result.promptTokens, completionTokens: result.completionTokens });
-    // Live token/cost readout on the next spinner frame (realtime, à la Claude Code).
-    if (!jsonIpc && trace) {
-      const m = trace.turn.metrics;
-      const cost = formatUsd(estimateCost(model, m));
-      ui.setUsageStatus(
-        `↑${formatTokens(m.promptTokens)} ↓${formatTokens(m.completionTokens)}` +
-        (cost ? ` · ${cost}` : '') + ` · iter ${iteration}/${MAX_ITERATIONS}`
-      );
-    }
-
-    // ── Merge text-parsed tool calls with API tool calls ─────────────────────
-    // Some models (qwen2.5-coder) emit some calls via API and others as JSON
-    // text in the same response. We need both — text-parsed calls go first
-    // since they appear earlier in the output.
-    if (result.content) {
-      const textParsed = parseTextToolCalls(result.content);
-      if (textParsed.length) {
-        if (!result.toolCalls?.length) {
-          result.toolCalls = textParsed;
-        } else {
-          // Prepend text-parsed calls that aren't already covered by API calls
-          const apiKeys = new Set(result.toolCalls.map(c => JSON.stringify(c.function)));
-          const novel = textParsed.filter(c => !apiKeys.has(JSON.stringify(c.function)));
-          result.toolCalls = [...novel, ...result.toolCalls];
+      case 'usage': {
+        trace?.addUsage({ promptTokens: data.last?.promptTokens, completionTokens: data.last?.completionTokens });
+        // Live token/cost readout on the next spinner frame.
+        if (!jsonIpc && trace) {
+          const m = trace.turn.metrics;
+          const cost = formatUsd(estimateCost(model, m));
+          ui.setUsageStatus(
+            `↑${formatTokens(m.promptTokens)} ↓${formatTokens(m.completionTokens)}` +
+            (cost ? ` · ${cost}` : '') + ` · iter ${data.iteration}/${maxIterations}`
+          );
         }
+        break;
       }
-    }
 
-    // ── No tool calls → normal response, done ──────────────────────────────
-    if (!result.toolCalls?.length) {
-      if (!jsonIpc) {
-        if (!streamStarted && result.content) {
-          // Nothing was streamed (e.g. empty onDelta path) — render with markdown
+      // Every message the runner appends is mirrored into persisted history —
+      // the SAME object, so later in-place edits (the act nudge appends to the
+      // last tool result) land in both.
+      case 'message': session.messages.push(data.message); break;
+
+      case 'assistant_text': {
+        if (jsonIpc) {
+          console.log(JSON.stringify({
+            type: 'assistant',
+            content: data.content ?? '',
+            ...(data.toolCalls ? { toolCalls: data.toolCalls } : {}),
+          }));
+          break;
+        }
+        if (!streamStarted && data.content) {
+          // Nothing streamed (e.g. a cache replay) — render it with markdown.
           ui.printAssistantStart();
-          ui.printAssistantMessage(result.content);
+          ui.printAssistantMessage(data.content);
+          if (!data.final) stdout.write('\n');
         } else if (streamStarted) {
-          mdStream.end(); // flush a trailing partial line
+          mdStream.end();       // flush a trailing partial line
           stdout.write('\n');
         }
-        // Prefer the turn's accumulated usage (across tool iterations) for the
-        // cost meter; fall back to this single response when there's no trace.
-        const turnUsage = trace
-          ? trace.turn.metrics
-          : { promptTokens: result.promptTokens ?? 0, completionTokens: result.completionTokens ?? 0 };
-        ui.printAssistantEnd({
-          model,
-          tokens: (turnUsage.promptTokens ?? 0) + (turnUsage.completionTokens ?? 0) || null,
-          costUsd: estimateCost(model, turnUsage),
-          sessionCostUsd: sessionCostUsd(),
-        });
+        break;
       }
-      session.messages.push({ role: 'assistant', content: result.content });
 
-      // Safe boundary: deliver follow-ups queued during this turn and keep the
-      // same agent loop alive instead of finishing.
-      if (await deliverQueuedFollowUps(input, messages, trace)) continue;
+      case 'tool_call': {
+        trace?.event('tool_call', { name: data.name, preview: truncateLine(JSON.stringify(data.args ?? {}), 200) });
+        if (jsonIpc) { console.log(JSON.stringify({ type: 'tool_call', name: data.name, arguments: data.args })); break; }
+        // The permission prompt renders the call itself — printing the normal
+        // tool-call line too showed the same call twice.
+        if (!needsApproval(data.name, data.args)) ui.printToolCall(data.name, data.args);
+        break;
+      }
 
-      // Verification gate: don't let a turn that edited files finish without a
-      // passing build/test/typecheck. (session.messages already has the assistant
-      // turn from above; the payload `messages` needs it before we continue.)
-      if (verifyGate && turnEdited && !verifyOk && verifyNudges < VERIFY_MAX) {
-        messages.push({ role: 'assistant', content: result.content ?? '' });
-        const note = { role: 'user', content: buildVerifyNudge(verifyRan) };
-        messages.push(note);
-        session.messages.push(note);
-        verifyNudges++;
-        trace?.event('verify_nudge', { verifyRan, attempt: verifyNudges });
+      case 'tool_denied': {
+        ui.printWarning('User denied permission for this operation.');
+        trace?.event('tool_denied', { name: data.name });
+        break;
+      }
+
+      case 'tool_result': {
+        if (jsonIpc) console.log(JSON.stringify({ type: 'tool_result', name: data.name, result: data.result, isError: data.isError }));
+        else ui.printToolResult(data.name, data.result, data.isError);
+        trace?.event('tool_result', { name: data.name, isError: data.isError, chars: data.result.length });
+        break;
+      }
+
+      case 'act_nudge': {
+        trace?.event('act_nudge', { streak: data.streak });
+        if (!jsonIpc) ui.printInfo(`Nudging the model to act (${data.streak} reads without an edit).`);
+        break;
+      }
+
+      case 'verify_nudge': {
+        trace?.event('verify_nudge', { verifyRan: data.verifyRan, attempt: data.attempt });
         if (!jsonIpc) ui.printInfo('Edits not verified — asking the model to build/typecheck/test before finishing.');
         await flushSessionSave(session);
-        continue;
+        break;
       }
 
-      if (trace) {
-        trace.complete();
-        trace.event('assistant_completed', { chars: (result.content ?? '').length, ...trace.turn.metrics });
+      case 'iteration_end': await flushSessionSave(session); break;
+
+      case 'cancelled': {
+        trace?.event('assistant_aborted', { iteration: data.iteration });
+        trace?.cancel(); // 'cancelled', not 'failed' — keeps the dataset clean
+        await flushSessionSave(session);
+        break;
       }
-      await flushSessionSave(session);
-      if (jsonIpc) {
-        console.log(JSON.stringify({ type: 'assistant', content: result.content }));
-        // Report the turn's accumulated usage (across tool iterations), matching
-        // the interactive cost meter; the last response alone under-counts.
-        const doneUsage = trace
-          ? trace.turn.metrics
-          : { promptTokens: result.promptTokens ?? 0, completionTokens: result.completionTokens ?? 0 };
-        console.log(JSON.stringify({
-          type: 'done',
-          tokens: (doneUsage.promptTokens ?? 0) + (doneUsage.completionTokens ?? 0),
-          promptTokens: doneUsage.promptTokens ?? 0,
-          completionTokens: doneUsage.completionTokens ?? 0,
-        }));
+
+      case 'failed': {
+        trace?.event('assistant_failed', { error: data.error.message, iteration: data.iteration });
+        trace?.fail();
+        await flushSessionSave(session);
+        if (jsonIpc) console.log(JSON.stringify({ type: 'error', error: data.error.message }));
+        else ui.printError(explainStreamError(data.error, model));
+        break;
       }
-      return;
+
+      case 'completed': {
+        if (!jsonIpc) {
+          // Footer goes here, not on the last assistant_text: a turn held open by
+          // the verify gate or a queued follow-up produces several assistant
+          // messages, and only the last one ends the turn.
+          const u = trace ? trace.turn.metrics : { promptTokens: 0, completionTokens: 0 };
+          ui.printAssistantEnd({
+            model,
+            tokens: (u.promptTokens ?? 0) + (u.completionTokens ?? 0) || null,
+            costUsd: estimateCost(model, u),
+            sessionCostUsd: sessionCostUsd(),
+          });
+        }
+        if (trace) {
+          trace.complete();
+          trace.event('assistant_completed', { chars: (data.content ?? '').length, ...trace.turn.metrics });
+        }
+        await flushSessionSave(session);
+        if (jsonIpc) {
+          // Report the turn's accumulated usage (across tool iterations),
+          // matching the interactive cost meter; the last response under-counts.
+          const u = trace ? trace.turn.metrics : { promptTokens: 0, completionTokens: 0 };
+          console.log(JSON.stringify({
+            type: 'done',
+            tokens: (u.promptTokens ?? 0) + (u.completionTokens ?? 0),
+            promptTokens: u.promptTokens ?? 0,
+            completionTokens: u.completionTokens ?? 0,
+          }));
+        }
+        break;
+      }
+
+      case 'max_iterations': trace?.event('max_iterations', { iterations: data.iterations }); break;
     }
+  };
 
-    // ── Tool calls ─────────────────────────────────────────────────────────
-    if (!jsonIpc) {
-      if (!streamStarted && result.content) {
-        // Content wasn't streamed yet — render it before tool blocks
-        ui.printAssistantStart();
-        ui.printAssistantMessage(result.content);
-        stdout.write('\n');
-      } else if (streamStarted) {
-        mdStream.end(); // flush a trailing partial line
-        stdout.write('\n'); // newline after streamed text before tool blocks
-      }
-    }
-
-    // Record assistant turn with tool_calls
-    const assistantMsg = { role: 'assistant', content: result.content ?? '', tool_calls: result.toolCalls };
-    messages.push(assistantMsg);
-    session.messages.push(assistantMsg);
-    if (jsonIpc) {
-      console.log(JSON.stringify({ type: 'assistant', content: result.content ?? '', toolCalls: result.toolCalls }));
-    }
-
-    for (const call of result.toolCalls) {
-      const { name, arguments: rawArgs } = call.function;
-      let args;
+  const result = await runAgent({
+    model,
+    messages,
+    tools: toolsOn ? TOOL_DEFS : [],
+    toolContext: { cwd: workspace, workspace },
+    effort,
+    maxIterations,
+    emit,
+    onDelta: (delta) => {
+      if (jsonIpc) console.log(JSON.stringify({ type: 'delta', content: delta }));
+      else mdStream?.write(delta);
+    },
+    approve: (name, args) => checkPermission(name, args, rl),
+    takeFollowUps: () => takeQueuedFollowUps(input, trace),
+    // Don't silently die mid-task. In an interactive terminal, offer to keep
+    // going; a fresh iteration budget continues the same turn (and trace).
+    onMaxIterations: async ({ iterations }) => {
+      if (autoApprove || jsonIpc || !process.stdin.isTTY) return false;
+      let answer = '';
       try {
-        args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
-      } catch {
-        args = { raw: rawArgs };
-      }
+        answer = String(await rl.question(`\n\x1b[90m⚠ Hit ${iterations} tool iterations. Keep going? [y/N] \x1b[0m`)).trim().toLowerCase();
+      } catch { /* no usable input — fall through to stop */ }
+      return answer === 'y' || answer === 'yes';
+    },
+  });
 
-      trace?.event('tool_call', { name, preview: truncateLine(JSON.stringify(args ?? {}), 200) });
-      if (jsonIpc) {
-        console.log(JSON.stringify({ type: 'tool_call', name, arguments: args }));
-      }
-
-      // The permission prompt renders the call itself — printing the normal
-      // tool-call line too showed the same call twice.
-      if (!jsonIpc && !needsApproval(name, args)) ui.printToolCall(name, args);
-
-      // Permission check
-      const allowed = await checkPermission(name, args, rl);
-      if (!allowed) {
-        const denied = 'User denied permission for this operation.';
-        ui.printWarning(denied);
-        trace?.event('tool_denied', { name });
-        const deniedMsg = { role: 'tool', content: denied, ...(call.id ? { tool_call_id: call.id } : {}) };
-        messages.push(deniedMsg);
-        session.messages.push(deniedMsg);
-        continue;
-      }
-
-      // Execute
-      let toolResult;
-      let isError = false;
-      try {
-        toolResult = String(await executeTool(name, args, { cwd: workspace, workspace, readCache }));
-      } catch (err) {
-        toolResult = `Error: ${err.message}`;
-        isError = true;
-      }
-
-      if (jsonIpc) {
-        console.log(JSON.stringify({ type: 'tool_result', name, result: toolResult, isError }));
-      }
-      if (!jsonIpc) ui.printToolResult(name, toolResult, isError);
-      trace?.event('tool_result', { name, isError, chars: toolResult.length });
-
-      const resultMsg = { role: 'tool', content: toolResult, ...(call.id ? { tool_call_id: call.id } : {}) };
-
-      messages.push(resultMsg);
-      session.messages.push(resultMsg);
-      nudger.record(name, isError); // a failed action doesn't count as progress
-      // Verification-gate tracking: note successful edits, and whether a build/
-      // test/typecheck ran and passed (most-recent result wins).
-      if (!isError && (name === 'write_file' || name === 'str_replace' || name === 'patch_file')) turnEdited = true;
-      if (name === 'bash' && looksLikeVerification(args.command)) { verifyRan = true; verifyOk = !isError; }
-    }
-
-    // If the model has only been reading/searching for a while with no edits,
-    // append a forcing nudge to the last tool result (no new message → keeps the
-    // tool_call/tool_result pairing valid for every provider).
-    const nudge = nudger.takeNudge();
-    if (nudge) {
-      const last = messages[messages.length - 1];
-      const sLast = session.messages[session.messages.length - 1];
-      if (last && last.role === 'tool') last.content += `\n\n${nudge}`;
-      if (sLast && sLast.role === 'tool') sLast.content += `\n\n${nudge}`;
-      trace?.event('act_nudge', { streak: nudger.streak });
-      if (!jsonIpc) ui.printInfo(`Nudging the model to act (${nudger.streak} reads without an edit).`);
-    }
-
-    await flushSessionSave(session);
-    // Safe boundary: inject follow-ups queued during tool execution before the
-    // next model request, so they ride along with the tool results.
-    await deliverQueuedFollowUps(input, messages, trace);
-    // Loop continues → send tool results (+ any follow-up) back to model
+  if (result.status === 'max_iterations') {
+    if (trace) { trace.complete(); await flushSessionSave(session); }
+    ui.printWarning(`Reached ${result.iterations} tool iterations — stopping (runaway guard). Type a message to continue where it left off, or raise the limit with --max-iterations N (or CLAUDETTE_MAX_ITERATIONS).`);
   }
-
-  if (trace) trace.event('max_iterations', { iterations: MAX_ITERATIONS });
-
-  // Don't silently die mid-task. In an interactive terminal, offer to keep
-  // going; a fresh iteration budget continues the same turn (and trace).
-  // nullReadline (exact-bash fallback) answers 'n', so this can't hang.
-  if (!autoApprove && !jsonIpc && process.stdin.isTTY) {
-    let answer = '';
-    try {
-      answer = String(await rl.question(`\n\x1b[90m⚠ Hit ${MAX_ITERATIONS} tool iterations. Keep going? [y/N] \x1b[0m`)).trim().toLowerCase();
-    } catch { /* no usable input — fall through to stop */ }
-    if (answer === 'y' || answer === 'yes') {
-      return agentLoop(messages, rl, trace, input); // propagate capture across the continue
-    }
-  }
-
-  if (trace) { trace.complete(); await flushSessionSave(session); }
-  ui.printWarning(`Reached ${MAX_ITERATIONS} tool iterations — stopping (runaway guard). Type a message to continue where it left off, or raise the limit with --max-iterations N (or CLAUDETTE_MAX_ITERATIONS).`);
+  return result;
 }
 
 // ─── Session cost helpers ─────────────────────────────────────────────────────
@@ -876,16 +747,21 @@ function sessionCostUsd() {
 
 // ─── Permission check ─────────────────────────────────────────────────────────
 
+// Memory key for an approved call. Bash is scoped to the EXACT command: "always"
+// on `npm test` must not also authorise `rm -rf /` later in the session. Every
+// other tool is coarse (the tool name), because its blast radius is already
+// bounded by the workspace guard.
+export function permissionKey(toolName, args = {}) {
+  return toolName === 'bash' ? `bash:${String(args.command ?? '').trim()}` : toolName;
+}
+
 // True when checkPermission would prompt the user (the prompt renders its own
 // tool-call header, so the caller must not print one too).
 function needsApproval(toolName, args) {
   // Read-only ops always allowed
   if (['read_file', 'list_dir', 'glob', 'grep', 'search_code', 'fetch_url'].includes(toolName)) return false;
   if (autoApprove) return false;
-
-  const key = toolName === 'bash' ? `bash:${args.command}` : toolName;
-  if (alwaysAllow.has(key) || alwaysAllow.has(toolName)) return false;
-  return true;
+  return !alwaysAllow.has(permissionKey(toolName, args));
 }
 
 async function checkPermission(toolName, args, rl) {
@@ -894,11 +770,12 @@ async function checkPermission(toolName, args, rl) {
   const detail = toolName === 'bash' ? args.command : JSON.stringify(args, null, 2);
   ui.printPermissionPrompt(toolName, detail);
 
-  const raw = await rl.question(`  \x1b[90m[\x1b[0my\x1b[90m/\x1b[0mn\x1b[90m/\x1b[0ma\x1b[90m]\x1b[0m `);
+  const always = toolName === 'bash' ? 'a=always (this exact command)' : `a=always (${toolName})`;
+  const raw = await rl.question(`  \x1b[90m[\x1b[0my\x1b[90m/\x1b[0mn\x1b[90m/\x1b[0ma\x1b[90m] ${always}\x1b[0m `);
   const a = raw.trim().toLowerCase();
 
   if (a === 'always' || a === 'a') {
-    alwaysAllow.add(toolName); // allow all future calls to this tool type
+    alwaysAllow.add(permissionKey(toolName, args));
     return true;
   }
   return a === 'y' || a === 'yes';
@@ -943,6 +820,7 @@ async function handleCommand(line, rl) {
         ['/review',          'Review staged changes'],
 
         ['Info'],
+        ['Tab',              'Complete slash commands and @paths'],
         ['/cost',            'Estimate token usage for this session'],
         ['/queue',           'List follow-ups queued while the agent works (type while it runs); /queue clear'],
         ['/vim',             'Toggle vim mode indicator'],
@@ -1064,9 +942,10 @@ async function handleCommand(line, rl) {
       ui.printInfo('Compacting…');
       try {
         const summary = await summariseMessages(session.messages);
+        const archive = await archiveMessages(session, 'compact');
         session.messages = [{ role: 'user', content: `[Conversation summary]: ${summary}` }];
         await flushSessionSave(session);
-        ui.printSuccess('Compacted — history replaced with summary.');
+        ui.printSuccess(`Compacted — history replaced with summary (full history kept at ${path.basename(archive)}).`);
       } catch (err) {
         ui.printError(`Compact failed: ${err.message}`);
       }
@@ -1186,202 +1065,7 @@ async function handleCommand(line, rl) {
   }
 }
 
-// ─── Text-based tool call parser (fallback for models that don't use the API) ─
-// Handles models like llama3.2 that output tool calls as JSON text content.
-const TOOL_ALIASES = {
-  // bash aliases
-  run: 'bash', execute: 'bash', shell: 'bash', cmd: 'bash', command: 'bash', bash_cmd: 'bash',
-  run_bash: 'bash', run_command: 'bash', run_shell: 'bash',
-  // read aliases
-  read: 'read_file', cat: 'read_file', open: 'read_file', open_file: 'read_file', file_read: 'read_file',
-  // write aliases
-  write: 'write_file', create: 'write_file', create_file: 'write_file', file_write: 'write_file',
-  // str_replace aliases
-  edit: 'str_replace', replace: 'str_replace', modify: 'str_replace', patch: 'str_replace',
-  // glob aliases
-  list: 'glob', find: 'glob', find_files: 'glob', list_files: 'glob', search_files: 'glob',
-  // search aliases
-  search: 'search_code', grep: 'search_code', find_in_files: 'search_code', grep_files: 'search_code',
-};
-
-// Tools that are really interpreters — map to bash and prepend interpreter name
-const INTERPRETER_TOOLS = {
-  python3: 'python3', python: 'python3', node: 'node', ruby: 'ruby',
-  perl: 'perl', sh: 'sh', bash_run: 'bash',
-};
-
-function normalizeToolName(raw) {
-  const lower = raw.toLowerCase().replace(/[\s-]/g, '_');
-  if (TOOL_ALIASES[lower]) return TOOL_ALIASES[lower];
-  // Fuzzy: if any known tool name is a substring match
-  const known = ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'grep'];
-  for (const t of known) if (lower.includes(t.replace('_', '')) || lower.includes(t)) return t;
-  // Fuzzy against aliases keys
-  for (const [alias, tool] of Object.entries(TOOL_ALIASES)) {
-    if (lower.includes(alias)) return tool;
-  }
-  return raw; // return as-is if no match
-}
-
-// Canonical param names — keyed by tool so ambiguous shorthands (e.g. 's') resolve correctly
-const PARAM_ALIASES_BY_TOOL = {
-  read_file:  { p: 'path', f: 'path', fp: 'path', filepath: 'path', filename: 'path',
-                file: 'path', file_path: 'path', s: 'path', src: 'path', source: 'path' },
-  write_file: { p: 'path', f: 'path', fp: 'path', filepath: 'path', filename: 'path',
-                file: 'path', file_path: 'path', contents: 'content', text: 'content', data: 'content' },
-  str_replace: { p: 'path', f: 'path', filepath: 'path', file: 'path', file_path: 'path',
-                 old: 'old_str', old_string: 'old_str', original: 'old_str', search: 'old_str', s: 'old_str',
-                 new: 'new_str', new_string: 'new_str', replacement: 'new_str', replace: 'new_str', r: 'new_str' },
-  bash:       { cmd: 'command', shell_command: 'command', bash_command: 'command' },
-  glob:       { glob_pattern: 'pattern', file_pattern: 'pattern' },
-  grep:       { regex: 'pattern', query: 'pattern', dir: 'path', directory: 'path' },
-};
-// Fallback aliases applied when no tool-specific entry matches
-const PARAM_ALIASES_COMMON = {
-  p: 'path', f: 'path', filepath: 'path', filename: 'path', file_path: 'path',
-  glob_pattern: 'pattern', file_pattern: 'pattern',
-  regex: 'pattern', query: 'pattern', dir: 'path', directory: 'path',
-};
-
-function normalizeArgs(args, toolName) {
-  const toolTable = PARAM_ALIASES_BY_TOOL[toolName] ?? {};
-  const cleaned = {};
-  for (const [k, v] of Object.entries(args)) {
-    const key = k.toLowerCase();
-    const normKey = toolTable[key] ?? PARAM_ALIASES_COMMON[key] ?? k;
-    if (typeof v === 'string') {
-      // Fix single-element list-wrapped values: "['ls -la']" → "ls -la"
-      const listMatch = v.match(/^\[['"]([^'"]+)['"]\]$/);
-      if (listMatch) {
-        cleaned[normKey] = listMatch[1];
-      } else {
-        // Try to parse as JSON array and join with space: ['python3', 'file.py'] → 'python3 file.py'
-        try {
-          const parsed = JSON.parse(v.replace(/'/g, '"'));
-          if (Array.isArray(parsed) && parsed.every(x => typeof x === 'string')) {
-            cleaned[normKey] = parsed.join(' ');
-          } else {
-            cleaned[normKey] = v;
-          }
-        } catch {
-          cleaned[normKey] = v;
-        }
-      }
-    } else if (Array.isArray(v) && v.every(x => typeof x === 'string')) {
-      // Handle actual array values: join with space
-      cleaned[normKey] = v.join(' ');
-    } else {
-      cleaned[normKey] = v;
-    }
-  }
-  return cleaned;
-}
-
-// Escape literal control characters inside JSON string values so JSON.parse accepts them.
-// Models like qwen2.5-coder write multi-line file content with literal \n/\t in JSON strings.
-function sanitizeJsonControls(s) {
-  let inStr = false, esc = false, out = '';
-  for (const c of s) {
-    if (esc)              { esc = false; out += c; continue; }
-    if (c === '\\' && inStr) { esc = true; out += c; continue; }
-    if (c === '"')        { inStr = !inStr; out += c; continue; }
-    if (inStr) {
-      if      (c === '\n') { out += '\\n'; continue; }
-      else if (c === '\r') { out += '\\r'; continue; }
-      else if (c === '\t') { out += '\\t'; continue; }
-      else if (c === '\b') { out += '\\b'; continue; }
-      else if (c === '\f') { out += '\\f'; continue; }
-    }
-    out += c;
-  }
-  return out;
-}
-
-function extractJsonObjects(text) {
-  // Brace-counting extractor — handles any nesting depth, respects strings
-  const results = [];
-  let i = 0;
-  while (i < text.length) {
-    if (text[i] !== '{') { i++; continue; }
-    let depth = 0, inStr = false, esc = false, j = i;
-    while (j < text.length) {
-      const c = text[j];
-      if (esc)                          { esc = false; }
-      else if (c === '\\' && inStr)     { esc = true; }
-      else if (c === '"')               { inStr = !inStr; }
-      else if (!inStr && c === '{')     { depth++; }
-      else if (!inStr && c === '}')     { depth--; if (depth === 0) { results.push(text.slice(i, j + 1)); break; } }
-      j++;
-    }
-    i = j + 1;
-  }
-  return results;
-}
-
-function parseTextToolCalls(text) {
-  // Strip markdown code fences
-  const stripped = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, '$1').trim();
-
-  const calls = [];
-  // Try the whole text, then each individual JSON object found
-  const candidates = [stripped, ...extractJsonObjects(stripped)];
-
-  for (const candidate of candidates) {
-    try {
-      const obj = JSON.parse(sanitizeJsonControls(candidate));
-      const wrappedCalls = obj.tool_calls ?? obj.calls;
-      if (Array.isArray(wrappedCalls)) {
-        for (const wrapped of wrappedCalls) {
-          const inner = wrapped.function ?? wrapped.tool ?? wrapped;
-          if (typeof inner?.name !== 'string') continue;
-          const toolName = normalizeToolName(inner.name);
-          const rawArgs = inner.arguments ?? inner.parameters ?? inner.args ?? {};
-          const args = typeof rawArgs === 'object' && rawArgs !== null
-            ? normalizeArgs(rawArgs, toolName)
-            : rawArgs;
-          calls.push({ function: { name: toolName, arguments: args } });
-        }
-        continue;
-      }
-
-      // Must have a name field and arguments or parameters
-      if (typeof obj.name !== 'string') continue;
-      const rawArgs = obj.arguments ?? obj.parameters ?? obj.args ?? {};
-      if (typeof rawArgs !== 'object') continue;
-
-      // Check if this is an interpreter invocation (e.g. python3, node)
-      const lowerName = obj.name.toLowerCase();
-      const interp = INTERPRETER_TOOLS[lowerName];
-      if (interp) {
-        const fileArg = rawArgs.command ?? rawArgs.file ?? rawArgs.file_name ?? rawArgs.script ?? rawArgs.path ?? '';
-        calls.push({ function: { name: 'bash', arguments: { command: `${interp} ${fileArg}`.trim() } } });
-        continue;
-      }
-
-      const toolName = normalizeToolName(obj.name);
-      const args = normalizeArgs(rawArgs, toolName);
-      calls.push({ function: { name: toolName, arguments: args } });
-    } catch { /* keep trying */ }
-  }
-
-  // Deduplicate by stringified identity (whole-text parse can overlap with extracted objects)
-  const seen = new Set();
-  return calls.filter(c => {
-    const key = JSON.stringify(c);
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-function extractExactBashCommand(text) {
-  // Accept either a space or a newline after the colon: when the prompt is fed
-  // over stdin, readline splits on embedded newlines, so the command must be
-  // able to ride on the same line as the instruction.
-  const match = String(text ?? '').match(/Call bash with EXACTLY this command \(copy character-for-character, do not modify anything\):\s+([\s\S]+)/);
-  return match?.[1]?.trim() || null;
-}
 
 function buildSystemPrompt(claudeMd, effort) {
   const lines = [
@@ -1400,7 +1084,6 @@ function buildSystemPrompt(claudeMd, effort) {
     '- For large files, use read_file with offset and limit to read specific line ranges (e.g. {"path":"foo.js","offset":100,"limit":50}).',
     '- When asked about a directory or project, read README.md or key source files — do not invent descriptions.',
     '- Use list_dir for directory inspection and search_code for repo-wide searches when possible.',
-    '- If the prompt says to call bash with EXACTLY a given command, do that first without modifying the command.',
     '- Do not read or edit CLAUDE.md, PERSIST.md, or docs unless the prompt explicitly asks for those files.',
     '- Do not run git add, git commit, git push, or create branches unless the prompt explicitly asks for git actions.',
     '- If a tool call fails because a file is missing, use the filenames named in the prompt before trying unrelated files.',
@@ -1416,14 +1099,6 @@ function buildSystemPrompt(claudeMd, effort) {
     lines.push('', '--- Project Instructions ---', claudeMd);
   }
   return lines.join('\n');
-}
-
-function nullReadline() {
-  return {
-    pause() {},
-    resume() {},
-    async question() { return 'n'; },
-  };
 }
 
 /**
@@ -1461,7 +1136,6 @@ export function suggestCredentialFix(missing, env = process.env) {
 export { parseTextToolCalls };
 
 export const __test_parseTextToolCalls = parseTextToolCalls;
-export const __test_extractExactBashCommand = extractExactBashCommand;
 
 async function summariseMessages(messages) {
   const transcript = messages

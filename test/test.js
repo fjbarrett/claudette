@@ -13,6 +13,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +28,30 @@ async function makeTmpDir() {
 async function cleanDir(dir) {
   try { await fsp.rm(dir, { recursive: true, force: true }); } catch {}
 }
+
+// The live-provider suites used to hardcode `llama3.2:latest`. Nobody has that
+// installed, so 13 tests failed on every machine and got written off as
+// "environment-dependent" — they were unrunnable, not environmental. Ask Ollama
+// what it actually has; when it has nothing (or isn't running), the suites skip
+// with a reason instead of failing.
+const LIVE_MODEL = await (async function discoverLiveModel() {
+  const base = process.env.OLLAMA_BASE_URL ?? process.env.OLLAMA_HOST ?? 'http://127.0.0.1:11434';
+  try {
+    const res = await fetch(`${base}/api/tags`, { signal: AbortSignal.timeout(2000) });
+    if (!res.ok) return null;
+    const { models = [] } = await res.json();
+    // Prefer something that can drive a tool loop, and among those the smallest —
+    // these tests check that streaming and history work, not answer quality, and
+    // a 30B model turns a 20-second suite into a coffee break.
+    const bySize = [...models].sort((a, b) => (a.size ?? 0) - (b.size ?? 0));
+    const withTools = bySize.find(m => m.capabilities?.includes('tools'));
+    return (withTools ?? bySize[0])?.name ?? null;
+  } catch {
+    return null; // Ollama not running — the live suites skip
+  }
+})();
+
+const LIVE_SKIP = LIVE_MODEL ? false : 'no local Ollama model available (start Ollama or pull a model)';
 
 function httpGet(url) {
   return new Promise((resolve, reject) => {
@@ -1674,7 +1699,11 @@ describe('provider catalog (openrouter/google/xai/mistral/together/fireworks/coh
 
 describe('server.js HTTP API', async () => {
   let serverProcess;
-  const TEST_PORT = 14322;
+  // Was a hardcoded 14322, which made the whole suite fail if any earlier run
+  // left a server behind or a second run overlapped — the failure looked like a
+  // broken server rather than a busy port. The other server suites already
+  // allocate dynamically; this one now matches them.
+  const TEST_PORT = await getFreePort();
   const BASE = `http://127.0.0.1:${TEST_PORT}`;
 
   before(async () => {
@@ -1746,13 +1775,13 @@ describe('server.js HTTP API', async () => {
   test('POST /api/sessions creates a new session', async () => {
     const { status, body } = await httpPost(`${BASE}/api/sessions`, {
       title: 'Test Session',
-      model: 'llama3.2:latest',
+      model: LIVE_MODEL,
       cwd: ROOT,
     });
     assert.equal(status, 201);
     assert.ok(body.session.id, 'has id');
     assert.equal(body.session.title, 'Test Session');
-    assert.equal(body.session.model, 'llama3.2:latest');
+    assert.equal(body.session.model, LIVE_MODEL);
     // Cleanup
     try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${body.session.id}.json`)); } catch {}
   });
@@ -1826,14 +1855,14 @@ describe('server.js HTTP API', async () => {
     assert.equal(status, 404);
   });
 
-  test('POST /api/sessions/:id/messages streams response', async () => {
+  test('POST /api/sessions/:id/messages streams response', { skip: LIVE_SKIP }, async () => {
     // Create session first
-    const { body: created } = await httpPost(`${BASE}/api/sessions`, { model: 'llama3.2:latest' });
+    const { body: created } = await httpPost(`${BASE}/api/sessions`, { model: LIVE_MODEL });
     const sid = created.session.id;
 
     const { status, lines } = await httpPostStream(
       `${BASE}/api/sessions/${sid}/messages`,
-      { content: 'Reply with just the number 42.', model: 'llama3.2:latest' }
+      { content: 'Reply with just the number 42.', model: LIVE_MODEL }
     );
     assert.equal(status, 200);
 
@@ -1875,12 +1904,12 @@ describe('server.js HTTP API', async () => {
     try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${sid}.json`)); } catch {}
   });
 
-  test('POST /api/sessions/:id/messages uses @file expansion', async () => {
-    const { body: created } = await httpPost(`${BASE}/api/sessions`, { model: 'llama3.2:latest' });
+  test('POST /api/sessions/:id/messages uses @file expansion', { skip: LIVE_SKIP }, async () => {
+    const { body: created } = await httpPost(`${BASE}/api/sessions`, { model: LIVE_MODEL });
     const sid = created.session.id;
     const { lines } = await httpPostStream(
       `${BASE}/api/sessions/${sid}/messages`,
-      { content: 'Summarize @README.md in one word.', model: 'llama3.2:latest', cwd: ROOT }
+      { content: 'Summarize @README.md in one word.', model: LIVE_MODEL, cwd: ROOT }
     );
     const meta = lines.find(l => l.type === 'meta');
     assert.ok(meta?.expandedFiles?.length > 0, 'README.md was expanded');
@@ -1982,21 +2011,73 @@ describe('CLI (claudette.js)', async () => {
     assert.equal(calls[1]?.function?.arguments?.command, 'node --check src/chat.js');
   });
 
-  test('CLI extracts exact benchmark bash command verbatim', async () => {
-    const { __test_extractExactBashCommand } = await import('../src/chat.js');
-    const prompt = [
-      'Call bash with EXACTLY this command (copy character-for-character, do not modify anything):',
-      'node -e \'console.log("hi")\' && node --check src/chat.js',
-    ].join('\n');
-    assert.equal(
-      __test_extractExactBashCommand(prompt),
-      'node -e \'console.log("hi")\' && node --check src/chat.js'
-    );
+  // The exact-bash shortcut used to run any command that followed a magic
+  // sentence, straight from the prompt, with no permission check — and the
+  // prompt it scanned was the @file-EXPANDED one, so a file you merely asked it
+  // to summarise could execute shell. The extractor is gone; nothing may bring
+  // back a path from prompt text to executeTool that skips checkPermission.
+  test('no prompt-triggered bash bypass remains in chat.js', async () => {
+    const source = await fsp.readFile(path.join(ROOT, 'src', 'chat.js'), 'utf8');
+    assert.ok(!/EXACTLY this command/.test(source), 'magic-sentence extractor is gone');
+    assert.ok(!/extractExactBashCommand|runExactBashShortcut/.test(source), 'shortcut helpers are gone');
+    const chat = await import('../src/chat.js');
+    assert.equal(chat.__test_extractExactBashCommand, undefined, 'no test hook left behind');
   });
 
-  test('CLI exact benchmark bash extractor ignores normal prompts', async () => {
-    const { __test_extractExactBashCommand } = await import('../src/chat.js');
-    assert.equal(__test_extractExactBashCommand('Please inspect src/chat.js and fix /help.'), null);
+  test('permissionKey scopes bash approval to the exact command', async () => {
+    const { permissionKey } = await import('../src/chat.js');
+    // "always" on one command must not authorise a different one.
+    assert.equal(permissionKey('bash', { command: 'npm test' }), 'bash:npm test');
+    assert.notEqual(
+      permissionKey('bash', { command: 'npm test' }),
+      permissionKey('bash', { command: 'rm -rf /' }),
+    );
+    assert.equal(permissionKey('bash', { command: '  npm test  ' }), 'bash:npm test', 'whitespace normalised');
+    assert.equal(permissionKey('bash', {}), 'bash:');
+    // Non-bash tools stay coarse — the workspace guard already bounds them.
+    assert.equal(permissionKey('write_file', { path: 'a.js' }), 'write_file');
+  });
+
+  test('dropOrphanToolMessages removes tool messages with no matching tool_calls', async () => {
+    const { dropOrphanToolMessages } = await import('../src/chat.js');
+    // The shape the removed shortcut persisted, which OpenAI/Azure reject with
+    // "messages with role 'tool' must be a response to a preceeding message
+    // with 'tool_calls'" — poisoning every later prompt in that session.
+    const poisoned = [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'Executed the exact bash command.' },
+      { role: 'tool', content: 'output', name: 'bash' },
+      { role: 'user', content: 'now what?' },
+    ];
+    assert.deepEqual(dropOrphanToolMessages(poisoned), [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'Executed the exact bash command.' },
+      { role: 'user', content: 'now what?' },
+    ]);
+  });
+
+  test('dropOrphanToolMessages keeps legitimate tool results untouched', async () => {
+    const { dropOrphanToolMessages } = await import('../src/chat.js');
+    const valid = [
+      { role: 'user', content: 'read it' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'a', function: { name: 'read_file', arguments: {} } }] },
+      { role: 'tool', content: 'file body', tool_call_id: 'a' },
+      { role: 'assistant', content: 'done' },
+    ];
+    assert.equal(dropOrphanToolMessages(valid), valid, 'unchanged array is returned by identity');
+  });
+
+  test('dropOrphanToolMessages keeps one result per parallel tool call', async () => {
+    const { dropOrphanToolMessages } = await import('../src/chat.js');
+    const parallel = [
+      { role: 'assistant', content: '', tool_calls: [{ id: 'a', function: {} }, { id: 'b', function: {} }] },
+      { role: 'tool', content: 'one', tool_call_id: 'a' },
+      { role: 'tool', content: 'two', tool_call_id: 'b' },
+      { role: 'tool', content: 'orphan third' },
+    ];
+    const out = dropOrphanToolMessages(parallel);
+    assert.equal(out.length, 3, 'the unmatched third result is dropped');
+    assert.equal(out.at(-1).content, 'two');
   });
 
   test('CLI /models lists available models', async () => {
@@ -2021,8 +2102,10 @@ describe('CLI (claudette.js)', async () => {
   });
 
   test('CLI /model <name> switches model', async () => {
-    const { stdout } = await runCliWithInput(['/model llama3.2:latest\n']);
-    assert.ok(stdout.includes('llama3.2'), 'shows new model');
+    // /model only records the name, so any string exercises it — no live model needed.
+    const target = LIVE_MODEL ?? 'llama3.2:latest';
+    const { stdout } = await runCliWithInput([`/model ${target}\n`]);
+    assert.ok(stdout.includes(target), `shows new model (${target})`);
   });
 
   test('CLI /tools toggles tool calling', async () => {
@@ -2102,7 +2185,7 @@ describe('CLI (claudette.js)', async () => {
 
   test('CLI sends a simple message and gets a response', async () => {
     const { stdout } = await runCliWithInput([
-      '/model llama3.2:latest\n',
+      `/model ${LIVE_MODEL}\n`,
       'Say only the word PONG\n'
     ], 45_000);
     assert.ok(stdout.length > 0, 'got response');
@@ -2341,6 +2424,39 @@ describe('CLI tool loop with mock Ollama', async () => {
     );
   });
 
+  // `claudette -p "…"` — the headless entry point a script or CI job uses.
+  function runHeadlessCli(prompt, extraArgs = []) {
+    return new Promise((resolve, reject) => {
+      const proc = spawn('node', ['claudette.js', '-p', prompt, '-y', '--cwd', tmpDir, '--model', 'mock-coder:latest', ...extraArgs], {
+        cwd: ROOT,
+        env: { ...process.env, OLLAMA_BASE_URL: mockBaseUrl },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let stdout = '', stderr = '';
+      proc.stdout.on('data', d => stdout += d);
+      proc.stderr.on('data', d => stderr += d);
+      proc.stdin.end();
+      const timer = setTimeout(() => { proc.kill('SIGTERM'); resolve({ stdout, stderr, code: null, timedOut: true }); }, 20_000);
+      proc.on('close', code => { clearTimeout(timer); resolve({ stdout, stderr, code, timedOut: false }); });
+      proc.on('error', reject);
+    });
+  }
+
+  test('-p runs one prompt, prints the answer, and exits 0', async () => {
+    const { stdout, code, timedOut } = await runHeadlessCli('inspect the file');
+    assert.equal(timedOut, false, 'headless exits on its own');
+    assert.equal(code, 0);
+    assert.match(stdout, /Final answer: saw alpha from file\./);
+  });
+
+  test('-p output is clean enough to pipe (no banner, spinner, or cost footer)', async () => {
+    const { stdout } = await runHeadlessCli('inspect the file');
+    assert.ok(!stdout.includes('◆ Claudette'), 'no banner');
+    assert.ok(!/Thinking…|Working…/.test(stdout), 'no spinner frames');
+    assert.ok(!stdout.includes('↳'), 'no model/token footer');
+    assert.ok(!/\x1b\[2K/.test(stdout), 'no line-clearing escapes');
+  });
+
   test('records a per-turn trace (session.turns[]) with events and metrics', async () => {
     const sessionsDir = path.join(ROOT, 'data', 'sessions');
     const before = new Set(await fsp.readdir(sessionsDir));
@@ -2459,156 +2575,70 @@ describe('cost & request tuning', async () => {
 
 // ─── chat.js parser tests (normalizeArgs fix for 's' alias) ──────────────────
 
-describe('chat.js: normalizeArgs per-tool alias fix', async () => {
-  // We test the fix by importing chat.js via a subprocess that exports the
-  // relevant parsed result. Since the functions are private, we exercise them
-  // through parseTextToolCalls indirectly by checking real CLI behavior.
-  // The key regression: {"name":"read_file","arguments":{"s":"README.md"}}
-  // should produce {path:"README.md"}, NOT {old_str:"README.md"}.
+describe('tool-call-parser: normalizeArgs per-tool alias table', async () => {
+  // These used to spawn a subprocess running an INLINED COPY of the alias tables,
+  // so a real bug in the parser could never fail them. They import the shipping
+  // function now.
+  const { normalizeArgs, parseTextToolCalls } = await import('../src/tool-call-parser.js');
 
-  // We can test this via the server's /api/expand which also goes through
-  // the same alias logic for the cli path. But the cleanest way is to spin
-  // up a Node.js child that runs the parser inline.
+  const cases = [
+    // read_file: 's' means "source path", NOT str_replace's "old string"
+    { tool: 'read_file', args: { s: 'CLAUDE.md' }, expect: { path: 'CLAUDE.md' } },
+    { tool: 'read_file', args: { f: 'foo.js' }, expect: { path: 'foo.js' } },
+    { tool: 'read_file', args: { path: 'bar.txt' }, expect: { path: 'bar.txt' } },
+    // str_replace: the same 's' means old_str here
+    { tool: 'str_replace', args: { path: 'f.txt', s: 'find_me', new: 'replace' }, expect: { path: 'f.txt', old_str: 'find_me', new_str: 'replace' } },
+    { tool: 'str_replace', args: { path: 'f.txt', old: 'x', new: 'y' }, expect: { path: 'f.txt', old_str: 'x', new_str: 'y' } },
+    // write_file: 'contents'/'text' → 'content'
+    { tool: 'write_file', args: { path: 'x.txt', contents: 'hello' }, expect: { path: 'x.txt', content: 'hello' } },
+    { tool: 'write_file', args: { path: 'x.txt', text: 'world' }, expect: { path: 'x.txt', content: 'world' } },
+    // bash: 'cmd' → 'command'
+    { tool: 'bash', args: { cmd: 'ls -la' }, expect: { command: 'ls -la' } },
+    // glob: no ambiguous remapping
+    { tool: 'glob', args: { pattern: '*.js' }, expect: { pattern: '*.js' } },
+    { tool: 'glob', args: { glob_pattern: '**/*.ts' }, expect: { pattern: '**/*.ts' } },
+    // grep: 'regex' → 'pattern', 'dir' → 'path'
+    { tool: 'grep', args: { regex: 'foo', dir: 'src' }, expect: { pattern: 'foo', path: 'src' } },
+  ];
 
-  const PARSER_SCRIPT = `
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
-
-// Inline the same alias tables + normalizeArgs from chat.js for unit-level testing
-const PARAM_ALIASES_BY_TOOL = {
-  read_file:  { p: 'path', f: 'path', fp: 'path', filepath: 'path', filename: 'path',
-                file: 'path', file_path: 'path', s: 'path', src: 'path', source: 'path' },
-  write_file: { p: 'path', f: 'path', fp: 'path', filepath: 'path', filename: 'path',
-                file: 'path', file_path: 'path', contents: 'content', text: 'content', data: 'content' },
-  str_replace: { p: 'path', f: 'path', filepath: 'path', file: 'path', file_path: 'path',
-                 old: 'old_str', old_string: 'old_str', original: 'old_str', search: 'old_str', s: 'old_str',
-                 new: 'new_str', new_string: 'new_str', replacement: 'new_str', replace: 'new_str', r: 'new_str' },
-  bash:       { cmd: 'command', shell_command: 'command', bash_command: 'command' },
-  glob:       { glob_pattern: 'pattern', file_pattern: 'pattern' },
-  grep:       { regex: 'pattern', query: 'pattern', dir: 'path', directory: 'path' },
-};
-const PARAM_ALIASES_COMMON = {
-  p: 'path', f: 'path', filepath: 'path', filename: 'path', file_path: 'path',
-  glob_pattern: 'pattern', file_pattern: 'pattern',
-  regex: 'pattern', query: 'pattern', dir: 'path', directory: 'path',
-};
-
-function normalizeArgs(args, toolName) {
-  const toolTable = PARAM_ALIASES_BY_TOOL[toolName] ?? {};
-  const cleaned = {};
-  for (const [k, v] of Object.entries(args)) {
-    const key = k.toLowerCase();
-    const normKey = toolTable[key] ?? PARAM_ALIASES_COMMON[key] ?? k;
-    cleaned[normKey] = v;
-  }
-  return cleaned;
-}
-
-const cases = [
-  // read_file: 's' should map to 'path'
-  { tool: 'read_file', args: { s: 'CLAUDE.md' }, expect: { path: 'CLAUDE.md' } },
-  { tool: 'read_file', args: { s: './src/chat.js' }, expect: { path: './src/chat.js' } },
-  { tool: 'read_file', args: { src: 'README.md' }, expect: { path: 'README.md' } },
-  { tool: 'read_file', args: { filename: 'foo.txt' }, expect: { path: 'foo.txt' } },
-  { tool: 'read_file', args: { path: 'bar.txt' }, expect: { path: 'bar.txt' } },
-  // str_replace: 's' should map to 'old_str'
-  { tool: 'str_replace', args: { path: 'f.txt', s: 'find_me', new: 'replace' }, expect: { path: 'f.txt', old_str: 'find_me', new_str: 'replace' } },
-  { tool: 'str_replace', args: { path: 'f.txt', old: 'x', new: 'y' }, expect: { path: 'f.txt', old_str: 'x', new_str: 'y' } },
-  // write_file: 'contents' → 'content'
-  { tool: 'write_file', args: { path: 'x.txt', contents: 'hello' }, expect: { path: 'x.txt', content: 'hello' } },
-  { tool: 'write_file', args: { path: 'x.txt', text: 'world' }, expect: { path: 'x.txt', content: 'world' } },
-  // bash: 'cmd' → 'command'
-  { tool: 'bash', args: { cmd: 'ls -la' }, expect: { command: 'ls -la' } },
-  // glob: no ambiguous remapping
-  { tool: 'glob', args: { pattern: '*.js' }, expect: { pattern: '*.js' } },
-  { tool: 'glob', args: { glob_pattern: '**/*.ts' }, expect: { pattern: '**/*.ts' } },
-  // grep: 'regex' → 'pattern'
-  { tool: 'grep', args: { regex: 'foo', dir: 'src' }, expect: { pattern: 'foo', path: 'src' } },
-];
-
-let pass = 0, fail = 0;
-for (const { tool, args, expect } of cases) {
-  const got = normalizeArgs(args, tool);
-  for (const [k, v] of Object.entries(expect)) {
-    if (got[k] !== v) {
-      console.error(\`FAIL: \${tool}(\${JSON.stringify(args)}) — expected \${k}=\${JSON.stringify(v)}, got \${JSON.stringify(got[k])}\`);
-      fail++;
-    } else {
-      pass++;
-    }
-  }
-}
-console.log(JSON.stringify({ pass, fail }));
-`;
-
-  function runScript(scriptContent) {
-    return new Promise((resolve, reject) => {
-      const tmpFile = path.join(os.tmpdir(), `parser-test-${randomUUID()}.mjs`);
-      fs.writeFileSync(tmpFile, scriptContent);
-      const proc = spawn('node', [tmpFile], { stdio: 'pipe' });
-      let out = '', err = '';
-      proc.stdout.on('data', d => out += d);
-      proc.stderr.on('data', d => err += d);
-      proc.on('close', code => {
-        try { fs.unlinkSync(tmpFile); } catch {}
-        try { resolve({ out, err, result: JSON.parse(out.trim().split('\n').at(-1)) }); }
-        catch { resolve({ out, err, result: null }); }
-      });
-      proc.on('error', reject);
+  for (const { tool, args, expect } of cases) {
+    test(`${tool}(${JSON.stringify(args)}) normalises correctly`, () => {
+      const got = normalizeArgs(args, tool);
+      for (const [k, v] of Object.entries(expect)) {
+        assert.equal(got[k], v, `${tool}: ${k}`);
+      }
     });
   }
 
-  test('normalizeArgs: tool-specific alias table', async () => {
-    const { result, err } = await runScript(PARSER_SCRIPT);
-    if (err.trim()) process.stderr.write('  parser script stderr: ' + err + '\n');
-    assert.ok(result, `parser script produced JSON output`);
-    assert.equal(result.fail, 0, `all alias cases pass (${result.pass} checks, ${result.fail} failures)`);
-    assert.ok(result.pass > 0, 'ran at least one check');
+  // The regression this table exists for: llama3.2 emitted {"s":"CLAUDE.md"} for a
+  // read, a shared alias table turned it into str_replace's old_str, and the run
+  // went sideways.
+  test('the ambiguous "s" resolves per tool, not globally', () => {
+    const read = normalizeArgs({ s: 'CLAUDE.md' }, 'read_file');
+    assert.equal(read.path, 'CLAUDE.md');
+    assert.equal(read.old_str, undefined, 'read_file never gets an old_str');
+
+    const edit = normalizeArgs({ path: 'f.txt', s: 'find', new: 'replace' }, 'str_replace');
+    assert.equal(edit.old_str, 'find');
+    assert.equal(edit.new_str, 'replace');
+    assert.equal(edit.path, 'f.txt');
   });
 
-  test('normalizeArgs: read_file s→path (regression for llama3.2 runaway)', async () => {
-    const script = `
-import path from 'node:path';
-const PARAM_ALIASES_BY_TOOL = { read_file: { s: 'path' }, str_replace: { s: 'old_str' } };
-const PARAM_ALIASES_COMMON = {};
-function normalizeArgs(args, toolName) {
-  const t = PARAM_ALIASES_BY_TOOL[toolName] ?? {};
-  const out = {};
-  for (const [k,v] of Object.entries(args)) { out[t[k.toLowerCase()] ?? k] = v; }
-  return out;
-}
-const r = normalizeArgs({s:'CLAUDE.md'}, 'read_file');
-console.log(JSON.stringify(r));
-assert(r.path === 'CLAUDE.md' && !r.old_str, 'read_file: s→path');
-function assert(cond, msg) { if (!cond) { console.error('FAIL: ' + msg); process.exit(1); } }
-`;
-    const { result, out } = await runScript(script);
-    const parsed = (() => { try { return JSON.parse(out.trim()); } catch { return null; } })();
-    assert.ok(parsed, 'script ran');
-    assert.equal(parsed.path, 'CLAUDE.md', 's mapped to path for read_file');
-    assert.equal(parsed.old_str, undefined, 's did NOT map to old_str for read_file');
+  test('unknown keys and unknown tools pass through untouched', () => {
+    assert.deepEqual(normalizeArgs({ weird: 1 }, 'read_file'), { weird: 1 });
+    assert.deepEqual(normalizeArgs({ p: 'a.js' }, 'no_such_tool'), { path: 'a.js' }, 'falls back to the common table');
   });
 
-  test('normalizeArgs: str_replace s→old_str preserved', async () => {
-    const script = `
-const PARAM_ALIASES_BY_TOOL = { str_replace: { s: 'old_str', old: 'old_str', new: 'new_str', r: 'new_str' } };
-const PARAM_ALIASES_COMMON = {};
-function normalizeArgs(args, toolName) {
-  const t = PARAM_ALIASES_BY_TOOL[toolName] ?? {};
-  const out = {};
-  for (const [k,v] of Object.entries(args)) { out[t[k.toLowerCase()] ?? k] = v; }
-  return out;
-}
-const r = normalizeArgs({path:'f.txt', s:'find', new:'replace'}, 'str_replace');
-console.log(JSON.stringify(r));
-`;
-    const { out } = await runScript(script);
-    const parsed = JSON.parse(out.trim());
-    assert.equal(parsed.old_str, 'find', 's→old_str for str_replace');
-    assert.equal(parsed.new_str, 'replace', 'new→new_str for str_replace');
-    assert.equal(parsed.path, 'f.txt', 'path preserved');
+  test('list-wrapped and array values collapse to a plain string', () => {
+    // Models write {"command": "['ls','-la']"} surprisingly often.
+    assert.equal(normalizeArgs({ cmd: "['ls -la']" }, 'bash').command, 'ls -la');
+    assert.equal(normalizeArgs({ cmd: ['python3', 'main.py'] }, 'bash').command, 'python3 main.py');
+  });
+
+  test('the same normalisation applies through parseTextToolCalls', () => {
+    const [call] = parseTextToolCalls('{"name":"read","arguments":{"s":"CLAUDE.md"}}');
+    assert.equal(call.function.name, 'read_file');
+    assert.equal(call.function.arguments.path, 'CLAUDE.md');
   });
 });
 
@@ -2852,6 +2882,49 @@ describe('src/input.js (follow-up queue)', async () => {
     assert.match(many.content, /\[Follow-up sent while you were working\]/, 'labeled as steering input');
     assert.match(many.content, /1\. first\n2\. second/, 'numbered, order preserved');
   });
+
+  // createLineQueue — readline drops lines emitted while nobody is awaiting
+  // question(). That is what made --json-ipc one-shot.
+  test('createLineQueue buffers lines that arrive before anyone asks', async () => {
+    const { createLineQueue } = await import('../src/input.js');
+    const emitter = new EventEmitter();
+    const q = createLineQueue(emitter);
+    emitter.emit('line', 'one');
+    emitter.emit('line', 'two');
+    assert.equal(q.pending, 2, 'both buffered with no reader attached');
+    assert.equal(await q.next(), 'one');
+    assert.equal(await q.next(), 'two');
+  });
+
+  test('createLineQueue resolves a waiting reader when the line arrives later', async () => {
+    const { createLineQueue } = await import('../src/input.js');
+    const emitter = new EventEmitter();
+    const q = createLineQueue(emitter);
+    const pending = q.next();
+    emitter.emit('line', 'later');
+    assert.equal(await pending, 'later');
+  });
+
+  test('createLineQueue drains the buffer before reporting EOF', async () => {
+    const { createLineQueue } = await import('../src/input.js');
+    const emitter = new EventEmitter();
+    const q = createLineQueue(emitter);
+    emitter.emit('line', 'buffered');
+    emitter.emit('close');
+    assert.equal(q.closed, true);
+    assert.equal(await q.next(), 'buffered', 'EOF does not discard queued input');
+    assert.equal(await q.next(), null, 'then null, not a rejection');
+    assert.equal(await q.next(), null, 'null is stable');
+  });
+
+  test('createLineQueue unblocks a waiting reader on close', async () => {
+    const { createLineQueue } = await import('../src/input.js');
+    const emitter = new EventEmitter();
+    const q = createLineQueue(emitter);
+    const pending = q.next();
+    emitter.emit('close');
+    assert.equal(await pending, null);
+  });
 });
 
 // ─── chat.js: effort + bypass settings ────────────────────────────────────────
@@ -3038,6 +3111,482 @@ describe('ui.js (markdown stream)', async () => {
     stream.write('hello\n');
     stream.end();
     assert.ok(!out().startsWith('\n'), 'no blank line between ◆ marker and first line');
+  });
+});
+
+// ─── src/agent-runner.js: the shared agent loop ───────────────────────────────
+// The loop the CLI, the eval harness, and (later) subagents all run. Driven here
+// by a scripted chatFn against a real sandbox, with no terminal involved — which
+// is the whole point of the extraction.
+
+describe('src/agent-runner.js (shared loop)', async () => {
+  const { runAgent, mergeToolCalls, dropOrphanToolMessages } = await import('../src/agent-runner.js');
+  const { TOOL_DEFS } = await import('../src/tools.js');
+
+  let sandbox;
+  before(async () => { sandbox = await makeTmpDir(); });
+  after(async () => { await cleanDir(sandbox); });
+
+  // Replays a fixed list of model responses, one per call.
+  function scripted(responses) {
+    let i = 0;
+    const seen = [];
+    const fn = async ({ messages }) => {
+      seen.push(messages);
+      const r = responses[Math.min(i++, responses.length - 1)];
+      return { content: '', toolCalls: null, promptTokens: 10, completionTokens: 2, ...r };
+    };
+    fn.seen = seen;
+    return fn;
+  }
+
+  test('runs a tool then finishes, reporting status and usage', async () => {
+    await fsp.writeFile(path.join(sandbox, 'note.txt'), 'hello runner\n', 'utf8');
+    const messages = [{ role: 'user', content: 'read note.txt' }];
+    const chatFn = scripted([
+      { toolCalls: [{ id: 't1', function: { name: 'read_file', arguments: { path: 'note.txt' } } }] },
+      { content: 'It says hello runner.' },
+    ]);
+
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS, chatFn,
+      toolContext: { cwd: sandbox, workspace: sandbox },
+    });
+
+    assert.equal(run.status, 'completed');
+    assert.equal(run.content, 'It says hello runner.');
+    assert.equal(run.iterations, 2);
+    assert.equal(run.usage.promptTokens, 20, 'usage accumulates across iterations');
+    assert.deepEqual(run.toolCalls.map(c => c.name), ['read_file']);
+    assert.ok(
+      messages.some(m => m.role === 'tool' && m.content.includes('hello runner')),
+      'the tool result lands in the message list',
+    );
+  });
+
+  test('emits every appended message by reference, so callers can mirror history', async () => {
+    const messages = [{ role: 'user', content: 'hi' }];
+    const mirrored = [];
+    const run = await runAgent({
+      model: 'mock', messages, chatFn: scripted([{ content: 'done' }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type, data) => { if (type === 'message') mirrored.push(data.message); },
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(mirrored.length, 1);
+    assert.equal(mirrored[0], messages.at(-1), 'same object, not a copy');
+  });
+
+  test('a denied tool call is reported to the model and execution is skipped', async () => {
+    const target = path.join(sandbox, 'guarded.txt');
+    await fsp.rm(target, { force: true });
+    const messages = [{ role: 'user', content: 'write it' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'guarded.txt', content: 'nope' } } }] },
+        { content: 'understood' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      approve: async () => false,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(fs.existsSync(target), false, 'denied write never touched the disk');
+    assert.match(messages.find(m => m.role === 'tool').content, /denied permission/i);
+  });
+
+  test('stops at the iteration cap and reports it', async () => {
+    const messages = [{ role: 'user', content: 'loop' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      // Never stops asking for a tool.
+      chatFn: scripted([{ toolCalls: [{ id: 'l', function: { name: 'list_dir', arguments: { path: '.' } } }] }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      maxIterations: 3,
+      actNudge: 0,
+    });
+    assert.equal(run.status, 'max_iterations');
+    assert.equal(run.iterations, 3);
+  });
+
+  test('onMaxIterations can grant a fresh budget without ending the turn', async () => {
+    const messages = [{ role: 'user', content: 'loop' }];
+    let granted = 0;
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([{ toolCalls: [{ id: 'l', function: { name: 'list_dir', arguments: { path: '.' } } }] }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      maxIterations: 2,
+      actNudge: 0,
+      onMaxIterations: async () => (granted++ === 0), // extend exactly once
+    });
+    assert.equal(granted, 2, 'asked again after the extended budget ran out');
+    assert.equal(run.iterations, 4, 'two budgets of two');
+    assert.equal(run.status, 'max_iterations');
+  });
+
+  test('queued follow-ups keep the turn alive past a would-be finish', async () => {
+    const messages = [{ role: 'user', content: 'first' }];
+    let handed = false;
+    const run = await runAgent({
+      model: 'mock', messages,
+      chatFn: scripted([{ content: 'all done' }, { content: 'and the follow-up too' }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      takeFollowUps: async () => {
+        if (handed) return null;
+        handed = true;
+        return { role: 'user', content: 'also do this' };
+      },
+    });
+    assert.equal(run.iterations, 2, 'the follow-up bought another model request');
+    assert.equal(run.content, 'and the follow-up too');
+    assert.ok(messages.some(m => m.role === 'user' && m.content === 'also do this'));
+  });
+
+  test('the verification gate blocks finishing after an unverified edit', async () => {
+    const messages = [{ role: 'user', content: 'edit it' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'verified.txt', content: 'x' } } }] },
+        { content: 'Done!' }, // tries to finish with no build/test run
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      verifyGate: true,
+    });
+    assert.ok(
+      messages.some(m => m.role === 'user' && /automated check/.test(m.content)),
+      'the model is pushed to verify before finishing',
+    );
+    assert.equal(run.status, 'completed');
+  });
+
+  test('the verification gate stays out of the way for a read-only turn', async () => {
+    const messages = [{ role: 'user', content: 'just look' }];
+    await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'r', function: { name: 'list_dir', arguments: { path: '.' } } }] },
+        { content: 'Looks fine.' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      verifyGate: true,
+    });
+    assert.ok(!messages.some(m => /automated check/.test(m.content ?? '')), 'nothing was edited, so nothing to verify');
+  });
+
+  test('a cancelled request ends the run as cancelled, not failed', async () => {
+    const messages = [{ role: 'user', content: 'go' }];
+    const run = await runAgent({
+      model: 'mock', messages,
+      chatFn: async () => { const e = new Error('aborted'); e.name = 'AbortError'; throw e; },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+    });
+    assert.equal(run.status, 'cancelled');
+  });
+
+  test('a provider error ends the run as failed', async () => {
+    const messages = [{ role: 'user', content: 'go' }];
+    const events = [];
+    const run = await runAgent({
+      model: 'mock', messages,
+      chatFn: async () => { throw new Error('provider exploded'); },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type) => events.push(type),
+    });
+    assert.equal(run.status, 'failed');
+    assert.ok(events.includes('failed'));
+  });
+
+  test('the payload is trimmed and orphan-free, while stored history is intact', async () => {
+    // An orphan `tool` message (what the removed exact-bash shortcut wrote) must
+    // never reach the provider, but must not be silently deleted from history.
+    const messages = [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'ran it' },
+      { role: 'tool', content: 'orphan output' },
+    ];
+    const chatFn = scripted([{ content: 'ok' }]);
+    await runAgent({
+      model: 'mock', messages, chatFn,
+      toolContext: { cwd: sandbox, workspace: sandbox },
+    });
+    const sent = chatFn.seen[0];
+    assert.ok(!sent.some(m => m.role === 'tool'), 'orphan stripped from the payload');
+    assert.ok(messages.some(m => m.role === 'tool'), 'but still present in stored history');
+  });
+
+  test('with tools disabled, tool-shaped text is treated as plain text', async () => {
+    // `/tools off` used to still execute text-emitted calls: the parser ran
+    // regardless of whether any tool was offered.
+    const messages = [{ role: 'user', content: 'no tools please' }];
+    const calls = [];
+    const run = await runAgent({
+      model: 'mock', messages, tools: [],
+      chatFn: scripted([{ content: '{"name":"bash","arguments":{"command":"echo nope"}}' }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type, data) => { if (type === 'tool_call') calls.push(data.name); },
+    });
+    assert.equal(run.status, 'completed');
+    assert.deepEqual(calls, [], 'nothing was executed');
+    assert.equal(run.iterations, 1);
+  });
+
+  test('mergeToolCalls keeps API calls and adds novel text-emitted ones', () => {
+    const api = [{ function: { name: 'bash', arguments: { command: 'ls' } } }];
+    // Same call in both channels → not duplicated.
+    const dupe = mergeToolCalls({ content: '{"name":"bash","arguments":{"command":"ls"}}', toolCalls: api });
+    assert.equal(dupe.length, 1);
+    // A different text call → prepended, since it appeared earlier in the output.
+    const merged = mergeToolCalls({ content: '{"name":"read_file","arguments":{"path":"a.js"}}', toolCalls: api });
+    assert.equal(merged.length, 2);
+    assert.equal(merged[0].function.name, 'read_file');
+  });
+
+  test('dropOrphanToolMessages is re-exported from chat.js unchanged', async () => {
+    const chat = await import('../src/chat.js');
+    assert.equal(chat.dropOrphanToolMessages, dropOrphanToolMessages);
+  });
+});
+
+// ─── src/retry.js: provider resilience ────────────────────────────────────────
+// One 429 used to kill an entire turn, and a hung provider hung forever.
+
+describe('src/retry.js (retry, backoff, stall)', async () => {
+  const {
+    isRetryable, retryAfterMs, backoffMs, withRetry, providerHttpError,
+    resolveMaxRetries, resolveStallTimeout, RETRYABLE_STATUS,
+  } = await import('../src/retry.js');
+
+  const headers = (obj) => ({ get: (k) => obj[k.toLowerCase()] ?? null });
+
+  test('providerHttpError carries status and Retry-After', () => {
+    const err = providerHttpError('OpenRouter', { status: 429, headers: headers({ 'retry-after': '3' }) }, 'slow down');
+    assert.equal(err.status, 429);
+    assert.equal(err.retryAfterMs, 3000);
+    assert.match(err.message, /OpenRouter chat \(429\): slow down/);
+  });
+
+  test('retryAfterMs parses seconds and HTTP-dates, ignores junk', () => {
+    assert.equal(retryAfterMs(headers({ 'retry-after': '2' })), 2000);
+    assert.equal(retryAfterMs(headers({})), null);
+    assert.equal(retryAfterMs(headers({ 'retry-after': 'nonsense' })), null);
+    const soon = new Date(Date.now() + 5000).toUTCString();
+    assert.ok(retryAfterMs(headers({ 'retry-after': soon })) > 3000);
+  });
+
+  test('isRetryable retries transient failures only', () => {
+    for (const status of RETRYABLE_STATUS) {
+      assert.equal(isRetryable(Object.assign(new Error('x'), { status })), true, `${status} retries`);
+    }
+    // A bad model slug, a missing key, or a malformed request must fail loudly
+    // on the first attempt rather than three times slower.
+    for (const status of [400, 401, 403, 404, 422]) {
+      assert.equal(isRetryable(Object.assign(new Error('x'), { status })), false, `${status} does not retry`);
+    }
+    assert.equal(isRetryable(Object.assign(new Error('gone'), { name: 'AbortError' })), false, 'user cancel is final');
+    assert.equal(isRetryable(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } })), true);
+    assert.equal(isRetryable(new Error('socket hang up')), true);
+    assert.equal(isRetryable(new Error('model_not_found')), false);
+  });
+
+  test('backoffMs grows, stays capped, and respects Retry-After', () => {
+    const full = { random: () => 1 }; // full jitter at its maximum
+    assert.equal(backoffMs(0, null, full), 500);
+    assert.equal(backoffMs(1, null, full), 1000);
+    assert.equal(backoffMs(9, null, full), 20_000, 'capped');
+    assert.equal(backoffMs(0, null, { random: () => 0 }), 0, 'jitter can go to zero');
+    assert.equal(backoffMs(0, { retryAfterMs: 9000 }, full), 9000, 'server hint wins when larger');
+  });
+
+  test('withRetry retries a transient failure and then succeeds', async () => {
+    let attempts = 0;
+    const slept = [];
+    const value = await withRetry(
+      async () => {
+        attempts++;
+        if (attempts < 3) throw Object.assign(new Error('rate limited'), { status: 429 });
+        return 'ok';
+      },
+      { sleep: async (ms) => { slept.push(ms); }, random: () => 1, maxRetries: 3 },
+    );
+    assert.equal(value, 'ok');
+    assert.equal(attempts, 3);
+    assert.deepEqual(slept, [500, 1000], 'backoff grew between attempts');
+  });
+
+  test('withRetry gives up after maxRetries and rethrows the last error', async () => {
+    let attempts = 0;
+    await assert.rejects(
+      withRetry(
+        async () => { attempts++; throw Object.assign(new Error('still down'), { status: 503 }); },
+        { sleep: async () => {}, maxRetries: 2 },
+      ),
+      /still down/,
+    );
+    assert.equal(attempts, 3, 'initial attempt plus two retries');
+  });
+
+  test('withRetry never retries once the caller vetoes', async () => {
+    // provider.js vetoes after bytes have streamed — replaying would print twice.
+    let attempts = 0;
+    await assert.rejects(
+      withRetry(
+        async () => { attempts++; throw Object.assign(new Error('429'), { status: 429 }); },
+        { sleep: async () => {}, canRetry: () => false },
+      ),
+      /429/,
+    );
+    assert.equal(attempts, 1);
+  });
+
+  test('withRetry stops when the caller aborts mid-backoff', async () => {
+    const ac = new AbortController();
+    let attempts = 0;
+    await assert.rejects(
+      withRetry(
+        async () => { attempts++; ac.abort(); throw Object.assign(new Error('502'), { status: 502 }); },
+        { sleep: async () => {}, signal: ac.signal },
+      ),
+      /502/,
+    );
+    assert.equal(attempts, 1, 'no retry after the user cancelled');
+  });
+
+  test('retry and stall settings read their env overrides', () => {
+    assert.equal(resolveMaxRetries({}), 2);
+    assert.equal(resolveMaxRetries({ CLAUDETTE_MAX_RETRIES: '0' }), 0);
+    assert.equal(resolveMaxRetries({ CLAUDETTE_MAX_RETRIES: 'nope' }), 2);
+    assert.equal(resolveStallTimeout({}), 300_000);
+    assert.equal(resolveStallTimeout({ CLAUDETTE_STALL_TIMEOUT: '0' }), 0, '0 disables the watchdog');
+  });
+
+  test('a stalled request surfaces as an actionable error, not an AbortError', async () => {
+    const { createStallGuard } = await import('../src/retry.js');
+    const guard = createStallGuard({ timeoutMs: 10, label: 'TestProvider' });
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(guard.signal.aborted, true, 'silence trips the watchdog');
+    // AbortError would be read by the agent loop as "the user pressed Ctrl+C",
+    // recording a real failure as a clean cancellation.
+    assert.throws(
+      () => guard.rethrow(Object.assign(new Error('aborted'), { name: 'AbortError' })),
+      (err) => err.name !== 'AbortError' && err.stall === true && /TestProvider sent nothing/.test(err.message),
+    );
+    guard.done();
+  });
+
+  test('activity keeps a slow-but-alive stream from tripping the watchdog', async () => {
+    const { createStallGuard } = await import('../src/retry.js');
+    const guard = createStallGuard({ timeoutMs: 60 });
+    for (let i = 0; i < 4; i++) {
+      await new Promise(r => setTimeout(r, 25));
+      guard.touch(); // a delta arrived
+    }
+    assert.equal(guard.signal.aborted, false, '100ms of steady output, 60ms watchdog');
+    guard.done();
+  });
+});
+
+// ─── src/completion.js: Tab completion ────────────────────────────────────────
+
+describe('src/completion.js (tab completion)', async () => {
+  const { completeSlashCommand, completeAtPath, SLASH_COMMANDS } = await import('../src/completion.js');
+
+  let dir;
+  before(async () => {
+    dir = await makeTmpDir();
+    await fsp.mkdir(path.join(dir, 'src'), { recursive: true });
+    await fsp.mkdir(path.join(dir, 'node_modules'), { recursive: true });
+    await fsp.writeFile(path.join(dir, 'src', 'chat.js'), '', 'utf8');
+    await fsp.writeFile(path.join(dir, 'src', 'chunk.js'), '', 'utf8');
+    await fsp.writeFile(path.join(dir, 'README.md'), '', 'utf8');
+    await fsp.writeFile(path.join(dir, '.hidden'), '', 'utf8');
+  });
+  after(async () => { await cleanDir(dir); });
+
+  test('completes a slash-command prefix', () => {
+    const [hits, partial] = completeSlashCommand('/mod');
+    assert.deepEqual(hits, ['/model', '/models']);
+    assert.equal(partial, '/mod');
+  });
+
+  test('offers every command for a bare slash, and none for prose', () => {
+    assert.deepEqual(completeSlashCommand('/')[0], SLASH_COMMANDS);
+    assert.equal(completeSlashCommand('fix the build'), null);
+    assert.equal(completeSlashCommand('/model gpt'), null, 'past the command word, stop completing');
+  });
+
+  test('completes @paths, marking directories', async () => {
+    const [hits] = await completeAtPath('look at @sr', dir);
+    assert.deepEqual(hits, ['src/']);
+    const [inner] = await completeAtPath('look at @src/ch', dir);
+    assert.deepEqual(inner, ['src/chat.js', 'src/chunk.js']);
+  });
+
+  test('@path completion hides dotfiles and node_modules until asked', async () => {
+    const [hits] = await completeAtPath('@', dir);
+    assert.ok(hits.includes('README.md'));
+    assert.ok(!hits.includes('node_modules/'), 'never worth completing');
+    assert.ok(!hits.some(h => h.startsWith('.')), 'hidden files stay hidden');
+    const [dots] = await completeAtPath('@.h', dir);
+    assert.deepEqual(dots, ['.hidden'], 'typing a dot opts in');
+  });
+
+  test('@path completion refuses to escape the workspace', async () => {
+    const [hits] = await completeAtPath('@../', dir);
+    assert.deepEqual(hits, [], 'same boundary @-expansion enforces');
+  });
+
+  test('completeAtPath ignores lines with no @token', async () => {
+    assert.equal(await completeAtPath('just a prompt', dir), null);
+  });
+});
+
+// ─── Durability: atomic writes + compaction archive ───────────────────────────
+
+describe('session durability (atomic writes, compaction archive)', async () => {
+  const { writeFileAtomic } = await import('../src/fs-atomic.js');
+  const { archiveMessages, ARCHIVE_DIR } = await import('../src/session.js');
+
+  let dir;
+  before(async () => { dir = await makeTmpDir(); });
+  after(async () => { await cleanDir(dir); });
+
+  test('writeFileAtomic publishes the whole file and leaves no temp behind', async () => {
+    const target = path.join(dir, 'nested', 'session.json');
+    await writeFileAtomic(target, '{"a":1}\n');
+    assert.equal(await fsp.readFile(target, 'utf8'), '{"a":1}\n');
+    const strays = (await fsp.readdir(path.dirname(target))).filter(f => f.endsWith('.tmp'));
+    assert.deepEqual(strays, [], 'temp file was renamed, not left');
+  });
+
+  test('writeFileAtomic overwrites in place', async () => {
+    const target = path.join(dir, 'twice.json');
+    await writeFileAtomic(target, 'first');
+    await writeFileAtomic(target, 'second');
+    assert.equal(await fsp.readFile(target, 'utf8'), 'second');
+  });
+
+  test('archiveMessages snapshots history before compaction destroys it', async () => {
+    const session = {
+      id: `test-${randomUUID()}`,
+      model: 'mock',
+      title: 'Doomed history',
+      messages: [{ role: 'user', content: 'keep me' }, { role: 'assistant', content: 'and me' }],
+    };
+    const file = await archiveMessages(session, 'compact');
+    try {
+      const saved = JSON.parse(await fsp.readFile(file, 'utf8'));
+      assert.deepEqual(saved.messages, session.messages);
+      assert.equal(saved.reason, 'compact');
+      assert.equal(saved.sessionId, session.id);
+      // Must not sit beside the sessions: listSessions() globs *.json there and
+      // loadSession() resolves short ids by prefix, so an archive would show up
+      // as a session and could be resumed instead of the real one.
+      assert.equal(path.dirname(file), ARCHIVE_DIR);
+    } finally {
+      await fsp.rm(file, { force: true });
+    }
   });
 });
 
@@ -3408,6 +3957,52 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
       'final assistant content is present',
     );
   });
+
+  // Regression: readline emits `line` events during a turn with nobody
+  // listening, so prompts written up-front (a pipe, a file redirect, any driver
+  // that doesn't wait for `ready`) were dropped. Two prompts must run two turns.
+  function drivePrebuffered(prompts, { timeout = 30_000 } = {}) {
+    return new Promise((resolve, reject) => {
+      const proc = spawn('node', ['claudette.js', '--json-ipc', '-y', '--cwd', tmpDir, '--model', 'mock-ipc:latest'], {
+        cwd: ROOT,
+        env: { ...process.env, OLLAMA_BASE_URL: mockBaseUrl },
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      let buffer = '';
+      const events = [];
+      proc.stdout.on('data', d => {
+        buffer += d.toString();
+        const parts = buffer.split('\n');
+        buffer = parts.pop();
+        for (const line of parts) {
+          const t = line.trim();
+          if (!t) continue;
+          try { events.push(JSON.parse(t)); } catch { /* non-JSON is asserted elsewhere */ }
+        }
+      });
+      // Everything up front, then EOF — no waiting for `ready`.
+      for (const text of prompts) proc.stdin.write(JSON.stringify({ type: 'prompt', text }) + '\n');
+      proc.stdin.end();
+
+      const timer = setTimeout(() => { proc.kill('SIGTERM'); resolve({ events, timedOut: true }); }, timeout);
+      proc.on('close', () => { clearTimeout(timer); resolve({ events, timedOut: false }); });
+      proc.on('error', reject);
+    });
+  }
+
+  test('runs every pre-buffered prompt, not just the first', async () => {
+    const { events, timedOut } = await drivePrebuffered(['inspect the file', 'inspect the file again']);
+    assert.equal(timedOut, false, 'exits cleanly at EOF');
+    const done = events.filter(e => e.type === 'done');
+    assert.equal(done.length, 2, `both prompts ran a turn (got ${done.length})`);
+    assert.equal(events.filter(e => e.type === 'ready').length, 2, 'ready advertised once per turn');
+  });
+
+  test('a single piped prompt still completes (Harbor adapter path)', async () => {
+    const { events, timedOut } = await drivePrebuffered(['inspect the file']);
+    assert.equal(timedOut, false, 'exits cleanly at EOF');
+    assert.equal(events.filter(e => e.type === 'done').length, 1);
+  });
 });
 
 // ─── Server streaming error path ──────────────────────────────────────────────
@@ -3454,7 +4049,7 @@ describe('server.js: stream error path', async () => {
   });
 
   test('POST /api/sessions/:id/messages ends with an error record when the provider is unreachable', async () => {
-    const { body: created } = await httpPost(`${base}/api/sessions`, { model: 'llama3.2:latest' });
+    const { body: created } = await httpPost(`${base}/api/sessions`, { model: LIVE_MODEL });
     const sid = created.session.id;
 
     let timer;
@@ -3464,7 +4059,7 @@ describe('server.js: stream error path', async () => {
     const { status, lines } = await Promise.race([
       httpPostStream(`${base}/api/sessions/${sid}/messages`, {
         content: 'Reply with just the number 42.',
-        model: 'llama3.2:latest',
+        model: LIVE_MODEL,
       }),
       guard,
     ]).finally(() => clearTimeout(timer));
@@ -3479,7 +4074,7 @@ describe('server.js: stream error path', async () => {
 
 // ─── Stress loop: Ollama integration ─────────────────────────────────────────
 
-describe('Stress: Ollama message stream', async () => {
+describe('Stress: Ollama message stream', { skip: LIVE_SKIP }, async () => {
   let testPort2;
   let base2;
   let serverProcess;
@@ -3545,15 +4140,15 @@ describe('Stress: Ollama message stream', async () => {
   let sessionId;
 
   before(async () => {
-    const { body } = await httpPost(`${base2}/api/sessions`, { model: 'llama3.2:latest' });
+    const { body } = await httpPost(`${base2}/api/sessions`, { model: LIVE_MODEL });
     sessionId = body.session.id;
   });
 
   for (const prompt of PROMPTS) {
-    test(`Stress: "${prompt.slice(0, 40)}"`, async () => {
+    test(`Stress: "${prompt.slice(0, 40)}"`, { skip: LIVE_SKIP }, async () => {
       const { status, lines } = await httpPostStream(
         `${base2}/api/sessions/${sessionId}/messages`,
-        { content: prompt, model: 'llama3.2:latest' }
+        { content: prompt, model: LIVE_MODEL }
       );
       assert.equal(status, 200, `HTTP 200 for: ${prompt}`);
       const deltas = lines.filter(l => l?.type === 'delta');
@@ -3563,17 +4158,17 @@ describe('Stress: Ollama message stream', async () => {
     });
   }
 
-  test('Stress: multi-turn conversation maintains history', async () => {
-    const { body: s } = await httpPost(`${base2}/api/sessions`, { model: 'llama3.2:latest' });
+  test('Stress: multi-turn conversation maintains history', { skip: LIVE_SKIP }, async () => {
+    const { body: s } = await httpPost(`${base2}/api/sessions`, { model: LIVE_MODEL });
     const sid = s.session.id;
 
     await httpPostStream(`${base2}/api/sessions/${sid}/messages`, {
       content: 'Hypothetical coding context: remember that the bug is in src/ollama.js and the failing test is test/test.js.',
-      model: 'llama3.2:latest',
+      model: LIVE_MODEL,
     });
     const { lines } = await httpPostStream(`${base2}/api/sessions/${sid}/messages`, {
       content: 'What file did I say contains the bug, and what file contains the failing test?',
-      model: 'llama3.2:latest',
+      model: LIVE_MODEL,
     });
     const response = lines.filter(l => l?.type === 'delta').map(l => l.content).join('');
     // The model may or may not remember perfectly, but it should respond
@@ -3584,7 +4179,7 @@ describe('Stress: Ollama message stream', async () => {
     try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${sid}.json`)); } catch {}
   });
 
-  test('Stress: concurrent requests', async () => {
+  test('Stress: concurrent requests', { skip: LIVE_SKIP }, async () => {
     const prompts = [
       'Hypothetical codegen: write a JavaScript helper that retries fetch twice.',
       'Hypothetical debugging: explain why a JSON.parse call may throw on partial streamed chunks.',
@@ -3592,10 +4187,10 @@ describe('Stress: Ollama message stream', async () => {
     ];
     const results = await Promise.all(
       prompts.map(async (p) => {
-        const { body: s } = await httpPost(`${base2}/api/sessions`, { model: 'llama3.2:latest' });
+        const { body: s } = await httpPost(`${base2}/api/sessions`, { model: LIVE_MODEL });
         const r = await httpPostStream(`${base2}/api/sessions/${s.session.id}/messages`, {
           content: p,
-          model: 'llama3.2:latest',
+          model: LIVE_MODEL,
         });
         try { await fsp.unlink(path.join(ROOT, 'data', 'sessions', `${s.session.id}.json`)); } catch {}
         return r;

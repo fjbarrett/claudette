@@ -41,9 +41,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chatStream, defaultCloudModels } from '../src/provider.js';
-import { TOOL_DEFS, executeTool } from '../src/tools.js';
-import { parseTextToolCalls } from '../src/chat.js';
-import { trimToolOutputs } from '../src/context.js';
+import { TOOL_DEFS } from '../src/tools.js';
+import { runAgent } from '../src/agent-runner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,65 +97,35 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
     ];
     const maxTurns = caseDef.maxTurns ?? 8;
 
-    for (let turn = 1; turn <= maxTurns; turn++) {
-      record.turns = turn;
-      const result = await chatFn({
-        model,
-        // Mirror the interactive agent loop: collapse old tool outputs in the
-        // payload (not in stored `messages`) so a long tool loop stops re-sending
-        // every file read. `trim:false` measures the un-trimmed baseline.
-        messages: trim ? trimToolOutputs(messages) : messages,
-        tools: TOOL_DEFS,
-        onDelta: () => {},
-      });
-
-      const inTok = result.promptTokens ?? 0;
-      record.promptTokens += inTok;
-      record.completionTokens += result.completionTokens ?? 0;
-      if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
-
-      // Merge text-emitted tool calls the same way the interactive CLI does.
-      let toolCalls = result.toolCalls ?? [];
-      if (result.content) {
-        const textParsed = parseTextToolCalls(result.content);
-        if (textParsed.length) {
-          const apiKeys = new Set(toolCalls.map(c => JSON.stringify(c.function)));
-          const novel = textParsed.filter(c => !apiKeys.has(JSON.stringify(c.function)));
-          toolCalls = [...novel, ...toolCalls];
+    // The same loop the CLI runs — that is the point. This harness used to carry
+    // its own copy, so it silently measured an agent without the re-read guard,
+    // the action nudge, or the verification gate.
+    const run = await runAgent({
+      model,
+      messages,
+      tools: TOOL_DEFS,
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      chatFn: trim
+        ? chatFn
+        // `--no-trim` measures the un-trimmed baseline: undo the runner's
+        // payload trimming by handing the provider the full message list.
+        : (opts => chatFn({ ...opts, messages })),
+      maxIterations: maxTurns,
+      emit: (type, data) => {
+        if (type === 'iteration_start') record.turns = data.iteration;
+        else if (type === 'usage') {
+          const inTok = data.last?.promptTokens ?? 0;
+          if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
+        } else if (type === 'tool_result') {
+          record.toolCalls.push({ name: data.name, args: data.args, isError: data.isError, output: truncate(data.result, 2000) });
         }
-      }
+      },
+    });
 
-      if (!toolCalls.length) {
-        record.finalText = result.content ?? '';
-        break;
-      }
-
-      messages.push({ role: 'assistant', content: result.content ?? '', tool_calls: toolCalls });
-
-      for (const call of toolCalls) {
-        const name = call.function?.name;
-        let args;
-        try {
-          args = typeof call.function?.arguments === 'string'
-            ? JSON.parse(call.function.arguments)
-            : (call.function?.arguments ?? {});
-        } catch {
-          args = { raw: call.function?.arguments };
-        }
-
-        let output;
-        let isError = false;
-        try {
-          output = String(await executeTool(name, args, { cwd: sandbox, workspace: sandbox }));
-        } catch (err) {
-          output = `Error: ${err.message}`;
-          isError = true;
-        }
-
-        record.toolCalls.push({ name, args, isError, output: truncate(output, 2000) });
-        messages.push({ role: 'tool', content: output, ...(call.id ? { tool_call_id: call.id } : {}) });
-      }
-    }
+    record.finalText = run.status === 'completed' ? run.content : '';
+    record.promptTokens = run.usage.promptTokens;
+    record.completionTokens = run.usage.completionTokens;
+    if (run.status === 'failed') throw new Error(`agent run failed after ${run.iterations} iterations`);
 
     const { pass, failures } = await evaluateExpectations(record, caseDef.expect ?? {}, sandbox);
     record.pass = pass;

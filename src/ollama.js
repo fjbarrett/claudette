@@ -1,5 +1,6 @@
 // Ollama API client — direct connection, no server proxy
 import { resolveOllamaBaseUrl } from './config.js';
+import { providerHttpError } from './retry.js';
 
 const BASE = resolveOllamaBaseUrl();
 
@@ -40,7 +41,7 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
       && res.status === 400
       && /does not support tools/i.test(txt);
     if (!unsupportedTools) {
-      throw new Error(`Ollama chat (${res.status}): ${txt}`);
+      throw providerHttpError('Ollama', res, txt);
     }
 
     toolMode = 'text';
@@ -51,7 +52,7 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
     });
     if (!res.ok) {
       const fallbackText = await res.text().catch(() => '');
-      throw new Error(`Ollama chat (${res.status}): ${fallbackText}`);
+      throw providerHttpError('Ollama', res, fallbackText);
     }
   }
 

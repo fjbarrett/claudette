@@ -7,6 +7,7 @@
 // and model list while sharing this wire protocol.
 
 import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
+import { providerHttpError } from './retry.js';
 
 const PREFIX = 'openai/';
 export const KEY_ENV = 'OPENAI_API_KEY';
@@ -119,7 +120,8 @@ export async function chatCompletionsStream({
 
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`${label} chat (${res.status}): ${txt}`);
+    // Carries .status + any Retry-After so provider.js can decide to retry.
+    throw providerHttpError(label, res, txt);
   }
 
   const result = await parseChatCompletionsSSE(res.body, onDelta);

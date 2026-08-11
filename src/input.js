@@ -153,6 +153,41 @@ export function createBurstReader({ flushMs = 40, onPrompt, setTimer = setTimeou
   };
 }
 
+// Buffer every line a readline interface emits, so none is lost while the caller
+// is busy. `rl.question()` only listens during the await; lines that arrive while
+// a turn is running (or that were already buffered when stdin is a pipe/file) are
+// emitted to nobody and dropped. That made `--json-ipc` a one-shot protocol: it
+// advertises `ready` each turn but only ever served the first prompt, and with
+// stdin redirected from a file it lost even that one.
+//
+// `next()` resolves with the next line, or null once the stream has closed and
+// the buffer is drained — so EOF is a value, not a rejection.
+export function createLineQueue(emitter, { lineEvent = 'line', closeEvent = 'close' } = {}) {
+  const lines = [];
+  let closed = false;
+  let waiter = null;
+  const settle = (value) => { const w = waiter; waiter = null; w(value); };
+
+  emitter.on(lineEvent, (l) => {
+    if (waiter) settle(String(l));
+    else lines.push(String(l));
+  });
+  emitter.once(closeEvent, () => {
+    closed = true;
+    if (waiter) settle(null);
+  });
+
+  return {
+    next() {
+      if (lines.length) return Promise.resolve(lines.shift());
+      if (closed) return Promise.resolve(null);
+      return new Promise(resolve => { waiter = resolve; });
+    },
+    get pending() { return lines.length; },
+    get closed() { return closed; },
+  };
+}
+
 // Combine drained follow-ups into a single steering user message, preserving
 // order. Returning one message (not several) avoids adjacent user turns and an
 // extra provider request per queued line.

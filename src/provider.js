@@ -16,6 +16,7 @@ import * as deepseek from './deepseek.js';
 import * as groq from './groq.js';
 import * as huggingface from './huggingface.js';
 import { catalogProviders } from './providers.js';
+import { withRetry, createStallGuard } from './retry.js';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -66,7 +67,7 @@ export async function getModels() {
 // model's response. stableStringify makes the digest independent of property
 // insertion order so equivalent requests from different call sites collide.
 export function getCacheKey(opts) {
-  const { signal, onDelta, onEvent, ...rest } = opts;
+  const { signal, onDelta, onEvent, onRetry, ...rest } = opts;
   return crypto.createHash('sha256')
     .update(`${CACHE_VERSION}\n${stableStringify(rest)}`)
     .digest('hex');
@@ -134,10 +135,53 @@ export async function chatStream(opts) {
   // For Ollama, strip an explicit `ollama/` prefix; cloud adapters strip their
   // own prefix internally.
   const model = provider === ollama ? normaliseOllama(opts.model) : opts.model;
-  const result = await provider.chatStream({ ...opts, model });
+
+  // Rate limits and transient 5xx used to kill the whole turn. Retry them with
+  // bounded backoff, but only while the response is still silent: once deltas
+  // have reached the terminal, replaying the call would print the answer twice.
+  let streamed = false;
+  const result = await withRetry(
+    async () => {
+      const guard = createStallGuard({ signal: opts.signal, label: provider.LABEL ?? 'Provider' });
+      try {
+        return await provider.chatStream({
+          ...opts,
+          model,
+          signal: guard.signal,
+          onDelta: (delta) => {
+            streamed = true;
+            guard.touch();
+            opts.onDelta?.(delta);
+          },
+        });
+      } catch (err) {
+        guard.rethrow(err); // stall → actionable error, never a bare AbortError
+      } finally {
+        guard.done();
+      }
+    },
+    {
+      signal: opts.signal,
+      canRetry: () => !streamed,
+      onRetry: (err, attempt, delay) => {
+        opts.onRetry?.({ error: err, attempt, delayMs: delay });
+        if (process.env.CLAUDETTE_QUIET_RETRIES !== '1') {
+          console.error(
+            `\x1b[33m⚠ ${provider.LABEL ?? 'provider'} request failed (${err.status ?? err.code ?? 'network'}), ` +
+            `retry ${attempt} in ${Math.round(delay / 1000)}s: ${truncate(err.message, 160)}\x1b[0m`
+          );
+        }
+      },
+    },
+  );
 
   if (cacheFile) await writeCache(cacheFile, result);
   return result;
+}
+
+function truncate(text, max) {
+  const s = String(text ?? '').replace(/\s+/g, ' ').trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
 

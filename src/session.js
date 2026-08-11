@@ -3,9 +3,11 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { saveTranscript } from './transcript.js';
+import { writeFileAtomic } from './fs-atomic.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const SESSIONS_DIR = path.join(__dirname, '..', 'data', 'sessions');
+export const ARCHIVE_DIR = path.join(SESSIONS_DIR, 'archive');
 const pendingWrites = new Map();
 const SAVE_DEBOUNCE_MS = 150;
 
@@ -162,8 +164,32 @@ function createPendingEntry(id) {
 
 async function commitSession(session) {
   const file = path.join(SESSIONS_DIR, `${session.id}.json`);
-  await fsp.writeFile(file, JSON.stringify(session, null, 2) + '\n', 'utf8');
+  await writeFileAtomic(file, JSON.stringify(session, null, 2) + '\n');
   await saveTranscript(session);
+}
+
+/**
+ * Snapshot the current messages beside the session before something destroys
+ * them. Compaction replaces the whole array with a summary, and the transcript
+ * is regenerated from the truncated array — so without this the original
+ * conversation is gone from both places. Returns the archive path.
+ */
+export async function archiveMessages(session, reason = 'compact') {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // A subdirectory, not a sibling: listSessions() globs *.json here, and
+  // loadSession() resolves short ids by prefix — an archive named
+  // `<id>.compact-….json` would show up as a session and could be resumed
+  // instead of the real one.
+  const file = path.join(ARCHIVE_DIR, `${session.id}.${reason}-${stamp}.json`);
+  await writeFileAtomic(file, JSON.stringify({
+    sessionId: session.id,
+    reason,
+    archivedAt: new Date().toISOString(),
+    model: session.model,
+    title: session.title,
+    messages: session.messages,
+  }, null, 2) + '\n');
+  return file;
 }
 
 async function flushMatchingSession(id) {
