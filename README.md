@@ -67,6 +67,75 @@ claudette --json-ipc                        # JSONL protocol on stdin/stdout
 `claudette -p "…" > answer.txt` gives you exactly the response. It exits non-zero
 when the turn fails, so a script can branch on it.
 
+## Use it from a script
+
+```bash
+npm install claudette      # or: npm link, from a clone
+```
+
+```js
+import { run, stream, createAgent } from 'claudette';
+
+// One turn, tools and all. `cwd` is a hard boundary — the agent cannot read
+// or write outside it.
+const { text, toolCalls, costUsd, status } = await run('fix the failing test', {
+  cwd: './my-project',
+  model: 'openrouter/openai/gpt-5-nano',   // or a bare Ollama id
+});
+
+// Watch it work.
+for await (const ev of stream('audit src/auth.js for injection risks')) {
+  if (ev.type === 'text') process.stdout.write(ev.text);
+  if (ev.type === 'tool_call') console.error('→', ev.name, ev.args);
+  if (ev.type === 'result') console.error('\ndone:', ev.status, ev.usage);
+}
+
+// Keep a conversation.
+const agent = createAgent({ cwd: './my-project' });
+await agent.send('what does src/index.js export?');
+await agent.send('add JSDoc to each of them');   // remembers the answer above
+```
+
+Useful options: `tools: false` for a plain completion, `approve: (name) => name !== 'bash'`
+to gate what it may run (default allows everything, since a script has nobody to ask),
+`signal` to cancel, `maxIterations`, `system` / `append` to shape the prompt, and
+`messages` to continue an earlier conversation.
+
+Lower-level pieces are exported too — `runAgent` (the loop, fully hookable),
+`executeTool`, `chatStream`, `getModels` — for building something else on top.
+TypeScript definitions ship in `index.d.ts`.
+
+## Benchmarks
+
+`bench/` is a private regression suite: worktree-isolated task runs, hard checks,
+an LLM judge, and a leaderboard.
+
+```bash
+npm run bench -- --task <id> --model <provider/model> --judge <provider/model>
+npm run bench:list
+npm run bench:leaderboard
+npm run eval -- --all --model <provider/model>   # fast in-process tool-usage evals
+```
+
+For comparable public numbers, claudette runs as a **Terminal-Bench 2.x agent**
+through Harbor:
+
+```bash
+uv venv .venv-harbor --python "$(command -v python3)"   # must be a native arm64/x86_64 python
+uv pip install -p .venv-harbor -e bench/harbor
+
+.venv-harbor/bin/harbor run -d terminal-bench@2.0 \
+  -a claudette_harbor:Claudette \
+  -m ollama/qwen3.6:35b-a3b-opencode \
+  --agent-kwarg version=main \
+  -i openssl-selfsigned-cert -o bench/runs/harbor -n 1
+```
+
+The adapter installs claudette into the task container from a GitHub tarball, so
+`version=` must name a pushed ref. A local `ollama/…` model works: the loopback
+URL is rewritten to `host.docker.internal` so the container can reach Ollama on
+the host, which makes benchmark runs free.
+
 ## Tests
 
 ```bash
