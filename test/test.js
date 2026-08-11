@@ -2886,7 +2886,7 @@ describe('src/usage.js (token-spend log)', async () => {
 // into one steering message at a safe boundary — never a second agent loop.
 
 describe('src/input.js (follow-up queue)', async () => {
-  const { InputController, buildFollowUpMessage, createInputAssembler, sanitizeUserInput, createBurstReader } = await import('../src/input.js');
+  const { InputController, buildFollowUpMessage, classifyApprovalAnswer, createInputAssembler, sanitizeUserInput, createBurstReader } = await import('../src/input.js');
 
   // ── Prompt sanitization (echoed tool-render glyphs leaking into input) ──
   test('sanitizeUserInput: cuts a single typed line at a leaked tool-render glyph', () => {
@@ -3008,6 +3008,70 @@ describe('src/input.js (follow-up queue)', async () => {
     assert.equal(q.list()[0].content, 'x', 'list returns copies, not live refs');
     assert.equal(q.clear(), 2, 'clear reports count');
     assert.equal(q.size, 0);
+  });
+
+  test('submit queues when no approval is pending', () => {
+    const q = new InputController();
+    const routed = q.submit('also update the README');
+    assert.equal(routed.kind, 'queued');
+    assert.equal(q.size, 1);
+    // 'y' is only an answer when something is asking; otherwise it is content.
+    assert.equal(q.submit('y').kind, 'queued', 'no prompt pending → y is just text');
+    assert.equal(q.submit('   ').kind, 'ignored', 'blank is neither');
+    assert.equal(q.size, 2);
+  });
+
+  test('submit answers a pending permission prompt without queueing it', async () => {
+    const q = new InputController();
+    const pending = q.awaitApproval();
+    assert.equal(q.mode, 'approval');
+    assert.ok(q.awaitingApproval);
+
+    const routed = q.submit('a');
+    assert.deepEqual(routed, { kind: 'approval', answer: 'a' });
+    assert.equal(await pending, 'a', 'the answer resolves the parked prompt');
+    assert.equal(q.size, 0, 'permission answers never enter the queue');
+    assert.equal(q.mode, 'working', 'back to working once answered');
+    assert.equal(q.awaitingApproval, false);
+  });
+
+  test('text typed at a permission prompt is queued and leaves it pending', async () => {
+    const q = new InputController();
+    let settled = null;
+    q.awaitApproval().then(v => { settled = v; });
+
+    const routed = q.submit('actually, skip the tests');
+    assert.equal(routed.kind, 'queued', 'non-answers steer instead of approving');
+    assert.equal(q.size, 1);
+    await new Promise(r => setImmediate(r));
+    assert.equal(settled, null, 'prompt still waiting for a real answer');
+    assert.equal(q.mode, 'approval', 'still in approval mode');
+
+    q.submit('yes');
+    assert.equal(await q.drain().length, 1, 'only the steering line was queued');
+    await new Promise(r => setImmediate(r));
+    assert.equal(settled, 'y', "'yes' normalises to y");
+  });
+
+  test('resolveApproval reports whether anything was waiting (interrupt path)', async () => {
+    const q = new InputController();
+    assert.equal(q.resolveApproval('n'), false, 'nothing pending → no-op');
+    const pending = q.awaitApproval();
+    assert.equal(q.resolveApproval('n'), true, 'settled the parked prompt');
+    assert.equal(await pending, 'n');
+    assert.equal(q.resolveApproval('n'), false, 'already settled → no double-resolve');
+  });
+
+  test('classifyApprovalAnswer accepts only the y/n/a vocabulary', () => {
+    assert.equal(classifyApprovalAnswer('Y'), 'y');
+    assert.equal(classifyApprovalAnswer(' yes '), 'y');
+    assert.equal(classifyApprovalAnswer('n'), 'n');
+    assert.equal(classifyApprovalAnswer('NO'), 'n');
+    assert.equal(classifyApprovalAnswer('always'), 'a');
+    assert.equal(classifyApprovalAnswer('a'), 'a');
+    for (const text of ['yeah', 'nope', 'y please', 'add tests', '']) {
+      assert.equal(classifyApprovalAnswer(text), null, `${JSON.stringify(text)} is not an answer`);
+    }
   });
 
   test('buildFollowUpMessage: null when empty, plain for one, numbered+labeled for many', () => {

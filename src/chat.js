@@ -22,7 +22,7 @@ import { parseTextToolCalls } from './tool-call-parser.js';
 import { runAgent, resolveMaxIterations } from './agent-runner.js';
 import { createTurnTrace, truncateLine } from './trace.js';
 import { estimateCost, formatUsd, formatTokens } from './cost.js';
-import { InputController, buildFollowUpMessage, createInputAssembler, sanitizeUserInput, createBurstReader, createLineQueue } from './input.js';
+import { InputController, buildFollowUpMessage, classifyApprovalAnswer, createInputAssembler, sanitizeUserInput, createBurstReader, createLineQueue } from './input.js';
 import { recordTurnUsage } from './usage.js';
 import { loadHistory, appendHistory } from './history.js';
 import { createCompleter } from './completion.js';
@@ -218,7 +218,10 @@ export async function start() {
     );
     exit(1);
   }
-  model = modelArg ?? process.env.OLLAMA_MODEL ?? pickDefaultModel(models);
+  // CLAUDETTE_MODEL sets the default for ANY provider. OLLAMA_MODEL did the same
+  // job under a misleading name — it happily defaulted you to a cloud model —
+  // so it stays supported but is no longer the one to reach for.
+  model = modelArg ?? process.env.CLAUDETTE_MODEL ?? process.env.OLLAMA_MODEL ?? pickDefaultModel(models);
 
   // Fail fast on an explicit --model whose provider has no key, instead of
   // showing the banner and only erroring at the first message. Auto-selected
@@ -449,11 +452,12 @@ async function handleMessage(text, rl) {
 }
 
 // Run one agent turn, capturing typed follow-ups into the session queue while it
-// works. Live capture is enabled only for an auto-approve TTY session: a normal
-// turn needs stdin for permission prompts, and --json-ipc has no terminal. The
-// queue drain inside agentLoop runs regardless, so it stays unit-testable.
+// works. Any TTY session captures: the raw-mode reader owns stdin for the whole
+// turn and feeds permission prompts too (see checkPermission), so steering no
+// longer requires --yolo. Only --json-ipc opts out — it has no terminal.
+// The queue drain inside agentLoop runs regardless, so it stays unit-testable.
 async function runTurn(messages, rl, trace) {
-  const capture = autoApprove && !jsonIpc && process.stdin.isTTY;
+  const capture = !jsonIpc && process.stdin.isTTY;
   if (!capture) {
     await agentLoop(messages, rl, trace, null);
     return;
@@ -469,6 +473,9 @@ async function runTurn(messages, rl, trace) {
     await agentLoop(messages, rl, trace, sessionInput);
   } finally {
     process.stdin.removeListener('data', handler);
+    // If the turn died (a throw, a stall abort) while a permission prompt was
+    // parked, settle it as denied — nothing is left to answer it now.
+    sessionInput.resolveApproval('n');
     ui.updateLiveInput('');       // erase any in-progress input line
     ui.setLiveInputActive(false);
     stdout.write('\x1b[?2004l'); // disable bracketed paste
@@ -485,6 +492,10 @@ function makeTurnInputHandler(input) {
     onLine: (content) => handleTurnInputLine(content, input),
     onChange: (buf) => ui.updateLiveInput(buf), // echo typed text on the bottom row
     onCancel: () => {
+      // Deny first: a Ctrl+C while a permission prompt is parked would otherwise
+      // leave awaitApproval() unresolved and the turn hung on a promise whose
+      // only resolver just went away.
+      if (input.resolveApproval('n')) ui.printInfo('Denied (interrupted).');
       if (currentAC) {
         currentAC.abort();
         currentAC = null;
@@ -503,8 +514,10 @@ function handleTurnInputLine(line, input) {
     ui.printInfo(`Cleared ${n} queued follow-up${n === 1 ? '' : 's'}.`);
     return;
   }
-  const item = input.enqueue(line);
-  if (item) ui.printQueued(item, input.size);
+  // submit() answers a parked permission prompt when the line is y/n/a, and
+  // queues anything else — including text typed at that prompt.
+  const routed = input.submit(line);
+  if (routed.kind === 'queued') ui.printQueued(routed.item, input.size);
 }
 
 // Take everything queued during the turn as one steering user message. Returns
@@ -548,7 +561,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       }
 
       case 'request_start': {
-        // When the turn wrapper is capturing follow-ups (auto-approve TTY), it
+        // When the turn wrapper is capturing follow-ups (any TTY session), it
         // owns stdin and Ctrl+C for the whole turn. Otherwise do the
         // per-iteration readline pause + raw Ctrl+C handling here (so Ctrl+C
         // still cancels and permission prompts keep working).
@@ -737,7 +750,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
         if (jsonIpc) console.log(JSON.stringify({ type: 'delta', content: delta }));
         else mdStream?.write(delta);
       },
-      approve: (name, args) => checkPermission(name, args, rl),
+      approve: (name, args) => checkPermission(name, args, rl, input),
       takeFollowUps: () => takeQueuedFollowUps(input, trace),
       // Don't silently die mid-task. In an interactive terminal, offer to keep
       // going; a fresh iteration budget continues the same turn (and trace).
@@ -806,21 +819,33 @@ function needsApproval(toolName, args) {
   return !alwaysAllow.has(permissionKey(toolName, args));
 }
 
-async function checkPermission(toolName, args, rl) {
+async function checkPermission(toolName, args, rl, input = null) {
   if (!needsApproval(toolName, args)) return true;
 
   const detail = toolName === 'bash' ? args.command : JSON.stringify(args, null, 2);
   ui.printPermissionPrompt(toolName, detail);
 
   const always = toolName === 'bash' ? 'a=always (this exact command)' : `a=always (${toolName})`;
-  const raw = await rl.question(`  \x1b[90m[\x1b[0my\x1b[90m/\x1b[0mn\x1b[90m/\x1b[0ma\x1b[90m] ${always}\x1b[0m `);
-  const a = raw.trim().toLowerCase();
+  const hint = `  \x1b[90m[\x1b[0my\x1b[90m/\x1b[0mn\x1b[90m/\x1b[0ma\x1b[90m] ${always}\x1b[0m`;
 
-  if (a === 'always' || a === 'a') {
+  // While a turn captures input, the raw-mode reader owns stdin and readline is
+  // paused — question() would wait forever. Park on the controller instead: the
+  // same reader answers it, and text that isn't y/n/a becomes a follow-up rather
+  // than an accidental approval. The hint gets its own row because the live input
+  // line redraws by clearing the row it sits on.
+  let answer;
+  if (input) {
+    stdout.write(`${hint}\x1b[90m  or type to steer\x1b[0m\n`);
+    answer = await input.awaitApproval();
+  } else {
+    answer = classifyApprovalAnswer(await rl.question(`${hint} `)) ?? 'n';
+  }
+
+  if (answer === 'a') {
     alwaysAllow.add(permissionKey(toolName, args));
     return true;
   }
-  return a === 'y' || a === 'yes';
+  return answer === 'y';
 }
 
 // ─── Slash command handler ────────────────────────────────────────────────────

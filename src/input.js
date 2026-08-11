@@ -10,15 +10,68 @@
 // unit-tested in isolation; chat.js owns the wiring.
 import { randomUUID } from 'node:crypto';
 
+// A permission prompt accepts a tiny fixed vocabulary. Anything else typed while
+// one is pending is a follow-up, not an answer — so a user who types "actually
+// skip the tests" at a [y/n/a] prompt gets it queued rather than silently read as
+// "a" (always allow). Returns 'y' | 'n' | 'a', or null when it isn't an answer.
+export function classifyApprovalAnswer(text) {
+  const a = String(text ?? '').trim().toLowerCase();
+  if (a === 'y' || a === 'yes') return 'y';
+  if (a === 'n' || a === 'no') return 'n';
+  if (a === 'a' || a === 'always') return 'a';
+  return null;
+}
+
 export class InputController {
   constructor() {
     this.pending = [];      // FIFO of { id, content, queuedAt }
     this.mode = 'idle';     // 'idle' | 'working' | 'approval'
+    this._approval = null;  // resolver for the in-flight permission prompt
   }
 
   setMode(mode) {
     this.mode = mode;
     return this.mode;
+  }
+
+  // ── Permission prompts ─────────────────────────────────────────────────────
+  // While a turn is capturing input, the raw-mode reader owns stdin, so the
+  // permission prompt can't use readline's question(). It parks here instead and
+  // the same keystroke stream answers it.
+
+  get awaitingApproval() {
+    return Boolean(this._approval);
+  }
+
+  // Resolves to 'y' | 'n' | 'a' once the user answers.
+  awaitApproval() {
+    this.setMode('approval');
+    return new Promise(resolve => { this._approval = resolve; });
+  }
+
+  // Settle a pending prompt (an answer, or 'n' from an interrupt). Returns false
+  // when nothing was waiting, so callers can tell a stray key from a real answer.
+  resolveApproval(answer) {
+    const resolve = this._approval;
+    if (!resolve) return false;
+    this._approval = null;
+    this.setMode('working');
+    resolve(answer);
+    return true;
+  }
+
+  // Route one submitted line to whichever consumer is active. Returns what
+  // happened so the caller can render it.
+  submit(content) {
+    if (this.awaitingApproval) {
+      const answer = classifyApprovalAnswer(content);
+      if (answer) {
+        this.resolveApproval(answer);
+        return { kind: 'approval', answer };
+      }
+    }
+    const item = this.enqueue(content);
+    return item ? { kind: 'queued', item } : { kind: 'ignored' };
   }
 
   // Queue a follow-up. Blank input is ignored (returns null). Returns the item.
