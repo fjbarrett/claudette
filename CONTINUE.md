@@ -6,7 +6,7 @@ handoff for work in progress.
 
 ## State: review + hardening + cleanup + library API + Terminal-Bench (2026-08-10)
 
-All committed and pushed on `feature/review-hardening`. **309/309 tests.**
+All committed and pushed on `feature/review-hardening`. **318 tests, 316 pass, 0 fail.**
 
 ### The three things that now work
 1. **CLI** — `npm link` puts `claudette` on PATH. `-p` headless, `--json-ipc`,
