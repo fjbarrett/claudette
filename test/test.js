@@ -3483,10 +3483,19 @@ describe('index.js (library API)', async () => {
   });
 
   test('a missing provider key is reported before any request', async () => {
-    await assert.rejects(
-      lib.run('go', { model: 'anthropic/claude-opus-4-8', cwd: ws }),
-      /ANTHROPIC_API_KEY/,
-    );
+    // Must run with the key genuinely absent. `.env` is autoloaded, so on a
+    // developer machine this test used to find a real key, skip the guard, and
+    // bill a live Opus turn from inside `npm test`.
+    const saved = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+    try {
+      await assert.rejects(
+        lib.run('go', { model: 'anthropic/claude-opus-4-8', cwd: ws }),
+        /ANTHROPIC_API_KEY/,
+      );
+    } finally {
+      if (saved !== undefined) process.env.ANTHROPIC_API_KEY = saved;
+    }
   });
 
   test('package.json exposes the library and the binary', async () => {
