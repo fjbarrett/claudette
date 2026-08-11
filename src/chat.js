@@ -115,6 +115,42 @@ function readCoalescedPrompt(rl, promptStr, { flushMs = 40 } = {}) {
   });
 }
 
+/**
+ * Choose a model when the user named none.
+ *
+ * This used to walk a hardcoded list of name fragments — 'gemma4',
+ * 'qwen2.5-coder', 'llama3.1' — which rots the moment a new family ships. On a
+ * machine holding qwen3.6, gpt-oss and devstral, not one of them matched, so it
+ * fell through to whichever model Ollama happened to list first.
+ *
+ * Score on what a model actually is instead:
+ *  - it must be able to call tools, or the agent loop cannot work at all;
+ *  - coding-tuned beats general;
+ *  - among equals, smaller wins, because generation speed is what makes an agent
+ *    loop usable and size tracks it closely on one machine.
+ * Cloud models (which carry no local size) sort ahead of local ones only when
+ * nothing local can call tools.
+ */
+export function pickDefaultModel(models = []) {
+  if (!models.length) return null;
+  const score = (m) => {
+    const name = String(m.name).toLowerCase();
+    const caps = m.capabilities ?? [];
+    let s = 0;
+    // A model with no declared capabilities is usually a cloud entry, where the
+    // list is unknown rather than empty — don't punish it for that.
+    if (caps.includes('tools')) s += 1000;
+    else if (caps.length) s -= 1000;
+    if (/coder|code|devstral/.test(name)) s += 100;
+    if (/instruct|chat/.test(name)) s += 10;
+    if (/embed|vision|guard|moderat/.test(name)) s -= 500; // not general assistants
+    // Smaller is faster; ~1 point per GB, so size only breaks ties.
+    if (m.size) s -= m.size / 1e9;
+    return s;
+  };
+  return [...models].sort((a, b) => score(b) - score(a))[0].name;
+}
+
 /** Value following a flag on argv, or null when the flag is absent/bare. */
 function flagValue(flag, argv = process.argv) {
   const i = argv.indexOf(flag);
@@ -182,14 +218,7 @@ export async function start() {
     );
     exit(1);
   }
-  // Prefer models known to support proper tool calling — iterate PREFERENCE order, not model list order
-  const PREFERRED_MODELS = ['gemma4', 'qwen2.5-coder', 'qwen2.5', 'mistral', 'llama3.1', 'qwen3.5'];
-  let defaultModel = models[0].name;
-  for (const pref of PREFERRED_MODELS) {
-    const found = models.find(m => m.name.includes(pref));
-    if (found) { defaultModel = found.name; break; }
-  }
-  model = modelArg ?? process.env.OLLAMA_MODEL ?? defaultModel;
+  model = modelArg ?? process.env.OLLAMA_MODEL ?? pickDefaultModel(models);
 
   // Fail fast on an explicit --model whose provider has no key, instead of
   // showing the banner and only erroring at the first message. Auto-selected

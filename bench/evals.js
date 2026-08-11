@@ -260,6 +260,7 @@ async function main() {
     );
   }
 
+  const startedAt = Date.now();
   console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}`);
   const results = [];
   for (const caseDef of selected) {
@@ -295,6 +296,30 @@ async function main() {
     });
   }
 
+  const summary = {
+    model,
+    generatedAt: new Date().toISOString(),
+    trim: args.trim,
+    totals: {
+      cases: results.length,
+      passed: results.filter(r => r.passAtK).length,
+      passedAll: results.filter(r => r.passAllK).length,
+      durationMs: Date.now() - startedAt,
+      promptTokens: results.reduce((a, r) => a + r.avgPromptTokens * r.repeat, 0),
+      completionTokens: results.reduce((a, r) => a + r.avgCompletionTokens * r.repeat, 0),
+      peakInputTokens: Math.max(0, ...results.map(r => r.avgPeakInputTokens)),
+    },
+    results,
+  };
+
+  if (args.json) {
+    // One JSON document on stdout and nothing else, so a caller can pipe it.
+    console.log(JSON.stringify(summary));
+    await writeReport(summary, model);
+    if (results.some(r => r.passes === 0)) process.exitCode = 1;
+    return;
+  }
+
   console.log('\n═══ Eval summary ═══');
   for (const r of results) {
     const rate = `${r.passes}/${r.repeat}`;
@@ -305,10 +330,7 @@ async function main() {
     );
   }
 
-  await fs.mkdir(REPORTS_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(REPORTS_DIR, `${stamp}-${model.replace(/[^a-zA-Z0-9._-]+/g, '-')}.json`);
-  await fs.writeFile(file, JSON.stringify({ model, generatedAt: new Date().toISOString(), results }, null, 2));
+  const file = await writeReport(summary, model);
   console.log(`\nreport: ${path.relative(process.cwd(), file)}`);
 
   if (results.some(r => r.passes === 0)) {
@@ -316,8 +338,16 @@ async function main() {
   }
 }
 
+async function writeReport(summary, model) {
+  await fs.mkdir(REPORTS_DIR, { recursive: true });
+  const stamp = summary.generatedAt.replace(/[:.]/g, '-');
+  const file = path.join(REPORTS_DIR, `${stamp}-${model.replace(/[^a-zA-Z0-9._-]+/g, '-')}.json`);
+  await fs.writeFile(file, JSON.stringify(summary, null, 2));
+  return file;
+}
+
 function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false, trim: true };
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false, trim: true, json: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -328,6 +358,7 @@ function parseArgs(argv) {
     else if (arg === '--keep') args.keep = true;
     else if (arg === '--verbose') args.verbose = true;
     else if (arg === '--no-cache') args.noCache = true;
+    else if (arg === '--json') args.json = true;
     else if (arg === '--trim') args.trim = true;       // context trimming on (default)
     else if (arg === '--no-trim') args.trim = false;   // baseline: re-send everything
     else throw new Error(`Unknown flag: ${arg}`);

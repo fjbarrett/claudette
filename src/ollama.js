@@ -14,6 +14,10 @@ export async function getModels() {
     family: m.details?.family ?? 'unknown',
     paramSize: m.details?.parameter_size ?? '?',
     modified: m.modified_at,
+    // Ollama reports what a model can actually do ("tools", "thinking", …).
+    // Auto-selection used to guess from a hardcoded list of name fragments,
+    // which rots: none of qwen3.6/gpt-oss/devstral matched it.
+    capabilities: Array.isArray(m.capabilities) ? m.capabilities : [],
   }));
 }
 
