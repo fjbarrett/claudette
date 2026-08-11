@@ -3511,7 +3511,7 @@ describe('index.js (library API)', async () => {
 });
 
 describe('src/agent-runner.js (shared loop)', async () => {
-  const { runAgent, mergeToolCalls, dropOrphanToolMessages } = await import('../src/agent-runner.js');
+  const { runAgent, mergeToolCalls, dropOrphanToolMessages, responseSignature, createRepeatDetector } = await import('../src/agent-runner.js');
   const { TOOL_DEFS } = await import('../src/tools.js');
 
   let sandbox;
@@ -3614,6 +3614,116 @@ describe('src/agent-runner.js (shared loop)', async () => {
     assert.equal(granted, 2, 'asked again after the extended budget ran out');
     assert.equal(run.iterations, 4, 'two budgets of two');
     assert.equal(run.status, 'max_iterations');
+  });
+
+  test('responseSignature ignores prose and key order, but not the calls', () => {
+    const call = (name, args) => [{ function: { name, arguments: args } }];
+    assert.equal(responseSignature(null), null, 'no tool calls cannot loop');
+    assert.equal(responseSignature([]), null);
+    assert.equal(
+      responseSignature(call('bash', { command: 'ls', description: 'd' })),
+      responseSignature(call('bash', { description: 'd', command: 'ls' })),
+      'argument key order does not mask a repeat',
+    );
+    assert.equal(
+      responseSignature(call('bash', '{"command":"ls"}')),
+      responseSignature(call('bash', { command: 'ls' })),
+      'string and object arguments compare equal',
+    );
+    assert.notEqual(
+      responseSignature(call('bash', { command: 'ls' })),
+      responseSignature(call('bash', { command: 'pwd' })),
+      'a different command is a different response',
+    );
+  });
+
+  test('createRepeatDetector fires on a run, re-arms, and resets on steering', () => {
+    const d = createRepeatDetector(3);
+    assert.equal(d.record('a'), null);
+    assert.equal(d.record('a'), null);
+    assert.ok(d.record('a'), 'fires on the third identical response');
+    assert.equal(d.nudges, 1);
+    assert.equal(d.record('a'), null, 're-armed, not firing every time after');
+    assert.equal(d.record('a'), null);
+    assert.ok(d.record('a'), 'fires again if the model ignored the nudge');
+    assert.equal(d.nudges, 2);
+
+    const e = createRepeatDetector(3);
+    e.record('a'); e.record('a');
+    e.record('b');                       // genuine progress breaks the run
+    assert.equal(e.record('a'), null, 'streak restarts after a different response');
+
+    const f = createRepeatDetector(3);
+    f.record('a'); f.record('a');
+    f.reset();                           // user steered; clean slate
+    assert.equal(f.record('a'), null, 'reset clears the streak');
+    assert.equal(createRepeatDetector(0).record('a'), null, 'threshold 0 disables');
+  });
+
+  test('a repeating model is nudged, then the turn ends instead of looping', async () => {
+    // Replays the real failure: a model that re-issues the identical successful
+    // bash batch forever. The act nudge cannot catch it, because a successful
+    // bash resets that streak every iteration — so actNudge stays on here to
+    // prove the repeat guard is what stops it.
+    const messages = [{ role: 'user', content: 'probe the site' }];
+    const sameCall = () => ({
+      toolCalls: [{ id: 'c', function: { name: 'bash', arguments: { command: 'echo hi' } } }],
+    });
+    let requests = 0;
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: async () => { requests++; return sameCall(); },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      maxIterations: 100,
+      repeatGuard: 3,
+    });
+
+    assert.equal(run.status, 'repeating', 'ended on repetition, not max_iterations');
+    assert.ok(run.iterations < 12, `stopped early, took ${run.iterations} iterations`);
+    const nudges = messages.filter(m => m.role === 'user' && /same set of tool calls/.test(m.content ?? ''));
+    assert.equal(nudges.length, 2, 'nudged twice before giving up');
+    assert.ok(requests < 12, 'did not burn the iteration budget');
+  });
+
+  test('repeat guard ignores legitimate repetition that follows progress', async () => {
+    // Running the same check after an edit is normal and must not trip the guard.
+    const bash = (command) => ({ toolCalls: [{ id: 'b', function: { name: 'bash', arguments: { command } } }] });
+    const messages = [{ role: 'user', content: 'fix it' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        bash('echo test'),
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'a.txt', content: 'x' } } }] },
+        bash('echo test'),
+        { toolCalls: [{ id: 'w2', function: { name: 'write_file', arguments: { path: 'b.txt', content: 'y' } } }] },
+        bash('echo test'),
+        { content: 'done' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      repeatGuard: 3, actNudge: 0, verifyGate: false,
+    });
+    assert.equal(run.status, 'completed', 'interleaved progress is not a loop');
+    assert.equal(messages.filter(m => /same set of tool calls/.test(m.content ?? '')).length, 0);
+  });
+
+  test('a delivered follow-up resets the repeat streak', async () => {
+    const same = { toolCalls: [{ id: 'c', function: { name: 'bash', arguments: { command: 'echo hi' } } }] };
+    const messages = [{ role: 'user', content: 'go' }];
+    let handed = false, calls = 0;
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: async () => (++calls > 4 ? { content: 'stopped' } : same),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      repeatGuard: 3, actNudge: 0, verifyGate: false,
+      takeFollowUps: async () => {
+        if (handed || calls < 2) return null;      // steer just before it would fire
+        handed = true;
+        return { role: 'user', content: 'try something else' };
+      },
+    });
+    assert.equal(run.status, 'completed', 'user steering pre-empts the guard');
+    assert.equal(messages.filter(m => /same set of tool calls/.test(m.content ?? '')).length, 0,
+      'no automated nudge stacked on top of the user follow-up');
   });
 
   test('queued follow-ups keep the turn alive past a would-be finish', async () => {

@@ -681,6 +681,19 @@ async function agentLoop(messages, rl, trace = null, input = null) {
         break;
       }
 
+      case 'repeat_nudge': {
+        trace?.event('repeat_nudge', { attempt: data.attempt });
+        if (!jsonIpc) ui.printInfo('Same tool calls repeating with no new information — telling the model to change approach.');
+        await flushSessionSave(session);
+        break;
+      }
+
+      case 'repeating': {
+        trace?.event('repeating', { iterations: data.iterations });
+        if (!jsonIpc) ui.printInfo(`Stopped after ${data.iterations} iterations: the model kept repeating the same tool calls. Give it a new instruction.`);
+        break;
+      }
+
       case 'iteration_end': await flushSessionSave(session); break;
 
       case 'cancelled': {

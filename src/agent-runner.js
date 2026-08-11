@@ -129,6 +129,73 @@ export function buildVerifyNudge(verifyRan) {
 
 const VERIFY_MAX = 2; // gate fires at most twice per turn (initial + one fix cycle)
 
+// Repetition guard. A degenerating model re-emits the same response forever: a
+// real session logged 30 consecutive byte-identical replies, the same five curl
+// commands re-issued for 37 minutes, turning 38 distinct commands into 183. The
+// act nudge cannot see this, because a SUCCESSFUL bash call resets its streak —
+// so a loop of successful identical commands looks like progress every single
+// iteration. Only `maxIterations` would have ended it, about two hours later.
+export function resolveRepeatGuard(env = process.env) {
+  const n = Number(env.CLAUDETTE_REPEAT_GUARD);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 3; // 0 disables
+}
+
+// Recursively sort object keys so an argument set that serialises in a different
+// order still compares equal.
+function stableValue(v) {
+  if (Array.isArray(v)) return v.map(stableValue);
+  if (v && typeof v === 'object') {
+    return Object.fromEntries(Object.keys(v).sort().map(k => [k, stableValue(v[k])]));
+  }
+  return v;
+}
+
+/**
+ * Signature of one assistant turn: the tool calls it wants to make, by name and
+ * argument. Prose is deliberately excluded — a model that reworded its preamble
+ * while re-issuing identical commands is still looping. Returns null when there
+ * are no tool calls, which ends the turn anyway and so cannot loop.
+ */
+export function responseSignature(calls) {
+  if (!calls?.length) return null;
+  return JSON.stringify(calls.map(c => {
+    let args = c.function?.arguments;
+    if (typeof args === 'string') { try { args = JSON.parse(args); } catch { /* compare raw */ } }
+    return [c.function?.name ?? '', stableValue(args ?? {})];
+  }));
+}
+
+export function buildRepeatNudge(count) {
+  return `[automated check] You have issued this exact same set of tool calls ${count} times in a row and learned nothing new from it. ` +
+    'Stop repeating it. Either answer with what you already have, or do something genuinely different — a different command, a different file, ' +
+    'a different approach. If you are stuck, say plainly what is blocking you instead of retrying.';
+}
+
+// Fires when the same signature repeats `threshold` times running. Re-arms after
+// each nudge, so an ignored nudge fires again rather than going silent.
+export function createRepeatDetector(threshold) {
+  let last = null, streak = 0, nudges = 0;
+  return {
+    record(signature) {
+      if (signature == null) { last = null; streak = 0; return null; }
+      if (signature === last) streak++;
+      else { last = signature; streak = 1; }
+      if (threshold > 0 && streak >= threshold) {
+        streak = 0; // re-arm: another `threshold` repeats needed to fire again
+        nudges++;
+        return buildRepeatNudge(threshold);
+      }
+      return null;
+    },
+    // Steering input changed the context; give the model a clean slate.
+    reset() { last = null; streak = 0; },
+    get nudges() { return nudges; },
+    get streak() { return streak; },
+  };
+}
+
+const REPEAT_MAX = 2; // nudge twice, then end the turn rather than loop forever
+
 // ─── Message hygiene ─────────────────────────────────────────────────────────
 
 /**
@@ -182,7 +249,8 @@ function parseArgs(rawArgs) {
  * `messages` is mutated in place (the caller usually wants the final list), and
  * returned alongside the outcome:
  *   { status, content, messages, usage, iterations, toolCalls }
- * where status is 'completed' | 'cancelled' | 'failed' | 'max_iterations'.
+ * where status is 'completed' | 'cancelled' | 'failed' | 'max_iterations' |
+ * 'repeating' (the model kept re-issuing identical tool calls).
  */
 export async function runAgent({
   model,
@@ -195,6 +263,7 @@ export async function runAgent({
   maxIterations = resolveMaxIterations(),
   actNudge = resolveActNudge(),
   verifyGate = resolveVerifyGate(),
+  repeatGuard = resolveRepeatGuard(),
   emit = () => {},
   onDelta = null,
   approve = null,
@@ -207,6 +276,7 @@ export async function runAgent({
   // context. Fresh per run so a later turn always sees current files.
   const readCache = toolContext.readCache ?? new Map();
   const nudger = createActNudger(actNudge);
+  const repeater = createRepeatDetector(repeatGuard);
   const usage = { promptTokens: 0, completionTokens: 0 };
   const toolCalls = [];
 
@@ -272,6 +342,7 @@ export async function runAgent({
       // text. `/tools off` used to still execute it, because the text parser ran
       // regardless of whether tools were enabled.
       const calls = tools.length ? mergeToolCalls(result) : null;
+      const signature = responseSignature(calls);
       content = result.content ?? '';
 
       // ── No tool calls → the model is trying to finish ──────────────────────
@@ -346,7 +417,26 @@ export async function runAgent({
       // Steering input injected before the next request rides along with the
       // tool results the model is waiting on.
       const followUps = takeFollowUps ? await takeFollowUps() : null;
-      if (followUps) await append(followUps);
+      if (followUps) {
+        await append(followUps);
+        repeater.reset(); // the user changed the context; judge repetition afresh
+      } else {
+        // The same tool calls over and over, learning nothing: nudge, and if the
+        // model ignores that, end the turn instead of spending the whole
+        // iteration budget on a degenerate loop. Checked here rather than before
+        // executing the batch so tool_call/tool_result pairing stays valid, and
+        // in the else-branch so it never stacks a second adjacent user message
+        // on top of a delivered follow-up.
+        const repeatNudge = repeater.record(signature);
+        if (repeatNudge) {
+          if (repeater.nudges > REPEAT_MAX) {
+            await emit('repeating', { iterations: iteration, signature });
+            return finish('repeating');
+          }
+          await emit('repeat_nudge', { attempt: repeater.nudges, nudge: repeatNudge });
+          await append({ role: 'user', content: repeatNudge });
+        }
+      }
     }
 
     await emit('max_iterations', { iterations: iteration });
