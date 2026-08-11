@@ -2,7 +2,97 @@
 
 ## [Unreleased]
 
+### Security
+- **A file you asked Claudette to read could run shell commands with no
+  permission prompt.** `handleMessage` scanned the prompt for a benchmark escape
+  hatch ("Call bash with EXACTLY this command…") and ran whatever followed
+  through `executeTool` directly, skipping `checkPermission` entirely. It scanned
+  the **@file-expanded** prompt, so the sentence only had to appear inside a file
+  you inlined. Reproduced end to end: a `notes.md` containing that sentence, with
+  the prompt `please summarize @notes.md`, executed the command before any model
+  request. The shortcut is gone; the two benchmark tasks that leaned on it
+  (`count-lines-tool`, `extract-print-help`) are now written as real task
+  descriptions, which is what their judge rubrics always claimed to score.
+- **"Always allow" on one bash command authorised every later command.**
+  `needsApproval` built a per-command `bash:<cmd>` key, but `checkPermission`
+  stored the bare tool name — so answering `a` to `rm -rf build` silently
+  approved every command for the rest of the session. Bash approvals are now
+  scoped to the exact command (`permissionKey`), and the prompt says which.
+
 ### Fixed
+- **The exact-bash shortcut poisoned sessions on OpenAI-compatible providers.**
+  Both its branches appended a `role: 'tool'` message with no preceding
+  `tool_calls`; OpenAI and Azure reject the entire request with *"messages with
+  role 'tool' must be a response to a preceeding message with 'tool_calls'"*. The
+  failure branch died inside its own recovery loop, and the success branch left
+  the bad message in `session.messages` so the **next** prompt in that session
+  400'd. Removed at the source, and `dropOrphanToolMessages` now strips orphans
+  from every outbound payload so sessions written by older builds still resume.
+  Stored history keeps them.
+- **`--json-ipc` dropped every prompt after the first.** The loop advertises
+  `{"type":"ready"}` each turn, but `rl.question()` only listens while awaited —
+  lines emitted during a turn reached nobody and were discarded, then `rlClosed`
+  ended the loop. Two piped prompts ran one turn; with stdin redirected from a
+  file, even the first was lost. A `createLineQueue` buffers every line, EOF is a
+  value rather than a rejection, and `ready` is no longer advertised into a closed
+  stream. Single-shot piping (the Harbor adapter) is unaffected.
+- Compaction no longer destroys the conversation. `/compact` and auto-compaction
+  replaced `session.messages` with a summary, and the transcript is regenerated
+  from that array — so the original was gone from both places. The full history is
+  archived to `data/sessions/archive/` first, and the path is printed.
+- Session writes are atomic (temp file + rename). A crash mid-write left a
+  truncated JSON that `JSON.parse` rejects, making the session unloadable and
+  silently dropping it from `/sessions`. Sessions are written after every tool
+  result during a turn, so the window was not theoretical.
+- A rate limit or transient 5xx no longer throws away the whole turn. Provider
+  calls retry with exponential backoff plus jitter, honouring `Retry-After`
+  (`CLAUDETTE_MAX_RETRIES`, default 2). Retries stop once bytes have streamed, so
+  visible output is never duplicated, and a bad model slug or missing key still
+  fails on the first attempt instead of three times slower.
+- A hung provider no longer hangs forever. A stall watchdog aborts a request that
+  sends nothing for `CLAUDETTE_STALL_TIMEOUT` (default 300s, `0` disables) and
+  reports it as an actionable error — deliberately not an `AbortError`, which the
+  agent loop reads as "the user pressed Ctrl+C" and would have recorded a real
+  failure as a clean cancellation.
+- Transcripts are throttled instead of rewritten after every tool result. A
+  150-iteration turn re-serialised the whole growing transcript 150 times; it is
+  derived data, so it now writes at most every 2s and is flushed exactly at turn
+  end and on exit (`CLAUDETTE_TRANSCRIPT_THROTTLE`).
+
+### Changed
+- **The agent loop is now `src/agent-runner.js`, shared by everything.** It lived
+  inside `chat.js`, tangled with readline and the spinner, so `bench/evals.js`
+  carried a second, simpler copy and the browser had none. Every behaviour added
+  to the CLI — the re-read guard, the action nudge, the verification gate, payload
+  trimming — was invisible to the harness measuring it, so the benchmark scored a
+  different agent than the one that ships. `runAgent()` has no terminal in it;
+  callers supply rendering, permissions, and persistence through hooks. The CLI is
+  now a shell around it, and the eval harness runs the real loop. The text
+  tool-call parser moved to `src/tool-call-parser.js` for the same reason.
+
+### Added
+- `claudette -p "…"` — headless one-shot mode. Prints the reply and nothing else
+  (no banner, spinner, or cost footer), so it pipes cleanly, and exits non-zero
+  when the turn fails.
+- `claudette --continue` / `--resume <id>` — reattach to the newest or a named
+  session at launch, instead of starting cold and typing `/resume`.
+- `Tab` completion for slash commands and `@paths`. readline supports a
+  `completer` and one was never passed, so Tab did nothing.
+- CI (`.github/workflows/ci.yml`) on Node 20/22/24, plus `npm test` and
+  `npm run test:offline` — a 240-test suite existed and nothing ran it.
+
+### Tests
+- The live-provider suite was unrunnable, not "environment-dependent". Thirteen
+  tests hardcoded `llama3.2:latest`; they now discover an installed Ollama model
+  (preferring one that advertises tool support) and skip with a reason when none
+  is available.
+- The `normalizeArgs` tests asserted against an inlined **copy** of the alias
+  tables, spawned in a subprocess — a real parser bug could never fail them. They
+  import the shipping function now.
+- New coverage for the extracted runner, retry/backoff/stall behaviour, tab
+  completion, atomic writes, and the compaction archive.
+
+### Fixed (earlier)
 - Recoverable tool errors now guide the model instead of repeating. Across real
   sessions 13% of tool calls errored, dominated by three recoverable mistakes —
   file-not-found (59×), missing/empty path (38×), and path-outside-workspace

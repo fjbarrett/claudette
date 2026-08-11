@@ -7,10 +7,13 @@ Fireworks, Groq, HuggingFace), or local models via Ollama. No local GPU required
 
 ## What it includes
 
-- Browser UI with session history, model switching, and streamed responses
-- Local CLI with slash commands and streamed chat
+- Local CLI with slash commands, tool use, and streamed chat
+- Headless one-shot mode (`-p`) and a JSONL line protocol (`--json-ipc`) for scripts
+- Browser dashboard with session history, model switching, streamed responses, and
+  per-turn traces (chat and trace only — the tool-running agent is the CLI)
 - Persistent JSON session storage in `data/sessions`
 - `@relative/path` file expansion so prompts can inline workspace files
+- A benchmark harness (`bench/`) that runs the same agent loop the CLI ships
 
 ## Setup
 
@@ -40,15 +43,40 @@ In another terminal:
 npm run cli
 ```
 
-Inside the CLI, the main git workflow commands are:
+Inside the CLI, `Tab` completes slash commands and `@paths`, and `/help` lists
+everything. The git-oriented commands are:
 
 ```text
 /status               show branch + working tree state
-/feature <name>       create and switch to feature/<name>
-/save <message>       git add -A && git commit -m "<message>"
-/publish              push the current branch to origin
-/update               pull latest changes with --ff-only
+/diff                 show the unstaged diff
+/commit               write and run a git commit for the staged changes
+/review               review the staged changes
 ```
+
+### Running it without a terminal
+
+```bash
+claudette -p "why does the build fail?"     # one prompt, prints the answer, exits
+claudette -p "fix the lint errors" -y       # …with tools auto-approved
+claudette --continue                        # reattach to the newest session
+claudette --resume 3f9a1c2b                 # reattach to a specific session
+claudette --json-ipc                        # JSONL protocol on stdin/stdout
+```
+
+`-p` prints the reply and nothing else — no banner, spinner, or cost footer — so
+`claudette -p "…" > answer.txt` gives you exactly the response. It exits non-zero
+when the turn fails, so a script can branch on it.
+
+## Tests
+
+```bash
+npm test           # the offline suite — what CI runs, ~60s, no key or GPU needed
+npm run test:live  # adds the Stress suite, which drives a real local Ollama model
+```
+
+No dependencies to install; the offline suite drives a mock Ollama over loopback.
+`test:live` is slow by nature — each prompt is a real generation, so a 27B model
+turns it into a 40-minute run.
 
 ## Models & providers
 
@@ -126,6 +154,24 @@ Ollama use their own native APIs (`src/anthropic.js`, `src/ollama.js`).
   `PERPLEXITY_BASE_URL`
 - `ANTHROPIC_MAX_TOKENS`: max output tokens for Anthropic responses, default `4096`
 - `WORKSPACE_ROOT`: allowed root for `@file` expansion, default repo root
+
+### Agent behaviour
+
+- `CLAUDETTE_MAX_ITERATIONS`: tool iterations per turn, default `150` (`--max-iterations N`)
+- `CLAUDETTE_ACT_NUDGE`: read-only tool calls before the agent is pushed to act, default `15`; `0` disables
+- `CLAUDETTE_VERIFY_GATE`: `0` lets a turn finish without a passing build/test after editing
+- `CLAUDETTE_AUTO_COMPACT` / `CLAUDETTE_COMPACT_TOKENS`: history compaction (`0` / default `60000`).
+  Compaction archives the full history to `data/sessions/archive/` before summarising
+- `CLAUDETTE_BASH_TIMEOUT` / `CLAUDETTE_BASH_OUTPUT_CHARS`: bash tool limits, default `120000` ms / `16000` chars
+
+### Provider resilience
+
+- `CLAUDETTE_MAX_RETRIES`: retries for rate limits and transient 5xx, default `2`.
+  Backoff is exponential with jitter and honours `Retry-After`. A response that has
+  already started streaming is never retried, so output can't be duplicated
+- `CLAUDETTE_STALL_TIMEOUT`: give up when a provider sends nothing for this long,
+  default `300000` ms; `0` waits indefinitely
+- `CLAUDETTE_QUIET_RETRIES=1`: don't print the retry notice
 
 > Note: `OPENAI_BASE_URL` / `OPENAI_API_BASE` no longer configure Ollama (that was
 > a legacy fallback). `OPENAI_BASE_URL` now configures the OpenAI provider; use

@@ -4,21 +4,28 @@
 
 ## Context
 
-**Last Updated:** 2026-06-12
-**Stage:** Cloud-first multi-provider — models addressed `provider/model`; backends for OpenAI/Anthropic/DeepSeek/Groq/HuggingFace (bespoke) + catalog (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity) over one OpenAI-compatible transport. Runs with no local Ollama (bench defaults + judge resolve cloud-first). Bench harness tuned; in-process eval loops for prompt/tool-usage testing; web dashboard for bench reports.
-**Purpose:** Claudette is a multi-provider AI coding assistant CLI + web server (any major LLM provider or hosting platform; local Ollama optional)
+**Last Updated:** 2026-08-10
+**Stage:** Cloud-first multi-provider with a shared, terminal-free agent loop (`src/agent-runner.js`) used by the CLI and the eval harness. Models addressed `provider/model`; backends for OpenAI/Anthropic/DeepSeek/Groq/HuggingFace (bespoke) + catalog (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity) over one OpenAI-compatible transport. Provider calls retry with backoff and abort on stall. CI on Node 20/22/24.
+**Purpose:** Claudette is a multi-provider AI coding assistant CLI + web dashboard (any major LLM provider or hosting platform; local Ollama optional)
 **Structure:**
 ```
-claudette.js      CLI entry point
-server.js         HTTP API + static server
+claudette.js      CLI entry point (-p headless, --continue/--resume, --json-ipc)
+server.js         HTTP API + static server (chat + trace dashboard; no tools yet)
 cli.js            Legacy CLI (uses server as backend)
 src/
   env.js          Zero-dep .env parser/loader; env-autoload.js side-effect (first import in entry points)
   config.js       Ollama base URL resolver (OLLAMA_BASE_URL/OLLAMA_HOST; OPENAI_* no longer routed here)
-  chat.js         Main REPL, agent loop, text tool-call parser
+  agent-runner.js THE agent loop — headless, hook-driven (emit/onDelta/approve/takeFollowUps/onMaxIterations).
+                  Owns iteration cap, act nudge, verify gate, payload trim, orphan-tool-message repair
+  chat.js         REPL + slash commands; a terminal/permission/session shell around runAgent()
+  tool-call-parser.js  Text-emitted tool-call parsing + per-tool arg alias tables
   tools.js        Tool definitions + executors (bash/read_file/write_file/str_replace/list_dir/search_code/fetch_url/patch_file)
-  session.js      Session CRUD (data/sessions/*.json)
-  context.js      CLAUDE.md loader, @file expansion
+  retry.js        Retry policy, backoff+jitter, Retry-After, stall watchdog, provider error shaping
+  fs-atomic.js    writeFileAtomic (temp + rename)
+  completion.js   Tab completion for slash commands and @paths
+  session.js      Session CRUD (data/sessions/*.json) + archiveMessages -> sessions/archive/
+  context.js      CLAUDE.md loader, @file expansion, trimToolOutputs
+  transcript.js   Derived text transcripts, throttled + flushable
   ollama.js       Ollama API client (getModels, chatStream)
   anthropic.js    Anthropic Messages API client (native; anthropic/ + legacy anthropic:)
   openai.js       OpenAI adapter + shared OpenAI-compatible Chat Completions transport + provider factory
@@ -26,12 +33,14 @@ src/
   groq.js         Groq adapter (groq/, hosted Llama) — reuses openai.js transport
   huggingface.js  HuggingFace router adapter (hf/) — reuses openai.js transport
   providers.js    Catalog of OpenAI-compatible providers (OpenRouter/Together/Fireworks/Google/xAI/Mistral/Cohere/Perplexity)
-  provider.js     Registry router: provider/model -> backend; bare/ollama/ -> Ollama; missingCredential()
-  ui.js           ANSI terminal rendering, spinner
-bench/            Benchmark harness (run.js, worktree runs, reports) + evals.js in-process eval loops + evals/ cases
-data/sessions/    Persisted session JSON files
+  provider.js     Registry router + retry/stall wrapper; bare/ollama/ -> Ollama; missingCredential()
+  ui.js           ANSI terminal rendering, spinner (silent under --json-ipc and -p)
+bench/            Benchmark harness (run.js, worktree runs, reports) + evals.js (now runs the SHARED loop) + evals/ cases
+                  + harbor/ (Terminal-Bench adapter)
+data/sessions/    Persisted session JSON files; archive/ holds pre-compaction history
 public/           Web UI (index.html, styles.css, app.js, bench.html dashboard)
-test/test.js      Comprehensive test suite + config coverage
+test/test.js      Test suite (288 tests); live-model suites auto-discover an Ollama model and skip without one
+.github/workflows/ci.yml  Offline suite on Node 20/22/24 + bench-task validation
 ```
 
 ---
@@ -60,6 +69,8 @@ test/test.js      Comprehensive test suite + config coverage
 | 2026-07-05 | Claude | **Harbor adapter — claudette on Terminal-Bench 2.0.** New `bench/harbor/` Python pkg (`claudette_harbor:Claudette`, BaseInstalledAgent): installs claudette in the task container from a GitHub tarball ref (`--agent-kwarg version=<ref>`), drives it via piped one-line `--json-ipc` prompt, tees JSONL to `/logs/agent/`, reports tokens from `done`. Two claudette fixes shipped with it: guarded `rl.pause()` (piped one-shot died "readline was closed" mid-turn) + `done` event now reports accumulated turn usage split into promptTokens/completionTokens. **First run: `openssl-selfsigned-cert` reward 1.0** (gpt-5-nano, 3m11s, 99.7k in/16.7k out, 25 iterations, 0 exceptions). Setup: `uv venv .venv-harbor && uv pip install -p .venv-harbor -e bench/harbor`. Note: registry serves terminal-bench@2.0 (89 tasks); 2.1 not published there yet. Observation: verify-gate burns ~10 iterations hunting for a build in non-npm task dirs — candidate tuning for benchmark runs. Suite 217/14. |
 | 2026-07-05 | Claude | **Repo repair + bench harness re-validated.** `.git/objects` had been lost (repo copied ~Jun 29 without it; git fully broken, bench worktrees impossible). Restored: recreated objects dir, cleared dangling refs/reflogs (backed up first), fetched from origin (origin/main = old branch point 5e8072c, nothing upstream lost). The 5 feature commits' history was unrecoverable but content survived in the working tree → recommitted as one commit `2b9cb6b` on `feature/context-management`, pushed to origin (first push of this branch). Bench harness then verified end-to-end on OpenRouter gpt-5-nano: eval `bash-echo` pass; full bench `targeted-edit` hard=10 judge=8 overall=9.2 (worktree+IPC+verify+judge+report+cleanup all working); leaderboard regenerated. Note: only OPENROUTER_API_KEY is set and OpenRouter has no DEFAULT_MODELS, so `--model`/`--judge` must be passed explicitly. File mtimes were rewritten by the Jun 29 copy — don't trust `ls -t` on old artifacts. |
 | 2026-07-13 | Codex | Captured the repo-review hardening work as a prioritized follow-up for later. |
+| 2026-08-10 | Claude | Full-program review for next development. Suite re-run: **219 pass / 13 fail**. Reproduced 3 new defects live (unapproved shell via `@file` content through the exact-bash shortcut; `role:'tool'` with no `tool_calls` → provider 400 poisoning the session; `--json-ipc` drops all prompts after the first) + found the `alwaysAllow` bash-key dead code. Logged them plus the structural gaps in TODO. |
+| 2026-08-10 | Claude | **Acted on the whole review.** Security: removed the exact-bash prompt→shell bypass (and rewrote the 2 bench tasks that depended on it as real task descriptions); scoped bash "always" approval to the exact command. Fixed: orphan-`tool`-message session poisoning (`dropOrphanToolMessages` on every payload), `--json-ipc` dropping prompts 2..N (`createLineQueue`), lossy compaction (archives to `sessions/archive/` first), non-atomic session writes (`fs-atomic.js`), O(n²) transcript rewrites (throttled + flushed). Structural: extracted **`src/agent-runner.js`** — headless hook-driven loop now shared by chat.js and bench/evals.js (the bench had been measuring a different agent); text parser split to `tool-call-parser.js`. Reliability: `src/retry.js` — backoff+jitter, Retry-After, no retry after streaming starts, stall watchdog (never an AbortError). Added `-p` headless, `--continue`/`--resume`, Tab completion, `npm test`/`test:live`, GitHub Actions CI (Node 20/22/24). Tests: **288 total**; rewrote the `normalizeArgs` tests that asserted against an inlined copy; live suites now discover an Ollama model (smallest tool-capable) and skip cleanly without one — they had hardcoded the uninstalled `llama3.2:latest` and could never pass. Removed root scratch (`fib.py`, `hello.py`, `hello.html`, `console-script.js`, `ollama-code.js`); kept `GEMINI.md` (agent config) and `check_precision.sh` (ops script). |
 
 ---
 
@@ -75,7 +86,10 @@ test/test.js      Comprehensive test suite + config coverage
 | `node claudette.js -y` / `--yolo` / `--bypass` | Start CLI with auto-approve for all tool calls (or set `CLAUDETTE_AUTO_APPROVE=1`) |
 | `node claudette.js --effort <low\|medium\|high\|xhigh\|max>` | Set reasoning effort (or `CLAUDETTE_EFFORT`; `/effort` at runtime) |
 | `node server.js` | Start web server on port 4321 |
-| `NODE_ENV=test node --test test/test.js` | Run full test suite (~45-90s; spawns server+CLI subprocesses. Run ONE at a time — server tests bind fixed port 14322, so concurrent runs conflict) |
+| `npm test` | Offline suite (~60s) — what CI runs; no provider key, no Ollama. Spawns server+CLI subprocesses; ports are allocated dynamically now, so parallel runs are safe |
+| `npm run test:live` | Adds the `Stress:` cases against a real local Ollama model (auto-discovered). Slow — a 27B model makes it a ~40-min run |
+| `node claudette.js -p "<prompt>"` | Headless: one prompt, print the answer, exit (non-zero if the turn failed). Add `-y` to auto-approve tools |
+| `node claudette.js --continue` / `--resume <id>` | Reattach to the newest / a specific saved session at launch |
 | `OLLAMA_BASE_URL=http://localhost:11434 node claudette.js --model gemma4:latest` | Point CLI at the SSH-tunneled Ollama endpoint explicitly |
 | `npm run bench:gemma` | Run all benchmark tasks against gemma4 with live output |
 | `npm run bench -- --task <id> --model gemma4:latest --verbose` | Run one task with live output |
@@ -96,7 +110,32 @@ test/test.js      Comprehensive test suite + config coverage
 ## TODO
 
 ### Outstanding Tasks
-- Before public 1.0: remove the exact-Bash permission bypass; make `glob` shell-free; enforce realpath/symlink workspace boundaries; bind the unauthenticated server to loopback and add body/provider timeouts; then make tests hermetic and rebaseline benchmarks without shortcuts.
+
+**Done 2026-08-10** (see Changelog `[Unreleased]`): exact-bash bypass removed (both the
+unapproved-exec and the orphan-`tool`-message session poisoning), per-command bash
+approval, `--json-ipc` multi-prompt fix, `src/agent-runner.js` extraction (+ evals.js
+migrated onto it), provider retry/backoff/stall, atomic session writes, throttled
+transcripts, non-destructive compaction, `-p`/`--continue`/`--resume`, Tab completion,
+`npm test` + CI, live-test model discovery, dynamic test ports. Suite 289 tests (277 offline).
+
+**Next, in order:**
+- **MCP client.** Nine hardcoded tools vs. the whole ecosystem — the largest single
+  capability jump available. stdio + SSE transports, tool discovery, schema translation.
+- **Browser parity.** `server.js` still streams chat with no tools and duplicates
+  session storage, @file expansion, and the system prompt instead of using
+  `src/session.js` / `src/context.js` / `runAgent`. Now unblocked by the extraction.
+- **Subagents** — `docs/parallel-subagents-plan.md` Phase 2+; Phase 1 (reusable runner) is done.
+- **Queued follow-ups Phase 2** — `executeTool` takes a `signal` now but ignores it;
+  wire it to `execFile`/`fetch` so Ctrl+C interrupts a foreground command, and set the
+  `'approval'` input mode so typing during a permission prompt queues instead of answering.
+- Persisted permission rules (allow/ask/deny globs per project). `alwaysAllow` is still
+  an in-memory Set that dies with the process.
+- Before public 1.0: make `glob` shell-free; enforce realpath/symlink workspace
+  boundaries; add request/body limits to the unauthenticated server; rebaseline the
+  benchmark (the two shortcut tasks are now honest task descriptions and will score
+  lower until models actually do the work).
+- `count-lines-tool` and `extract-print-help` were 4-5/10 *with* a shortcut that did the
+  work for them; expect a fresh, lower baseline.
 - `count-lines-tool` and `extract-print-help` stuck at 4-5/10 — need 32B+ model or structured-task shortcut to improve.
 - Port bench harness to Windows machine at 192.168.0.178 (Node/Ollama/bash already installed) — use remote EC2 Ollama via SSH tunnel.
 - Re-run full benchmark matrix after any model upgrade.

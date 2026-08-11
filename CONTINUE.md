@@ -4,105 +4,74 @@ Use this file to resume an interrupted active task. Read `AGENTS.md`,
 `CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
 handoff for work in progress.
 
-## Active branch — `feature/context-management` (committed `2b9cb6b`, pushed)
+## State: review acted on, uncommitted on `main` (2026-08-10)
 
-**2026-07-05 repo repair:** `.git/objects` was lost in a ~Jun 29 copy of the repo.
-Restored from origin (origin/main = the branch point, 5e8072c). The branch's 5
-original commits were unrecoverable as history but their content survived in the
-working tree and is now recommitted as `2b9cb6b` and pushed to origin. Ref/reflog
-backups from before the repair: session scratchpad `git-backup/`. Bench harness
-re-validated end-to-end post-repair (eval bash-echo pass; bench targeted-edit
-overall 9.2 on openrouter/openai/gpt-5-nano).
+A full program review found four defects (three reproduced live) plus a set of
+structural gaps; all of it is now implemented and tested but **not yet committed**.
+Details in `Changelog.md` under `[Unreleased]`. Working tree has ~14 modified
+files, 5 new `src/` modules, 5 deletions, and a new CI workflow.
 
-Log-driven hardening of context + input handling, all now in `2b9cb6b`.
-Full suite at last check: **200 pass / 14 fail**; all 14 are
-pre-existing env-dependent (live-provider Stress suite + `/api/models` + message
-stream). `git diff --check` clean.
+### What changed, and why it mattered
 
-Grounded in `data/usage/usage.jsonl` (28 turns: 30:1 input:output, 4 turns >500k
-input, max 1.73M, 6 turns ≥50 tools, 3 failed):
+**Security**
+- Removed the exact-bash shortcut. It scanned the *@file-expanded* prompt for
+  "Call bash with EXACTLY this command…" and ran the rest through `executeTool`
+  with no `checkPermission`. Verified exploitable: a `notes.md` carrying that
+  sentence plus `please summarize @notes.md` executed a command before any model
+  request. The two bench tasks that used it (`count-lines-tool`,
+  `extract-print-help`) are rewritten as genuine task descriptions.
+- Bash "always" approval is scoped to the exact command (`permissionKey`). It
+  used to authorise every later command in the session.
 
-- **Tool-output trimming** — `trimToolOutputs` (src/context.js) collapses old
-  large tool results in the model payload (keep most recent 6); stored history
-  untouched. Wired into `agentLoop`.
-- **Auto-compaction** — `maybeAutoCompact` summarises history past ~60k tokens
-  (`CLAUDETTE_COMPACT_TOKENS`; `CLAUDETTE_AUTO_COMPACT=0` to disable) before a turn.
-- **Iteration cap 50 → 150** (`resolveMaxIterations`) — logs showed 6 turns hitting
-  the old cap; safe now that trimming bounds per-iteration growth.
-- **Idle-prompt paste coalescing** — `createBurstReader` + `readCoalescedPrompt`
-  join readline's per-newline `line` burst so a pasted block is ONE prompt (the
-  in-turn path was already fixed; this closes the idle gap).
-- **Input sanitization** — `sanitizeUserInput` strips ANSI + cuts a single typed
-  line at leaked ⏺/⎿ render glyphs (multi-line pastes kept whole).
-- **Usage-log signals** — `iterations`, `hitToolCap`, `compacted` added to
-  `buildUsageRecord` (+ `turn.compacted` in trace.js) to measure the above.
-- **Clear model-error message** — `explainStreamError`: a turn failing on a bad
-  model id (logs: `gpt-54-mini`, tools=0/in=0) now points at the slug / `/models`.
-- **Re-read guard + anti-over-exploration prompt** — the "results not good" root
-  cause: a real turn made 128 tool calls, first edit at #109, **69% of reads were
-  redundant re-reads** (one file 23×). `read_file` now short-circuits an identical
-  unchanged re-read (per-turn `readCache` in agentLoop → executeTool; changed file
-  / new range still reads); system prompt tells the agent to explore only as needed
-  and act once it understands. (System prompt also renamed "Ollama Code"→"Claudette".)
-- **Action-forcing nudge** (`createActNudger`/`resolveActNudge`, default 15,
-  `CLAUDETTE_ACT_NUDGE`) — re-read guard alone didn't stop flailing (live: still
-  read same files ×dozens, 0 edits). After N read-only tool calls with no edit, a
-  steering line is appended to the last tool result. **Verified live on gpt-5-nano:
-  nudge fired at 3 reads → model immediately made the edit, typo fixed.**
-- **Piped-input EOF fixes (found via live testing):** `readCoalescedPrompt` flushes
-  a buffered line on stream close (was dropped when EOF raced the 40ms window);
-  main loop breaks on `rlClosed`; `rl.resume()` in agentLoop's finally is guarded
-  (was throwing "readline was closed" and crashing a turn when stdin closed
-  mid-turn). +regression test (`echo "/help" | claudette`).
+**Correctness**
+- `dropOrphanToolMessages` strips `role:'tool'` messages with no preceding
+  `tool_calls` from outbound payloads. The shortcut wrote those, and OpenAI/Azure
+  reject the whole request — poisoning the session for every later prompt.
+- `--json-ipc` no longer drops prompts 2..N (`createLineQueue` in `src/input.js`).
+- Compaction archives to `data/sessions/archive/` before summarising.
+- Session writes go through `writeFileAtomic`.
 
-## Live stress test (realistic Next.js "fix the CSS" task, gpt-5-nano)
-Built a sandbox mirroring the real flailing turn (rankings page + components +
-globals.css missing `.rankings-table`). Two kinks found & fixed: (1) a failed
-no-op `patch_file` reset the nudge streak → now a failed action counts toward the
-nudge (`record(name, isError)`); (2) `list_dir` threw on `path:""` → now defaults
-to root. Re-run after fixes: **clean success — 3 successful patches, table fully
-styled, no empty-path errors, no flailing.**
+**Structure — the important one**
+- `src/agent-runner.js` now owns the loop. `chat.js` is a terminal/permission/
+  session shell around `runAgent()`, and `bench/evals.js` runs the same loop
+  instead of its own simpler copy. Hooks: `emit(type,data)`, `onDelta`, `approve`,
+  `takeFollowUps`, `onMaxIterations`. Every appended message is emitted **by
+  reference**, so mirroring into `session.messages` picks up in-place edits (the
+  act nudge appends to the last tool result).
+- Text tool-call parsing moved to `src/tool-call-parser.js`.
+- `chat.js` re-exports the moved helpers, so existing importers are unaffected.
 
-## Verified working from the logs (post-change turns)
-The re-read guard fired 6× across 2 real sessions; 2 of 3 recent turns dropped
-redundant reads from the 69% baseline to **14–29%** with first-edit at call 13–24
-(was 109). One hard turn still flailed (40+ reads, 0 edits) → that's what the
-action-nudge (above) now forces. Token A/B (eval, gpt-5-nano): trim −35% peak.
-- **Eval harness instrumented** — `bench/evals.js` applies trimming (toggle
-  `--no-trim`), records `promptTokens/peakInputTokens/completionTokens`, reports
-  avgIn/avgPeakIn/avgOut; new `context-stress-reads` case (10 sizable files).
-- **/help test fix** — it asserted phantom `/feature`+`/publish` commands; now
-  asserts the real `/diff`+`/commit`.
+**Reliability** — `src/retry.js`: backoff + jitter, `Retry-After`, no retry once
+bytes have streamed, stall watchdog that reports a plain Error (never an
+`AbortError`, which the loop reads as user-cancel).
 
-**Live validation (gpt-5-nano via OpenRouter — user constraint: gpt-5-nano only):**
-context-stress A/B → trim ON peak 7,459 / total 57,978; OFF peak 11,463 / total
-67,988 (**−35% peak, −15% total**), both PASS. Full eval suite (5 cases) all pass
-with trim on.
+**Added** — `-p` headless, `--continue`/`--resume`, Tab completion, `npm test` (offline) /
+`npm run test:live`, GitHub Actions CI on Node 20/22/24.
 
-## Docs-plan review (user asked: delete if fully implemented → KEEP both)
-- `docs/queued-followups-plan.md` — Phase 1 done (queue, /queue, live input);
-  Phase 2 partial (Ctrl+C aborts model, but `executeTool` takes no AbortSignal so
-  foreground Bash/fetch can't be interrupted; `'approval'` input mode defined but
-  never set in chat.js); Phases 3 (background Bash/Ctrl+B) & 4 (browser queue) not
-  started. **Keep.**
-- `docs/parallel-subagents-plan.md` — NOT STARTED (no agent-manager/agent-runner/
-  delegate_agents/`/agents`). **Keep.**
-- Both remain user-owned untracked planning docs — do NOT commit into this branch.
+### Tests
+289 total (277 offline, 12 live). The live-model suites used to hardcode `llama3.2:latest` — not
+installed anywhere, so 13 tests failed on every machine and were miscategorised in
+PERSIST as "env-dependent". They now discover an Ollama model (smallest that
+advertises `tools`; here `qwen3.6:27b-q4_K_M`) and skip with a reason when Ollama
+is absent. The `normalizeArgs` tests asserted against an inlined copy of the alias
+tables in a subprocess; they import the real function now.
 
-## Open follow-ups (next, all log-supported)
-- Queued-followups Phase 2: give `executeTool` an AbortSignal (interrupt foreground
-  Bash/fetch); wire `'approval'` input mode so typing during a permission prompt is
-  queued, not consumed.
-- Prose-pollution: the 04:00 failed turn's prompt had leaked assistant text
-  ("…Absolutely. If you're") with no glyph — sanitizeUserInput can't catch that;
-  root-cause the in-turn capture mixing streamed output into the follow-up buffer.
-- Branch is committed and pushed; decide whether to open a PR to main.
-- Bench with only OPENROUTER_API_KEY: pass `--model`/`--judge` explicitly
-  (OpenRouter catalog entry has no DEFAULT_MODELS, judge default falls back to a
-  local Ollama model that isn't running).
-- Harbor adapter (`bench/harbor/`, 2026-07-05) works end-to-end: first
-  Terminal-Bench 2.0 run scored reward 1.0 on `openssl-selfsigned-cert`
-  (gpt-5-nano). Next: run a wider task slice with a stronger model; consider
-  tuning the verify-gate for non-npm task dirs (it burned ~10 iterations
-  hunting for a build to run); terminal-bench@2.1 not in the public registry
-  yet — re-check later.
+Verified live against local Ollama: headless `-p` returns a clean, pipeable answer
+and exits 0.
+
+### Next steps
+1. **Commit.** Suggest splitting: (a) security + correctness fixes, (b) the runner
+   extraction, (c) reliability, (d) CLI features + CI + cleanup.
+2. **Rebaseline the benchmark.** `count-lines-tool` and `extract-print-help` were
+   4-5/10 *with* a shortcut that did the work; they will score lower now, honestly.
+   `npm run bench -- --task <id> --model <m> --judge <m>` (OpenRouter declares no
+   `DEFAULT_MODELS`, so pass both explicitly), then `npm run bench:leaderboard`.
+3. **MCP client** — the biggest remaining capability gap (9 hardcoded tools).
+4. **Browser parity** — `server.js` still has no tools and duplicates session
+   storage / @file expansion / the system prompt. The extraction unblocks it.
+5. **Subagents** — `docs/parallel-subagents-plan.md`; its Phase 1 (reusable runner)
+   is now done.
+6. **Queued follow-ups Phase 2** — `executeTool` receives a `signal` but ignores
+   it; wire it to `execFile`/`fetch` so Ctrl+C interrupts a foreground command.
+
+Both `docs/*-plan.md` remain user-owned and untracked — do NOT commit them.
