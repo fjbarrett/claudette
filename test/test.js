@@ -51,7 +51,11 @@ const LIVE_MODEL = await (async function discoverLiveModel() {
   }
 })();
 
-const LIVE_SKIP = LIVE_MODEL ? false : 'no local Ollama model available (start Ollama or pull a model)';
+// `--test-skip-pattern` only exists from Node 22, so `npm test` used to fail
+// outright on Node 20. An env var works everywhere and says what it means.
+const LIVE_SKIP = process.env.CLAUDETTE_SKIP_LIVE
+  ? 'live-model suite skipped (CLAUDETTE_SKIP_LIVE); run `npm run test:live` for it'
+  : (LIVE_MODEL ? false : 'no local Ollama model available (start Ollama or pull a model)');
 
 function httpGet(url) {
   return new Promise((resolve, reject) => {
@@ -1743,9 +1747,9 @@ describe('server.js HTTP API', async () => {
     const { status, body } = await httpGet(`${BASE}/api/models`);
     assert.equal(status, 200);
     assert.ok(Array.isArray(body.models), 'models is array');
-    assert.ok(body.models.length > 0, 'has at least one model');
-    const first = body.models[0];
-    assert.ok(first.name, 'model has name');
+    // Content depends on what is reachable — with no Ollama and no key the right
+    // answer is an empty list, not a failure. Only the shape is guaranteed.
+    for (const m of body.models) assert.ok(m.name, 'every model has a name');
   });
 
   test('GET /api/sessions returns sessions list', async () => {
@@ -1960,6 +1964,39 @@ describe('server.js HTTP API', async () => {
 // ─── CLI process tests ────────────────────────────────────────────────────────
 
 describe('CLI (claudette.js)', async () => {
+  // These spawn the real CLI, which refuses to start when no model is reachable.
+  // They used to rely on the developer happening to have Ollama running — so they
+  // passed locally and every one of them failed in CI. Serve a minimal /api/tags
+  // instead, and the suite is hermetic.
+  let modelServer;
+  let modelBaseUrl;
+
+  before(async () => {
+    modelServer = http.createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/api/tags') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          models: [{
+            name: 'mock-cli:latest', size: 1,
+            details: { family: 'mock', parameter_size: '1b' },
+            modified_at: new Date().toISOString(),
+          }],
+        }));
+        return;
+      }
+      // Any chat request gets one short, well-formed response.
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+      res.write(JSON.stringify({ message: { content: 'PONG' } }) + '\n');
+      res.end(JSON.stringify({ done: true, prompt_eval_count: 1, eval_count: 1 }) + '\n');
+    });
+    await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve));
+    modelBaseUrl = `http://127.0.0.1:${modelServer.address().port}`;
+  });
+
+  after(async () => {
+    await new Promise((resolve, reject) => modelServer.close(err => err ? reject(err) : resolve()));
+  });
+
   function runCliWithInput(inputs, options = {}) {
     const {
       timeout = 30_000,
@@ -1972,7 +2009,7 @@ describe('CLI (claudette.js)', async () => {
     return new Promise((resolve, reject) => {
       const proc = spawn('node', ['claudette.js', ...args], {
         cwd,
-        env: { ...process.env, ...env },
+        env: { ...process.env, OLLAMA_BASE_URL: modelBaseUrl, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let stdout = '', stderr = '';
@@ -4443,7 +4480,11 @@ describe('server.js: stream error path', async () => {
   });
 
   test('POST /api/sessions/:id/messages ends with an error record when the provider is unreachable', async () => {
-    const { body: created } = await httpPost(`${base}/api/sessions`, { model: LIVE_MODEL });
+    // A literal bare model id, not LIVE_MODEL: the point is that the PROVIDER is
+    // unreachable, and passing null made the server fall through to
+    // getDefaultModel(), whose answer depends on what is installed.
+    const UNREACHABLE = 'unreachable-model:latest';
+    const { body: created } = await httpPost(`${base}/api/sessions`, { model: UNREACHABLE });
     const sid = created.session.id;
 
     let timer;
@@ -4453,7 +4494,7 @@ describe('server.js: stream error path', async () => {
     const { status, lines } = await Promise.race([
       httpPostStream(`${base}/api/sessions/${sid}/messages`, {
         content: 'Reply with just the number 42.',
-        model: LIVE_MODEL,
+        model: UNREACHABLE,
       }),
       guard,
     ]).finally(() => clearTimeout(timer));

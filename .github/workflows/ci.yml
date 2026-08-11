@@ -2,8 +2,9 @@ name: CI
 
 # The suite has 240+ tests and none of them ran automatically. Everything here is
 # offline: the CLI and server tests drive a mock Ollama over loopback, so no
-# provider key is needed. `npm test` skips the `Stress:` suite, which needs a real
-# local model — run that with `npm run test:live`.
+# provider key and no Ollama is needed — the CLI and server suites serve their own
+# model list over loopback. `npm test` skips the `Stress:` suite (CLAUDETTE_SKIP_LIVE);
+# run that with `npm run test:live` against a local model.
 on:
   push:
     branches: [main]
