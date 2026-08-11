@@ -101,6 +101,29 @@ class Claudette(BaseInstalledAgent):
             if val:
                 env[key] = val
 
+        # Local models. `ollama/<id>` (or a bare id) routes to Ollama, which runs
+        # on the host, not in the task container — so point it at the host gateway
+        # unless the caller already set a reachable URL. Without this, a local
+        # model is simply unusable under Harbor, and every benchmark run costs
+        # money it does not need to.
+        if provider not in _PROVIDER_KEYS:
+            base = os.environ.get("CLAUDETTE_HARBOR_OLLAMA_URL")
+            if not base:
+                host = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+                for local in ("127.0.0.1", "localhost", "0.0.0.0"):
+                    host = host.replace(local, "host.docker.internal")
+                base = host
+            env["OLLAMA_BASE_URL"] = base
+
+        # Pass through the agent tuning knobs the harness cares about, so a run is
+        # reproducible from its environment rather than from whatever the image
+        # happened to default to.
+        for key in ("CLAUDETTE_NUM_CTX", "CLAUDETTE_THINK", "CLAUDETTE_MAX_ITERATIONS",
+                    "CLAUDETTE_EFFORT", "CLAUDETTE_STALL_TIMEOUT", "CLAUDETTE_MAX_RETRIES"):
+            val = os.environ.get(key)
+            if val:
+                env[key] = val
+
         # One line in, JSONL out: claudette's --json-ipc reads a prompt line,
         # runs the full agentic turn, and exits on stdin EOF. json.dumps keeps
         # multi-line instructions on a single physical line.
