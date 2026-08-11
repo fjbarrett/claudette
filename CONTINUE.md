@@ -4,12 +4,14 @@ Use this file to resume an interrupted active task. Read `AGENTS.md`,
 `CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
 handoff for work in progress.
 
-## State: review acted on, committed on `feature/review-hardening` (2026-08-10)
+## State: review + hardening + cleanup, committed on `feature/review-hardening` (2026-08-10)
 
 A full program review found four defects (three reproduced live) plus a set of
-structural gaps; all of it is implemented, tested, and committed as three commits
-on `feature/review-hardening` (4e14853, c00e615, c2a08e7). Details in
+structural gaps; a second pass then finished the "before 1.0" security items and
+cleaned the repo. All committed on `feature/review-hardening`. Details in
 `Changelog.md` under `[Unreleased]`.
+
+**Suite: 306/306, live model tests included.**
 
 ### What changed, and why it mattered
 
@@ -73,7 +75,8 @@ and exits 0.
    storage / @file expansion / the system prompt. The extraction unblocks it.
 5. **Subagents** — `docs/parallel-subagents-plan.md`; its Phase 1 (reusable runner)
    is now done.
-6. **Queued follow-ups Phase 2** — `executeTool` receives a `signal` but ignores
-   it; wire it to `execFile`/`fetch` so Ctrl+C interrupts a foreground command.
+6. **Queued follow-ups, rest of Phase 2** — Ctrl+C interrupts a foreground tool
+   now; what remains is the `'approval'` input mode, so text typed during a
+   permission prompt queues instead of answering it.
 
 Both `docs/*-plan.md` remain user-owned and untracked — do NOT commit them.
