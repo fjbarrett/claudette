@@ -73,7 +73,7 @@ bytes have streamed, stall watchdog that reports a plain Error (never an
 `npm run test:live`, GitHub Actions CI on Node 20/22/24.
 
 ### Tests
-**289 / 289 passing, including the live-model suite** — the first fully green run.
+**318 total: 316 passing, 0 failing** (2 live-model tests skip without `CLAUDETTE_SKIP_LIVE`; `npm run test:live` runs them).
 Those 12 live tests used to hardcode `llama3.2:latest`, which was not installed, so
 they failed on every machine and were miscategorised in PERSIST as
 "env-dependent". They now discover an installed Ollama model (smallest that
@@ -86,6 +86,39 @@ tables in a subprocess; they import the real function now.
 Verified live against local Ollama: headless `-p` returns a clean, pipeable answer
 and exits 0.
 
+### Mid-turn steering (done 2026-08-11)
+Typing while the agent works now queues a follow-up in **any TTY session**; it
+previously required `--yolo`. The blocker was stdin ownership — `checkPermission`
+wanted readline's `question()` while the raw-mode reader held stdin — so both now
+share one reader: `InputController.awaitApproval()` parks the prompt, `submit()`
+sends `y`/`n`/`a` to it and queues everything else. Ctrl+C denies a parked
+approval before aborting; `runTurn`'s finally settles one if the turn dies.
+
+Verified in a real pty with `expect` (`scratchpad/steer.exp`) — blind
+timing cannot test this, because a `y` sent before the prompt appears correctly
+becomes a follow-up. Observed: prose queued at the `[y/n/a]` gate, prompt still
+waiting, `y` then ran the tool, queue drained at the safe boundary, model acted
+on the steer.
+
+**Known edge, not fixed:** slash commands other than `/queue` typed mid-turn are
+queued as prose and sent to the model — so `/exit` during a turn steers rather
+than exits. Ctrl+C is the documented interrupt. Decide the intended behaviour
+before changing it.
+
+### Model bake-off — PAUSED mid-run (2026-08-11)
+Stopped at the user's request. Complete: 8 local + 2 frontier, 5 eval cases each
+(`scratchpad/bakeoff.tsv`). Winner `qwen3.6:35b-a3b-opencode` (5/5, 55s).
+- **Never benchmarked** (killed mid-run): `qwen3-coder:30b`, `gpt-oss:20b`,
+  `devstral:24b`.
+- **Partially pulled**: `laguna-xs-2.1` (473MB of 20GB; Ollama keeps the blob).
+  Also queued but not started: `north-mini-code-1.0` (30B MoE/3B active, Cohere),
+  `lfm2.5` (8B, built for consumer-hardware tool calling). Both were picked to
+  match the winner's profile — MoE with ~3B active params, which is where the
+  5.7x generation-speed edge came from.
+- Tie-break round needs the 3 harder eval cases restored from
+  `scratchpad/staged-cases/` to `bench/evals/` (staged out so the 5-case
+  comparison stayed consistent). 4+ models tie at 5/5.
+
 ### Next steps
 1. **Open a PR to main** (branch is pushed).
 2. **Rebaseline the benchmark.** `count-lines-tool` and `extract-print-help` were
@@ -97,8 +130,9 @@ and exits 0.
    storage / @file expansion / the system prompt. The extraction unblocks it.
 5. **Subagents** — `docs/parallel-subagents-plan.md`; its Phase 1 (reusable runner)
    is now done.
-6. **Queued follow-ups, rest of Phase 2** — Ctrl+C interrupts a foreground tool
-   now; what remains is the `'approval'` input mode, so text typed during a
-   permission prompt queues instead of answering it.
+6. **Queued follow-ups, Phase 3+** — phases 1-2 are done (see above). Next is
+   `Ctrl+B` to background a long-running Bash command, which shares a task
+   registry with `docs/parallel-subagents-plan.md`, then browser parity (a
+   server-side per-session queue).
 
 Both `docs/*-plan.md` remain user-owned and untracked — do NOT commit them.
