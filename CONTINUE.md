@@ -4,12 +4,12 @@ Use this file to resume an interrupted active task. Read `AGENTS.md`,
 `CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
 handoff for work in progress.
 
-## State: review acted on, uncommitted on `main` (2026-08-10)
+## State: review acted on, committed on `feature/review-hardening` (2026-08-10)
 
 A full program review found four defects (three reproduced live) plus a set of
-structural gaps; all of it is now implemented and tested but **not yet committed**.
-Details in `Changelog.md` under `[Unreleased]`. Working tree has ~14 modified
-files, 5 new `src/` modules, 5 deletions, and a new CI workflow.
+structural gaps; all of it is implemented, tested, and committed as three commits
+on `feature/review-hardening` (4e14853, c00e615, c2a08e7). Details in
+`Changelog.md` under `[Unreleased]`.
 
 ### What changed, and why it mattered
 
@@ -49,19 +49,21 @@ bytes have streamed, stall watchdog that reports a plain Error (never an
 `npm run test:live`, GitHub Actions CI on Node 20/22/24.
 
 ### Tests
-289 total (277 offline, 12 live). The live-model suites used to hardcode `llama3.2:latest` — not
-installed anywhere, so 13 tests failed on every machine and were miscategorised in
-PERSIST as "env-dependent". They now discover an Ollama model (smallest that
-advertises `tools`; here `qwen3.6:27b-q4_K_M`) and skip with a reason when Ollama
-is absent. The `normalizeArgs` tests asserted against an inlined copy of the alias
+**289 / 289 passing, including the live-model suite** — the first fully green run.
+Those 12 live tests used to hardcode `llama3.2:latest`, which was not installed, so
+they failed on every machine and were miscategorised in PERSIST as
+"env-dependent". They now discover an installed Ollama model (smallest that
+advertises `tools`) and skip with a reason when Ollama is absent. `llama3.2:3b`,
+`qwen3:4b` and `qwen2.5-coder:7b` were pulled for this; discovery picks
+`llama3.2:3b`, which runs each Stress prompt in 2-9s instead of the 118-240s a 27B
+model took. The `normalizeArgs` tests asserted against an inlined copy of the alias
 tables in a subprocess; they import the real function now.
 
 Verified live against local Ollama: headless `-p` returns a clean, pipeable answer
 and exits 0.
 
 ### Next steps
-1. **Commit.** Suggest splitting: (a) security + correctness fixes, (b) the runner
-   extraction, (c) reliability, (d) CLI features + CI + cleanup.
+1. **Open a PR to main** (branch is pushed).
 2. **Rebaseline the benchmark.** `count-lines-tool` and `extract-print-help` were
    4-5/10 *with* a shortcut that did the work; they will score lower now, honestly.
    `npm run bench -- --task <id> --model <m> --judge <m>` (OpenRouter declares no

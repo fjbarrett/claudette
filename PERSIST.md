@@ -39,7 +39,7 @@ bench/            Benchmark harness (run.js, worktree runs, reports) + evals.js 
                   + harbor/ (Terminal-Bench adapter)
 data/sessions/    Persisted session JSON files; archive/ holds pre-compaction history
 public/           Web UI (index.html, styles.css, app.js, bench.html dashboard)
-test/test.js      Test suite (288 tests); live-model suites auto-discover an Ollama model and skip without one
+test/test.js      Test suite (289 tests, all passing); live-model suites auto-discover an Ollama model and skip without one
 .github/workflows/ci.yml  Offline suite on Node 20/22/24 + bench-task validation
 ```
 
@@ -116,7 +116,7 @@ unapproved-exec and the orphan-`tool`-message session poisoning), per-command ba
 approval, `--json-ipc` multi-prompt fix, `src/agent-runner.js` extraction (+ evals.js
 migrated onto it), provider retry/backoff/stall, atomic session writes, throttled
 transcripts, non-destructive compaction, `-p`/`--continue`/`--resume`, Tab completion,
-`npm test` + CI, live-test model discovery, dynamic test ports. Suite 289 tests (277 offline).
+`npm test` + CI, live-test model discovery, dynamic test ports. **Suite 289/289 green including live tests** (277 offline).
 
 **Next, in order:**
 - **MCP client.** Nine hardcoded tools vs. the whole ecosystem — the largest single
