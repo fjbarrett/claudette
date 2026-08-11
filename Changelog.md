@@ -3,6 +3,22 @@
 ## [Unreleased]
 
 ### Security
+
+- **A symlink inside the workspace could read and write outside it.** `guardPath`
+  compared relative paths, which catches `../etc/passwd` but not
+  `ln -s /etc/passwd notes.txt` — that link is lexically innocent, and
+  `read_file notes.txt` walked straight out. The real path is now resolved and
+  re-checked, including for files that do not exist yet (`write_file` creates
+  them), so a new file is validated as strictly as an existing one.
+- **`glob` no longer touches a shell.** It ran `bash -c 'shopt -s globstar;
+  files=($1); …'` with the model-controlled pattern as a positional parameter.
+  That was careful, and it still meant an auto-approved tool handing
+  attacker-influenced text to a shell. The matcher walks the tree directly now,
+  prunes `node_modules`/`.git` during the walk rather than filtering afterwards,
+  and omits symlinks that leave the workspace.
+- **The unauthenticated server accepted unbounded request bodies.** Capped at 1 MB
+  (`CLAUDETTE_MAX_BODY_BYTES`), answering 413 rather than resetting the connection,
+  and malformed JSON is a 400 instead of a 500.
 - **A file you asked Claudette to read could run shell commands with no
   permission prompt.** `handleMessage` scanned the prompt for a benchmark escape
   hatch ("Call bash with EXACTLY this command…") and ran whatever followed
@@ -20,6 +36,22 @@
   scoped to the exact command (`permissionKey`), and the prompt says which.
 
 ### Fixed
+
+- **Ctrl+C now interrupts a running tool, not just the model request.** The abort
+  controller was created per model request and cleared before tools ran, so during
+  the long part of a turn — a `npm run build` that hangs — nothing was listening
+  and Ctrl+C killed the process instead. One controller now spans the turn and is
+  threaded into `execFile`/`fetch`. An interrupted command says so, rather than
+  claiming it timed out and sending the model off to tune `CLAUDETTE_BASH_TIMEOUT`.
+- **Two concurrent turns on one web session silently lost one of them.** Both
+  loaded the session, both appended, and the slower save clobbered the faster.
+  The second request gets 409 now, and the slot is claimed synchronously — checking
+  before the first `await` left a window where both passed.
+- Closing the browser tab used to leave the provider call running to completion,
+  billed and discarded; it is aborted with the response.
+- `executeTool` rejected `signal: null`. `execFile` validates that option as
+  AbortSignal-or-undefined, so a caller with no signal to give (the eval harness)
+  broke every command before it ran.
 - **The exact-bash shortcut poisoned sessions on OpenAI-compatible providers.**
   Both its branches appended a `role: 'tool'` message with no preceding
   `tool_calls`; OpenAI and Azure reject the entire request with *"messages with
@@ -59,18 +91,11 @@
   derived data, so it now writes at most every 2s and is flushed exactly at turn
   end and on exit (`CLAUDETTE_TRANSCRIPT_THROTTLE`).
 
-### Changed
-- **The agent loop is now `src/agent-runner.js`, shared by everything.** It lived
-  inside `chat.js`, tangled with readline and the spinner, so `bench/evals.js`
-  carried a second, simpler copy and the browser had none. Every behaviour added
-  to the CLI — the re-read guard, the action nudge, the verification gate, payload
-  trimming — was invisible to the harness measuring it, so the benchmark scored a
-  different agent than the one that ships. `runAgent()` has no terminal in it;
-  callers supply rendering, permissions, and persistence through hooks. The CLI is
-  now a shell around it, and the eval harness runs the real loop. The text
-  tool-call parser moved to `src/tool-call-parser.js` for the same reason.
-
 ### Added
+
+- `CLAUDETTE_NUM_CTX` — Ollama's context window was hardcoded to 32k, so models
+  advertising far more (qwen3.6 exposes 256k) had no way to use it. Still defaults
+  to 32k, because Ollama's own default of 4096 truncates an agent loop immediately.
 - `claudette -p "…"` — headless one-shot mode. Prints the reply and nothing else
   (no banner, spinner, or cost footer), so it pipes cleanly, and exits non-zero
   when the turn fails.
@@ -81,7 +106,27 @@
 - CI (`.github/workflows/ci.yml`) on Node 20/22/24, plus `npm test` and
   `npm run test:offline` — a 240-test suite existed and nothing ran it.
 
+### Changed
+
+- `AGENTS.md` is the single source for agent conventions; `CLAUDE.md` and
+  `GEMINI.md` point at it. Three near-identical copies had already drifted — one
+  said trim history to 50 rows, another 20, and `GEMINI.md` never carried the
+  commit-attribution rule at all.
+- Removed the legacy `.persist/` state directory (superseded by `PERSIST.md`; it
+  still described the project as "Ollama Code Console" at a path that no longer
+  exists), the orphaned `cli.js`, and the unused `workspace/` fixtures.
+- **The agent loop is now `src/agent-runner.js`, shared by everything.** It lived
+  inside `chat.js`, tangled with readline and the spinner, so `bench/evals.js`
+  carried a second, simpler copy and the browser had none. Every behaviour added
+  to the CLI — the re-read guard, the action nudge, the verification gate, payload
+  trimming — was invisible to the harness measuring it, so the benchmark scored a
+  different agent than the one that ships. `runAgent()` has no terminal in it;
+  callers supply rendering, permissions, and persistence through hooks. The CLI is
+  now a shell around it, and the eval harness runs the real loop. The text
+  tool-call parser moved to `src/tool-call-parser.js` for the same reason.
+
 ### Tests
+
 - The live-provider suite was unrunnable, not "environment-dependent". Thirteen
   tests hardcoded `llama3.2:latest`; they now discover an installed Ollama model
   (preferring one that advertises tool support) and skip with a reason when none
@@ -92,7 +137,8 @@
 - New coverage for the extracted runner, retry/backoff/stall behaviour, tab
   completion, atomic writes, and the compaction archive.
 
-### Fixed (earlier)
+### Fixed (earlier, same release)
+
 - Recoverable tool errors now guide the model instead of repeating. Across real
   sessions 13% of tool calls errored, dominated by three recoverable mistakes —
   file-not-found (59×), missing/empty path (38×), and path-outside-workspace

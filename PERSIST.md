@@ -10,8 +10,8 @@
 **Structure:**
 ```
 claudette.js      CLI entry point (-p headless, --continue/--resume, --json-ipc)
-server.js         HTTP API + static server (chat + trace dashboard; no tools yet)
-cli.js            Legacy CLI (uses server as backend)
+server.js         HTTP API + static server (chat + trace dashboard; no tools yet).
+                  Body cap, one turn per session, aborts the provider call when the client disconnects
 src/
   env.js          Zero-dep .env parser/loader; env-autoload.js side-effect (first import in entry points)
   config.js       Ollama base URL resolver (OLLAMA_BASE_URL/OLLAMA_HOST; OPENAI_* no longer routed here)
@@ -19,14 +19,15 @@ src/
                   Owns iteration cap, act nudge, verify gate, payload trim, orphan-tool-message repair
   chat.js         REPL + slash commands; a terminal/permission/session shell around runAgent()
   tool-call-parser.js  Text-emitted tool-call parsing + per-tool arg alias tables
-  tools.js        Tool definitions + executors (bash/read_file/write_file/str_replace/list_dir/search_code/fetch_url/patch_file)
+  tools.js        Tool definitions + executors (bash/read_file/write_file/str_replace/list_dir/search_code/fetch_url/patch_file).
+                  Symlink-aware workspace boundary; shell-free glob; every executor takes an AbortSignal
   retry.js        Retry policy, backoff+jitter, Retry-After, stall watchdog, provider error shaping
   fs-atomic.js    writeFileAtomic (temp + rename)
   completion.js   Tab completion for slash commands and @paths
   session.js      Session CRUD (data/sessions/*.json) + archiveMessages -> sessions/archive/
   context.js      CLAUDE.md loader, @file expansion, trimToolOutputs
   transcript.js   Derived text transcripts, throttled + flushable
-  ollama.js       Ollama API client (getModels, chatStream)
+  ollama.js       Ollama API client (getModels, chatStream); num_ctx via CLAUDETTE_NUM_CTX (default 32k)
   anthropic.js    Anthropic Messages API client (native; anthropic/ + legacy anthropic:)
   openai.js       OpenAI adapter + shared OpenAI-compatible Chat Completions transport + provider factory
   deepseek.js     DeepSeek adapter (deepseek/) — reuses openai.js transport
@@ -39,7 +40,8 @@ bench/            Benchmark harness (run.js, worktree runs, reports) + evals.js 
                   + harbor/ (Terminal-Bench adapter)
 data/sessions/    Persisted session JSON files; archive/ holds pre-compaction history
 public/           Web UI (index.html, styles.css, app.js, bench.html dashboard)
-test/test.js      Test suite (289 tests, all passing); live-model suites auto-discover an Ollama model and skip without one
+test/test.js      Test suite (305 tests, all passing); live-model suites auto-discover an Ollama model and skip without one
+AGENTS.md         Single source for agent conventions; CLAUDE.md and GEMINI.md point at it
 .github/workflows/ci.yml  Offline suite on Node 20/22/24 + bench-task validation
 ```
 
@@ -111,55 +113,65 @@ test/test.js      Test suite (289 tests, all passing); live-model suites auto-di
 
 ### Outstanding Tasks
 
-**Done 2026-08-10** (see Changelog `[Unreleased]`): exact-bash bypass removed (both the
-unapproved-exec and the orphan-`tool`-message session poisoning), per-command bash
-approval, `--json-ipc` multi-prompt fix, `src/agent-runner.js` extraction (+ evals.js
-migrated onto it), provider retry/backoff/stall, atomic session writes, throttled
-transcripts, non-destructive compaction, `-p`/`--continue`/`--resume`, Tab completion,
-`npm test` + CI, live-test model discovery, dynamic test ports. **Suite 289/289 green including live tests** (277 offline).
+**Shipped 2026-08-10** — see `Changelog.md` `[Unreleased]` for the full list.
+Two passes: the review response (exact-bash bypass, agent-runner extraction,
+provider retry/stall, atomic writes, `-p`/`--resume`, Tab completion, CI), then
+the hardening pass (symlink-aware workspace boundary, shell-free `glob`,
+interruptible tools, server body/concurrency/disconnect limits, `CLAUDETTE_NUM_CTX`).
 
 **Next, in order:**
 - **MCP client.** Nine hardcoded tools vs. the whole ecosystem — the largest single
   capability jump available. stdio + SSE transports, tool discovery, schema translation.
 - **Browser parity.** `server.js` still streams chat with no tools and duplicates
   session storage, @file expansion, and the system prompt instead of using
-  `src/session.js` / `src/context.js` / `runAgent`. Now unblocked by the extraction.
+  `src/session.js` / `src/context.js` / `runAgent`. Unblocked by the extraction.
 - **Subagents** — `docs/parallel-subagents-plan.md` Phase 2+; Phase 1 (reusable runner) is done.
-- **Queued follow-ups Phase 2** — `executeTool` takes a `signal` now but ignores it;
-  wire it to `execFile`/`fetch` so Ctrl+C interrupts a foreground command, and set the
-  `'approval'` input mode so typing during a permission prompt queues instead of answering.
-- Persisted permission rules (allow/ask/deny globs per project). `alwaysAllow` is still
-  an in-memory Set that dies with the process.
-- Before public 1.0: make `glob` shell-free; enforce realpath/symlink workspace
-  boundaries; add request/body limits to the unauthenticated server; rebaseline the
-  benchmark (the two shortcut tasks are now honest task descriptions and will score
-  lower until models actually do the work).
-- `count-lines-tool` and `extract-print-help` were 4-5/10 *with* a shortcut that did the
-  work for them; expect a fresh, lower baseline.
-- `count-lines-tool` and `extract-print-help` stuck at 4-5/10 — need 32B+ model or structured-task shortcut to improve.
-- Port bench harness to Windows machine at 192.168.0.178 (Node/Ollama/bash already installed) — use remote EC2 Ollama via SSH tunnel.
-- Re-run full benchmark matrix after any model upgrade.
+- **Queued follow-ups, the rest of Phase 2** — Ctrl+C now interrupts a foreground
+  tool. Still to do: the `'approval'` input mode, so typing during a permission
+  prompt queues instead of answering it.
+- Persisted permission rules (allow/ask/deny globs per project). `alwaysAllow` is
+  still an in-memory Set that dies with the process.
+- **Rebaseline the benchmark.** `count-lines-tool` and `extract-print-help` are honest
+  task descriptions now; the old 4-5/10 was scored with a shortcut that did the work.
+  Expect lower, real numbers. Then regenerate `bench/LEADERBOARD.md`.
+- Replace the `verify:` grep assertions with real tests — `grep -q 'count_lines'
+  src/tools.js` is satisfied by `echo count_lines >> src/tools.js`.
+- Port the bench harness to the Windows box at 192.168.0.178 (Node/Ollama/bash
+  installed) — use the remote EC2 Ollama over an SSH tunnel.
 
 ### Feature Ideas
 
-**Audit priorities (2026-06-12):**
-- Security: bind the web server to loopback by default or add authentication; remove the production exact-bash benchmark shortcut; make `glob` shell-free; enforce realpath/symlink workspace boundaries.
-- Privacy: add transcript/session recording controls, redaction, retention, deletion, and a clear startup indicator.
-- Architecture: move the web server onto the shared provider/session/context/agent core so every provider and tool workflow behaves consistently across CLI and browser.
-- Reliability: add request/body limits, provider timeouts/retries, client-disconnect cancellation, atomic session writes, and concurrent-turn protection.
-- Product: position Claudette as a multi-provider coding-agent workbench; make the browser a real tool-capable agent or describe it explicitly as a chat/trace dashboard.
-- Interaction: implement `docs/queued-followups-plan.md` — live prompt during execution, visible FIFO follow-ups injected at safe model/tool boundaries, interrupt/redirect, then background Bash and browser parity.
-- Parallel agents: implement `docs/parallel-subagents-plan.md` — extract a reusable runner, add capped read-only subagents, then isolated worktree editing and eventually peer-coordinated teams.
+**Product / architecture:**
+- Position Claudette as a multi-provider coding-agent workbench; either make the
+  browser a real tool-capable agent or keep describing it as a chat/trace dashboard.
+- Privacy: transcript/session recording controls, redaction, retention, deletion,
+  and a startup indicator that recording is on.
+- Adopt opencode's one-server-many-clients shape: OpenAPI spec + SSE events;
+  `--attach` a warm server so the bench harness skips per-prompt boot.
 
 **Multi-provider roadmap (from terminal-bench / lm-eval-harness / HELM / KIRA / opencode research):**
-- _Highest leverage (opencode):_ consider building the model layer on the Vercel AI SDK provider packages + Models.dev metadata, with `@ai-sdk/openai-compatible` as the generic BYO-endpoint path — collapses most hand-maintained provider code and gives 75+ providers + model limits/cost for ~free.
-- Split secrets out of env/config into a credentials store + interactive `claudette auth login` (provider menu, OAuth *and* pasted keys). Anthropic Claude-subscription OAuth worth supporting.
-- `$schema` JSONC config, deep-merged global→project, with `{env:VAR}` substitution; `small_model` slot for cheap auxiliary calls (judge titles/summaries) to cut bench cost.
-- Per-provider config: `baseURL`/`apiKey`/`headers` + capability flags (`supportsTools`, `chatOnly`, pricing) + `concurrency`/`maxRetries`/`timeout` with exponential backoff (lm-eval).
-- Permissions map (`allow`/`ask`/`deny`, glob-matched bash, last-match-wins, per-agent merge) + `external_directory` guard (opencode).
-- **Bench harness upgrades (Scoped 2026-06-12):**
-  - *Phase 1 (Robustness & Caching):* Request caching (local `.cache/` hash map) for deterministic/free re-judging; robust subprocess communication via structured IPC/JSON protocol instead of terminal prompt token regex; task-level custom idle timeouts.
-  - *Phase 2 (Granularity):* Track token counts/cost/durations per run; multi-metric result vector (correctness, cost-efficiency, speed) in reports and leaderboard.
-  - *Phase 3 (DX & Orchestration):* Migrate to YAML task definitions (allows clean multi-line blocks); tag/suite grouping and filtering; resumable execution for interrupted runs.
-- **Agent loop (KIRA):** per-step token+cost trajectory; two-phase "are you sure?" completion gate with a test/QA/user checklist (reusable as a judge rubric); graceful context-overflow fallback (summarize → minimal-context retry); structured `analysis`/`plan` fields inside the action tool schema.
-- Adopt opencode's one-server-many-clients shape: OpenAPI spec + SSE events; `--attach` a warm server for the bench harness to skip per-prompt boot.
+- _Highest leverage (opencode):_ consider building the model layer on the Vercel AI SDK
+  provider packages + Models.dev metadata, with `@ai-sdk/openai-compatible` as the generic
+  BYO-endpoint path — collapses most hand-maintained provider code and gives 75+ providers
+  plus model limits/cost for ~free.
+- Split secrets out of env/config into a credentials store + interactive `claudette auth
+  login` (provider menu, OAuth *and* pasted keys). Anthropic Claude-subscription OAuth
+  worth supporting.
+- `$schema` JSONC config, deep-merged global→project, with `{env:VAR}` substitution;
+  `small_model` slot for cheap auxiliary calls (judge titles/summaries) to cut bench cost.
+- Per-provider config: `baseURL`/`apiKey`/`headers` + capability flags (`supportsTools`,
+  `chatOnly`, pricing) + `concurrency`/`maxRetries`/`timeout`.
+- Permissions map (`allow`/`ask`/`deny`, glob-matched bash, last-match-wins, per-agent
+  merge) + `external_directory` guard (opencode).
+
+**Bench harness upgrades:**
+- Per-run token counts/cost/durations; multi-metric result vector (correctness,
+  cost-efficiency, speed) in reports and the leaderboard.
+- Tag/suite grouping and filtering; resumable execution for interrupted runs;
+  task-level custom idle timeouts.
+- Container-per-task isolation instead of git worktrees, so a run reproduces on
+  another machine (this is what separates `bench/` from Terminal-Bench).
+
+**Agent loop (KIRA):**
+- Per-step token+cost trajectory; graceful context-overflow fallback (summarize →
+  minimal-context retry); structured `analysis`/`plan` fields inside the action tool schema.

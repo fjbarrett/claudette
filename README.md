@@ -163,6 +163,12 @@ Ollama use their own native APIs (`src/anthropic.js`, `src/ollama.js`).
 - `CLAUDETTE_AUTO_COMPACT` / `CLAUDETTE_COMPACT_TOKENS`: history compaction (`0` / default `60000`).
   Compaction archives the full history to `data/sessions/archive/` before summarising
 - `CLAUDETTE_BASH_TIMEOUT` / `CLAUDETTE_BASH_OUTPUT_CHARS`: bash tool limits, default `120000` ms / `16000` chars
+- `CLAUDETTE_NUM_CTX`: Ollama context window, default `32768`. Raise it for models
+  that support more (qwen3.6 exposes 256k); Ollama's own default is 4096, which
+  truncates an agent loop almost immediately, so one is always sent
+
+Ctrl+C interrupts a running tool as well as the model request, so a hung
+`npm run build` can be stopped without killing the session.
 
 ### Provider resilience
 
@@ -172,6 +178,16 @@ Ollama use their own native APIs (`src/anthropic.js`, `src/ollama.js`).
 - `CLAUDETTE_STALL_TIMEOUT`: give up when a provider sends nothing for this long,
   default `300000` ms; `0` waits indefinitely
 - `CLAUDETTE_QUIET_RETRIES=1`: don't print the retry notice
+
+### Web server
+
+- `CLAUDETTE_MAX_BODY_BYTES`: request body cap, default `1048576` (1 MB); over it the
+  server answers 413
+- One turn per session at a time; a second concurrent POST gets 409. Closing the tab
+  aborts the provider call instead of paying for a response nobody reads
+
+The server binds loopback and has no authentication. `HOST=0.0.0.0` exposes an
+unauthenticated agent to your LAN — don't.
 
 > Note: `OPENAI_BASE_URL` / `OPENAI_API_BASE` no longer configure Ollama (that was
 > a legacy fallback). `OPENAI_BASE_URL` now configures the OpenAI provider; use
