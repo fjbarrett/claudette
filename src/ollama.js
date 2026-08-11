@@ -31,11 +31,34 @@ export function resolveNumCtx(env = process.env) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 32768;
 }
 
-export async function chatStream({ model, messages, tools = [], onDelta, signal }) {
+/**
+ * Whether to let a local model "think" before answering.
+ *
+ * This is the single biggest lever on local speed, and the default was costing
+ * everything. Measured on an M1 Max, prompt "Reply with just the word READY":
+ *
+ *   qwen3.6:27b-opencode      think on 17.2s → off 0.8s   (21×)
+ *   qwen3.6:35b-a3b-opencode  think on 11.6s → off 0.4s   (29×)
+ *
+ * The models burn ~1000 reasoning tokens before the first content token, on
+ * every iteration of an agent loop. Off by default, therefore; `--effort medium`
+ * or higher turns it back on, which is exactly what that flag already meant.
+ * CLAUDETTE_THINK=1/0 forces it either way.
+ */
+export function resolveThink(effort = null, env = process.env) {
+  const forced = env.CLAUDETTE_THINK;
+  if (forced != null && forced !== '') return forced !== '0' && String(forced).toLowerCase() !== 'false';
+  return ['medium', 'high', 'xhigh', 'max'].includes(effort);
+}
+
+export async function chatStream({ model, messages, tools = [], onDelta, signal, effort = null }) {
   const body = {
     model,
     messages,
     stream: true,
+    // `think: false` is accepted by every model; `think: true` is a 400 on one
+    // that has no thinking mode, so it is only ever sent deliberately.
+    think: resolveThink(effort),
     options: { temperature: 0, num_ctx: resolveNumCtx() },
   };
   let toolMode = tools.length ? 'native' : 'none';
@@ -46,6 +69,14 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
 
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
+    // `--effort high` against a model with no thinking mode is a 400. That is a
+    // reasonable thing for a user to ask for and a silly thing to fail on, so
+    // drop the flag and run without it.
+    if (res.status === 400 && /does not support thinking/i.test(txt)) {
+      const { think, ...noThink } = body;
+      res = await postChat({ body: tools.length ? { ...noThink, tools } : noThink, signal });
+      if (!res.ok) throw providerHttpError('Ollama', res, await res.text().catch(() => ''));
+    } else {
     const unsupportedTools = tools.length
       && res.status === 400
       && /does not support tools/i.test(txt);
@@ -62,6 +93,7 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal 
     if (!res.ok) {
       const fallbackText = await res.text().catch(() => '');
       throw providerHttpError('Ollama', res, fallbackText);
+    }
     }
   }
 

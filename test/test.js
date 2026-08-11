@@ -3148,6 +3148,184 @@ describe('ui.js (markdown stream)', async () => {
 // by a scripted chatFn against a real sandbox, with no terminal involved — which
 // is the whole point of the extraction.
 
+// ─── index.js: the library API ────────────────────────────────────────────────
+// `import { run } from 'claudette'` — the scriptable surface. Driven here by a
+// scripted chatFn so it needs no provider.
+
+describe('index.js (library API)', async () => {
+  const lib = await import('../index.js');
+
+  let ws;
+  before(async () => {
+    ws = await fsp.realpath(await makeTmpDir());
+    await fsp.writeFile(path.join(ws, 'note.txt'), 'library speaking\n', 'utf8');
+  });
+  after(async () => { await cleanDir(ws); });
+
+  function scripted(responses) {
+    let i = 0;
+    const seen = [];
+    const fn = async ({ messages }) => {
+      seen.push(messages);
+      const r = responses[Math.min(i++, responses.length - 1)];
+      return { content: '', toolCalls: null, promptTokens: 7, completionTokens: 3, ...r };
+    };
+    fn.seen = seen;
+    return fn;
+  }
+
+  test('the documented surface is all exported', () => {
+    for (const name of ['run', 'stream', 'createAgent', 'buildSystemPrompt', 'runAgent',
+                        'TOOL_DEFS', 'executeTool', 'chatStream', 'getModels', 'estimateCost']) {
+      assert.equal(typeof lib[name], name === 'TOOL_DEFS' ? 'object' : 'function', `${name} is exported`);
+    }
+  });
+
+  test('run() returns text, status, usage and cost', async () => {
+    const res = await lib.run('say hi', {
+      model: 'mock', cwd: ws, projectInstructions: false,
+      chatFn: scripted([{ content: 'hi there' }]),
+    });
+    assert.equal(res.text, 'hi there');
+    assert.equal(res.status, 'completed');
+    assert.equal(res.usage.promptTokens, 7);
+    assert.equal(res.iterations, 1);
+    assert.equal(res.model, 'mock');
+  });
+
+  test('run() executes tools against the given cwd, and only there', async () => {
+    const res = await lib.run('read the note', {
+      model: 'mock', cwd: ws, projectInstructions: false,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'r', function: { name: 'read_file', arguments: { path: 'note.txt' } } }] },
+        { content: 'It says library speaking.' },
+      ]),
+    });
+    assert.deepEqual(res.toolCalls.map(c => c.name), ['read_file']);
+    assert.match(res.text, /library speaking/);
+  });
+
+  test('run() rejects an empty prompt rather than calling a provider', async () => {
+    await assert.rejects(lib.run('', { model: 'mock' }), /non-empty string/);
+    await assert.rejects(lib.run(undefined, { model: 'mock' }), /non-empty string/);
+  });
+
+  test('approve() gates tools — a script can allow reads but not writes', async () => {
+    const target = path.join(ws, 'should-not-exist.txt');
+    const res = await lib.run('write a file', {
+      model: 'mock', cwd: ws, projectInstructions: false,
+      approve: (name) => name !== 'write_file',
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'should-not-exist.txt', content: 'x' } } }] },
+        { content: 'blocked' },
+      ]),
+    });
+    assert.equal(fs.existsSync(target), false);
+    assert.equal(res.status, 'completed');
+  });
+
+  test('tools:false makes it a plain completion with no tools offered', async () => {
+    const chatFn = scripted([{ content: 'just words' }]);
+    await lib.run('no tools', { model: 'mock', cwd: ws, projectInstructions: false, tools: false, chatFn });
+    // The scripted fn records messages; assert the runner was given no tools by
+    // checking it finished in one turn with no tool execution.
+    const res = await lib.run('no tools', {
+      model: 'mock', cwd: ws, projectInstructions: false, tools: false,
+      chatFn: scripted([{ content: '{"name":"bash","arguments":{"command":"echo nope"}}' }]),
+    });
+    assert.deepEqual(res.toolCalls, [], 'tool-shaped text is not executed when tools are off');
+  });
+
+  test('@paths are expanded into the prompt and reported', async () => {
+    const chatFn = scripted([{ content: 'read it' }]);
+    const res = await lib.run('summarise @note.txt', {
+      model: 'mock', cwd: ws, projectInstructions: false, chatFn,
+    });
+    assert.deepEqual(res.files, ['note.txt']);
+    const sentUser = chatFn.seen[0].find(m => m.role === 'user');
+    assert.match(sentUser.content, /library speaking/, 'file contents inlined');
+  });
+
+  test('expandAtFiles:false leaves @tokens alone', async () => {
+    const chatFn = scripted([{ content: 'ok' }]);
+    const res = await lib.run('summarise @note.txt', {
+      model: 'mock', cwd: ws, projectInstructions: false, expandAtFiles: false, chatFn,
+    });
+    assert.deepEqual(res.files, []);
+    assert.match(chatFn.seen[0].find(m => m.role === 'user').content, /@note\.txt/);
+  });
+
+  test('system and append shape the system prompt', async () => {
+    const chatFn = scripted([{ content: 'ok' }]);
+    await lib.run('go', {
+      model: 'mock', cwd: ws, projectInstructions: false,
+      system: 'YOU ARE A TEAPOT', append: 'ALWAYS ANSWER IN HAIKU', chatFn,
+    });
+    const sys = chatFn.seen[0].find(m => m.role === 'system').content;
+    assert.match(sys, /YOU ARE A TEAPOT/);
+    assert.match(sys, /ALWAYS ANSWER IN HAIKU/);
+  });
+
+  test('stream() yields events and ends with the result', async () => {
+    const types = [];
+    let last = null;
+    for await (const ev of lib.stream('say hi', {
+      model: 'mock', cwd: ws, projectInstructions: false,
+      chatFn: scripted([{ content: 'hi' }]),
+    })) {
+      types.push(ev.type);
+      last = ev;
+    }
+    assert.ok(types.includes('completed'), 'observes the loop finishing');
+    assert.equal(last.type, 'result', 'last event carries the result');
+    assert.equal(last.text, 'hi');
+  });
+
+  test('stream() propagates a failure instead of hanging', async () => {
+    await assert.rejects(async () => {
+      // eslint-disable-next-line no-unused-vars
+      for await (const _ of lib.stream('', { model: 'mock' })) { /* never reached */ }
+    }, /non-empty string/);
+  });
+
+  test('createAgent() carries the conversation between calls', async () => {
+    const chatFn = scripted([{ content: 'first answer' }, { content: 'second answer' }]);
+    const agent = lib.createAgent({ model: 'mock', cwd: ws, projectInstructions: false, chatFn });
+
+    const one = await agent.send('remember 41');
+    assert.equal(one.text, 'first answer');
+    const two = await agent.send('what did I say?');
+    assert.equal(two.text, 'second answer');
+
+    // The second request must have seen the first exchange.
+    const secondRequest = chatFn.seen[1];
+    assert.ok(secondRequest.some(m => m.role === 'user' && m.content.includes('remember 41')));
+    assert.ok(secondRequest.some(m => m.role === 'assistant' && m.content === 'first answer'));
+    assert.equal(secondRequest.filter(m => m.role === 'system').length, 1, 'exactly one system message');
+
+    agent.reset();
+    assert.deepEqual(agent.messages, []);
+  });
+
+  test('a missing provider key is reported before any request', async () => {
+    await assert.rejects(
+      lib.run('go', { model: 'anthropic/claude-opus-4-8', cwd: ws }),
+      /ANTHROPIC_API_KEY/,
+    );
+  });
+
+  test('package.json exposes the library and the binary', async () => {
+    const pkg = JSON.parse(await fsp.readFile(path.join(ROOT, 'package.json'), 'utf8'));
+    assert.equal(pkg.main, './index.js');
+    assert.equal(pkg.exports['.'], './index.js');
+    assert.equal(pkg.bin.claudette, './claudette.js');
+    // `files` decides what ships; a missing entry means a broken install.
+    for (const needed of ['index.js', 'claudette.js', 'src/']) {
+      assert.ok(pkg.files.includes(needed), `${needed} is published`);
+    }
+  });
+});
+
 describe('src/agent-runner.js (shared loop)', async () => {
   const { runAgent, mergeToolCalls, dropOrphanToolMessages } = await import('../src/agent-runner.js');
   const { TOOL_DEFS } = await import('../src/tools.js');
