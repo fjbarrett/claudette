@@ -2669,7 +2669,26 @@ describe('cost & request tuning', async () => {
     assert.deepEqual(priceFor('openai/gpt-5-mini'), { in: 0.25, out: 2 }, 'gpt-5-mini beats gpt-5 by specificity');
     assert.deepEqual(priceFor('gpt-5'), { in: 1.25, out: 10 });
     assert.ok(priceFor('openrouter/anthropic/claude-opus-4.8'), 'opus priced across prefixes');
+
+    // Anthropic pricing. Opus 5 was missing entirely (cost reported as null), and
+    // the bare claude-opus-4 rate of $15/$75 — right for 4.0/4.1 — was being
+    // applied to 4.5 through 4.8, which are all $5/$25, overstating them 3x.
+    assert.deepEqual(priceFor('anthropic/claude-opus-5'), { in: 5, out: 25 }, 'Opus 5 is priced');
+    assert.deepEqual(priceFor('anthropic/claude-opus-4-8'), { in: 5, out: 25 }, '4.8 is not the 4.0 rate');
+    assert.deepEqual(priceFor('anthropic/claude-opus-4-5'), { in: 5, out: 25 });
+    assert.deepEqual(priceFor('anthropic/claude-opus-4-1'), { in: 15, out: 75 }, '4.1 keeps the original rate');
+    assert.deepEqual(priceFor('anthropic/claude-sonnet-5'), { in: 3, out: 15 });
+    assert.deepEqual(priceFor('anthropic/claude-fable-5'), { in: 10, out: 50 });
+    // Anthropic writes `claude-opus-4-8`, OpenRouter writes `claude-opus-4.8`;
+    // one entry must cover both or half the traffic silently goes unpriced.
+    assert.deepEqual(
+      priceFor('openrouter/anthropic/claude-opus-4.8'),
+      priceFor('anthropic/claude-opus-4-8'),
+      'dot and dash spellings resolve to the same price',
+    );
+
     assert.equal(estimateCost('claude-haiku-4.5', { promptTokens: 1_000_000 }), 1, '$1 per 1M haiku input');
+    assert.equal(estimateCost('anthropic/claude-opus-5', { promptTokens: 1_000_000, completionTokens: 1_000_000 }), 30, 'Opus 5: $5 in + $25 out');
     assert.equal(estimateCost('mystery-model', { promptTokens: 1_000_000 }), null, 'unknown model → null');
     assert.equal(formatUsd(0.004), '$0.0040');
     assert.equal(formatUsd(1.5), '$1.50');

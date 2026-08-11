@@ -7,7 +7,18 @@
 // Unknown models return null, and callers fall back to showing tokens only.
 
 const DEFAULT_PRICES = {
-  'claude-opus-4': { in: 15, out: 75 },
+  // Anthropic. Opus 4.5 onward is $5/$25 — only the original 4.0/4.1 were
+  // $15/$75, so the bare `claude-opus-4` key must stay the least specific of
+  // these or every modern Opus gets priced at 3x.
+  'claude-fable-5': { in: 10, out: 50 },
+  'claude-mythos-5': { in: 10, out: 50 },
+  'claude-opus-5': { in: 5, out: 25 },
+  'claude-opus-4-8': { in: 5, out: 25 },
+  'claude-opus-4-7': { in: 5, out: 25 },
+  'claude-opus-4-6': { in: 5, out: 25 },
+  'claude-opus-4-5': { in: 5, out: 25 },
+  'claude-opus-4': { in: 15, out: 75 },   // 4.0 / 4.1 only
+  'claude-sonnet-5': { in: 3, out: 15 },
   'claude-sonnet-4': { in: 3, out: 15 },
   'claude-haiku-4': { in: 1, out: 5 },
   'gpt-5-nano': { in: 0.05, out: 0.4 },
@@ -30,7 +41,10 @@ function priceTable() {
 }
 
 export function priceFor(model) {
-  const id = String(model ?? '').toLowerCase();
+  // Providers spell the same model differently: Anthropic uses
+  // `claude-opus-4-8`, OpenRouter uses `claude-opus-4.8`. Fold dots to dashes so
+  // one table entry covers both instead of silently missing half the traffic.
+  const id = String(model ?? '').toLowerCase().replace(/\./g, '-');
   const table = priceTable();
   // Most-specific (longest) key wins so `gpt-4o-mini` beats `gpt-4o`.
   for (const key of Object.keys(table).sort((a, b) => b.length - a.length)) {
