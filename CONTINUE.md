@@ -4,7 +4,29 @@ Use this file to resume an interrupted active task. Read `AGENTS.md`,
 `CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
 handoff for work in progress.
 
-## State: review + hardening + cleanup, committed on `feature/review-hardening` (2026-08-10)
+## State: review + hardening + cleanup + library API + Terminal-Bench (2026-08-10)
+
+All committed and pushed on `feature/review-hardening`. **309/309 tests.**
+
+### The three things that now work
+1. **CLI** — `npm link` puts `claudette` on PATH. `-p` headless, `--json-ipc`,
+   `--continue`/`--resume`, Tab completion.
+2. **Library** — `import { run, stream, createAgent } from 'claudette'`
+   (`index.js` + `index.d.ts`, `main`/`exports`/`files` in package.json).
+   Verified as a linked consumer, against both Ollama and OpenRouter.
+3. **Terminal-Bench** — Harbor adapter runs claudette in the task container
+   against **host Ollama** (loopback rewritten to `host.docker.internal`), so runs
+   are free. `openssl-selfsigned-cert`: 5/6 grader tests, reward 0.0.
+
+### Local performance — the machine is fine, the config was not
+M1 Max / 32GB. Two fixes worth ~100x combined:
+- `think:false` by default — these are reasoning models burning ~1k tokens per
+  step before answering. 27b 17.2s→0.8s; 35b-a3b 11.6s→0.4s.
+- Use the **a3b MoE** (52.8 tok/s), never the dense 27B (9.2 tok/s).
+Full agentic turn: 49s. Suite: 60s offline / 102s live. Cloud nano: 2.0s.
+RAM is the real limit — one 24GB model resident leaves little room, and swapping
+models costs 20-120s. Pick one and stay on it.
+
 
 A full program review found four defects (three reproduced live) plus a set of
 structural gaps; a second pass then finished the "before 1.0" security items and
