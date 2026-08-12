@@ -15,8 +15,13 @@ export interface Message {
 }
 
 export interface Usage {
+  /** Total input tokens, cached ones included. */
   promptTokens: number;
   completionTokens: number;
+  /** Subset of promptTokens served from the provider's prompt cache. */
+  cachedTokens?: number;
+  /** Subset of promptTokens written into it (Anthropic reports this separately). */
+  cacheWriteTokens?: number;
 }
 
 export interface ToolCallRecord {
@@ -113,6 +118,8 @@ export function runAgent(options: Record<string, unknown>): Promise<{
   usage: Usage;
   iterations: number;
   toolCalls: ToolCallRecord[];
+  /** The provider error behind a `failed` run; null otherwise. */
+  error: Error | null;
 }>;
 
 export const TOOL_DEFS: Array<{ type: 'function'; function: { name: string; description: string; parameters: unknown } }>;
@@ -126,9 +133,7 @@ export function executeTool(
 export function chatStream(options: Record<string, unknown>): Promise<{
   content: string;
   toolCalls: unknown[] | null;
-  promptTokens: number;
-  completionTokens: number;
-}>;
+} & Usage>;
 
 export function getModels(): Promise<Array<{ name: string; family: string; paramSize: string }>>;
 export function providerFor(model: string): unknown;

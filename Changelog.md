@@ -37,6 +37,28 @@
 
 ### Fixed
 
+- **Cached input tokens were not counted, so a long session under-reported its
+  cost by orders of magnitude.** Anthropic's `input_tokens` is the *uncached*
+  remainder, while OpenAI-compatible providers put the whole input in
+  `prompt_tokens` — and prompt caching is on by default here. The adapter read
+  `input_tokens` alone and called it the total: a five-case eval run against
+  `anthropic/claude-opus-5` reported 52 input tokens, and the live API said 371
+  for a single request the adapter was scoring at 2. `promptTokens` is now the
+  true total for both families, with the cache split carried alongside so
+  `estimateCost` prices a read at 0.1x and a write at 1.25x instead of billing
+  both as fresh input.
+- **A retry could fire instantly, three times, and give up inside a second.**
+  Backoff used full jitter — uniform over `[0, exponential]` — so an unlucky
+  draw waited ~0ms. It is half jitter now, and a connection-level failure
+  (nothing answering the socket, as against a 429 that answered) starts from a
+  3s base rather than 500ms. Found when Ollama auto-updated itself mid-run,
+  SIGTERMed its own server, and took 8.4s to come back; the whole retry budget
+  had expired long before. Sub-second waits also printed as "in 0s", which read
+  as "it never waited at all".
+- **A failed run threw away the provider error.** `runAgent` caught it, emitted
+  it, and returned a result that did not carry it — so a batch runner reported
+  "agent run failed after 1 iterations" with no way to tell a dead credit
+  balance from a bad model. The failed result carries the error now.
 - **Ctrl+C now interrupts a running tool, not just the model request.** The abort
   controller was created per model request and cleared before tools ran, so during
   the long part of a turn — a `npm run build` that hangs — nothing was listening
@@ -93,6 +115,19 @@
 
 ### Added
 
+- `bench/eval-summary.js` — rebuilds `bench/BAKEOFF.md` (a ranked model table
+  plus a per-case coverage matrix) from the eval reports on disk, keyed on the
+  latest result per model *and* case, since a bake-off gets run in pieces. The
+  first bake-off's table was kept in a session scratchpad and was gone by the
+  next session, while the reports it came from sat in `bench/runs/evals`
+  untouched. The reports stay gitignored; the summary is committed.
+- Four eval cases that separate models rather than checking they can call a tool:
+  `multi-file-rename` (rename a symbol across three files, not just its
+  definition), `fix-failing-test` (run it, read the error, fix the source,
+  re-run — `test.sh` writes `.passed` only on a green run, so "it passes now" is
+  checkable rather than taken on the agent's word), `already-correct` (the file
+  is already right; the pass condition is not editing it), and `ambiguous-anchor`
+  (a non-unique `str_replace` anchor that has to be recovered from).
 - `CLAUDETTE_NUM_CTX` — Ollama's context window was hardcoded to 32k, so models
   advertising far more (qwen3.6 exposes 256k) had no way to use it. Still defaults
   to 32k, because Ollama's own default of 4096 truncates an agent loop immediately.
@@ -108,6 +143,19 @@
 
 ### Changed
 
+- **`bench/evals.js` no longer replays cached responses by default** (`--cache`
+  opts in; `--no-cache` still parses). The cache is right while writing a case
+  and wrong while comparing models: a replayed call reports the tokens recorded
+  whenever it was captured and a near-zero duration, so a model with cache
+  entries reads as both cheaper and faster than one being measured for real. It
+  also masked the token-accounting fix above — the same case kept reporting 4
+  input tokens after the bug was gone, and 3,651 once the cache was off. The
+  mode is printed with the run and recorded in the report.
+- **Eval cases can assert more than "the right tool was called".** `files` takes
+  `excludes` and `absent` alongside `includes` (a rewrite that lands the asked-for
+  change but drops the rest of the file now fails), and `expect.maxToolCalls` is
+  an efficiency budget — with several models passing everything, correctness ties
+  break on whether the answer was reached or brute-forced.
 - `AGENTS.md` is the single source for agent conventions; `CLAUDE.md` and
   `GEMINI.md` point at it. Three near-identical copies had already drifted — one
   said trim history to 50 rows, another 20, and `GEMINI.md` never carried the

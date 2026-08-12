@@ -110,6 +110,9 @@ AGENTS.md         Single source for agent conventions; CLAUDE.md and GEMINI.md p
 | `npm run bench:projects -- --model <provider/model>` | Run the project-scale build-a-whole-app suite (notes-app, express CRUD, fastapi, fullstack) |
 | `npm run bench:leaderboard` | Regenerate `bench/LEADERBOARD.md` from the latest report file for each model/task pair |
 | `npm run eval -- --all --model <provider/model>` | Run all prompt/tool-usage eval cases (in-process, fast; no worktree) |
+| `npm run eval -- --all --model <m> --cache` | Replay recorded replies (opt-in). Never for a model comparison: a replay reports a near-zero duration and the tokens recorded when it was captured |
+| `node bench/eval-summary.js --since 2026-08-11 --write` | Rebuild `bench/BAKEOFF.md` from the eval reports (latest result per model *and* case) |
+| `CLAUDETTE_MAX_RETRIES=4 npm run eval -- ...` | For unattended runs: the default budget spans ~9s, and a local server restart takes longer |
 | `npm run eval -- --case <id> --repeat 5` | Flakiness loop on one eval case (pass@k / pass^k) |
 | `npm run eval:list` | List eval cases (`bench/evals/*.json`) |
 | `NODE_ENV=test node --test --test-name-pattern "<pattern>" test/test.js` | Run a targeted slice of the suite (fast; skips other suites' bodies) |

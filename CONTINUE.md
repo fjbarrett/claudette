@@ -121,19 +121,44 @@ Checked *after* the batch executes (keeps tool_call/tool_result pairing valid)
 and in the else-branch of the follow-up drain, so an automated nudge never stacks
 a second adjacent user message on a delivered follow-up.
 
-### Model bake-off — PAUSED mid-run (2026-08-11)
-Stopped at the user's request. Complete: 8 local + 2 frontier, 5 eval cases each
-(`scratchpad/bakeoff.tsv`). Winner `qwen3.6:35b-a3b-opencode` (5/5, 55s).
-- **Never benchmarked** (killed mid-run): `qwen3-coder:30b`, `gpt-oss:20b`,
-  `devstral:24b`.
-- **Partially pulled**: `laguna-xs-2.1` (473MB of 20GB; Ollama keeps the blob).
-  Also queued but not started: `north-mini-code-1.0` (30B MoE/3B active, Cohere),
-  `lfm2.5` (8B, built for consumer-hardware tool calling). Both were picked to
-  match the winner's profile — MoE with ~3B active params, which is where the
-  5.7x generation-speed edge came from.
-- Tie-break round needs the 3 harder eval cases restored from
-  `scratchpad/staged-cases/` to `bench/evals/` (staged out so the 5-case
-  comparison stayed consistent). 4+ models tie at 5/5.
+### Model bake-off — RESUMED (2026-08-11 evening)
+
+The paused run's table was in a session scratchpad and was gone by the next
+session. It has been **recovered and made durable**: the JSON reports it was
+derived from were in `bench/runs/evals/` the whole time, so
+`node bench/eval-summary.js --since 2026-08-11 --write` now rebuilds
+**`bench/BAKEOFF.md`** (tracked; the reports stay gitignored). Keyed on the
+latest result per model *and* case, because a bake-off gets run in pieces.
+
+The 3 lost "harder" cases were not recovered — four new ones were written
+instead, aimed at what actually separates models here rather than at whether a
+model can call a tool at all:
+`multi-file-rename`, `fix-failing-test`, `already-correct`, `ambiguous-anchor`.
+They needed assertions the harness lacked: `files.excludes` (the change landed
+but the rewrite dropped everything else), `files.absent`, and a `maxToolCalls`
+budget — which is how correctness ties break.
+
+**Do not compare a cached run against a live one.** `bench/evals.js` used to
+turn the response cache ON by default; it is now opt-in (`--cache`).
+
+### Four bugs found by trying to read the bake-off numbers (2026-08-11 evening)
+1. **Retry backoff could be ~0.** Full jitter draws from `[0, exponential]`, so
+   three attempts fit inside a second. Now half jitter, and a *connection*
+   failure (nothing answering the socket, as against a 429 that answered) starts
+   from a 3s base. Found when Ollama **auto-updated itself mid-run**, SIGTERMed
+   its server, and took 8.4s to return — the run died with the case's context
+   thrown away. For unattended runs also set `CLAUDETTE_MAX_RETRIES=4`.
+2. **Anthropic cached input was not counted.** `input_tokens` is the *uncached*
+   remainder; OpenAI-compatible providers put the whole input in
+   `prompt_tokens`. A five-case eval billed 52 input tokens. `promptTokens` is
+   now the true total, with the cache split carried so `estimateCost` prices a
+   read at 0.1x and a write at 1.25x.
+3. **The bench cache replayed stale results.** Fixing (2) changed nothing
+   because the harness kept replaying a reply recorded before the fix — and a
+   replay also reports a near-zero duration, so a cached model looks instant.
+4. **A failed run threw away the provider error.** `runAgent`'s failed result
+   now carries it; that is why `openrouter/anthropic/claude-opus-5` scored 2/5
+   with no explanation (three runs died on a provider error, not on quality).
 
 ### Next steps
 1. **Open a PR to main** (branch is pushed).
