@@ -2109,6 +2109,38 @@ describe('CLI (claudette.js)', async () => {
     assert.equal(calls[0]?.function?.name, 'search_code');
   });
 
+  // Verbatim from a qwen3-coder:30b eval run. The parser was JSON-only, so this
+  // read as prose and the case scored 0 tool calls — for a tool call that was
+  // entirely correct. Whole families of local models emit this shape.
+  test('CLI parser reads Qwen-style XML tool calls', async () => {
+    const { __test_parseTextToolCalls } = await import('../src/chat.js');
+    const calls = __test_parseTextToolCalls(
+      '<function=write_file>\n<parameter=path>\ngreeting.txt\n</parameter>\n' +
+      '<parameter=content>\nhello from claudette\n</parameter>\n</function>\n</tool_call>');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].function.name, 'write_file');
+    assert.deepEqual(calls[0].function.arguments, { path: 'greeting.txt', content: 'hello from claudette' });
+  });
+
+  test('XML tool calls keep interior whitespace and reject prose', async () => {
+    const { parseXmlToolCalls } = await import('../src/tool-call-parser.js');
+    // Indentation inside `content` is the file's, not the tag's — only the
+    // newline the tag itself introduced comes off.
+    const [call] = parseXmlToolCalls(
+      '<function=write_file>\n<parameter=path>a.py</parameter>\n' +
+      '<parameter=content>\ndef f():\n    return 1\n</parameter>\n</function>');
+    assert.equal(call.function.arguments.content, 'def f():\n    return 1');
+
+    assert.deepEqual(parseXmlToolCalls('I will call the write_file function now.'), [],
+      'prose mentioning a tool is not a call');
+    assert.deepEqual(parseXmlToolCalls('<function=bash></function>'), [],
+      'a call with no parameters is not a call');
+
+    const [numeric] = parseXmlToolCalls(
+      '<function=read_file><parameter=path>a.js</parameter><parameter=limit>20</parameter></function>');
+    assert.equal(numeric.function.arguments.limit, 20, 'numeric args are coerced, not left as strings');
+  });
+
   test('CLI parser extracts wrapped and batched text tool calls', async () => {
     const { __test_parseTextToolCalls } = await import('../src/chat.js');
     const calls = __test_parseTextToolCalls(JSON.stringify({

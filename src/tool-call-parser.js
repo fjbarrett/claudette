@@ -136,6 +136,52 @@ function extractJsonObjects(text) {
   return results;
 }
 
+// Qwen-style XML tool calls:
+//
+//   <function=write_file>
+//   <parameter=path>
+//   greeting.txt
+//   </parameter>
+//   <parameter=content>
+//   hello from claudette
+//   </parameter>
+//   </function>
+//
+// qwen3-coder:30b emits exactly this when it does not use the provider's
+// tool-call API, and the JSON parser below saw plain prose — so a bake-off
+// scored it 0 on `write-then-verify` for a tool call that was perfectly correct.
+// A `</tool_call>` or `<tool_call>` wrapper around it is common and ignored.
+const XML_CALL_RE = /<function\s*=\s*([a-zA-Z0-9_.-]+)\s*>([\s\S]*?)(?:<\/function>|$)/g;
+const XML_PARAM_RE = /<parameter\s*=\s*([a-zA-Z0-9_.-]+)\s*>([\s\S]*?)(?:<\/parameter>|$)/g;
+
+// One leading and one trailing newline are the tag's own formatting, not part of
+// the value — but interior whitespace is load-bearing for `content` and
+// `old_str`, so this is deliberately not a trim().
+function stripTagNewlines(value) {
+  return value.replace(/^[ \t]*\r?\n/, '').replace(/\r?\n[ \t]*$/, '');
+}
+
+function coerceScalar(value) {
+  if (/^-?\d+$/.test(value)) return Number(value);
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  return value;
+}
+
+export function parseXmlToolCalls(text) {
+  const calls = [];
+  for (const [, rawName, body] of String(text ?? '').matchAll(XML_CALL_RE)) {
+    const rawArgs = {};
+    for (const [, key, rawValue] of body.matchAll(XML_PARAM_RE)) {
+      rawArgs[key] = coerceScalar(stripTagNewlines(rawValue));
+    }
+    if (!Object.keys(rawArgs).length) continue; // a bare <function=x> is not a call
+    const toolName = normalizeToolName(rawName);
+    calls.push({ function: { name: toolName, arguments: normalizeArgs(rawArgs, toolName) } });
+  }
+  return calls;
+}
+
 function parseTextToolCalls(text) {
   // Strip markdown code fences
   const stripped = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, '$1').trim();
@@ -182,6 +228,8 @@ function parseTextToolCalls(text) {
     } catch { /* keep trying */ }
   }
 
+  calls.push(...parseXmlToolCalls(stripped));
+
   // Deduplicate by stringified identity (whole-text parse can overlap with extracted objects)
   const seen = new Set();
   return calls.filter(c => {
@@ -194,3 +242,4 @@ function parseTextToolCalls(text) {
 
 
 export { parseTextToolCalls, normalizeToolName, normalizeArgs, sanitizeJsonControls, extractJsonObjects };
+
