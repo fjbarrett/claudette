@@ -238,6 +238,8 @@ async function parseSSE(stream, onDelta) {
   const toolByIndex = new Map();  // content-block index → tools[] entry
   let promptTokens = 0;
   let completionTokens = 0;
+  let cachedTokens = 0;
+  let cacheWriteTokens = 0;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -255,9 +257,19 @@ async function parseSSE(stream, onDelta) {
       try { evt = JSON.parse(data); } catch { continue; }
 
       switch (evt.type) {
-        case 'message_start':
-          promptTokens = evt.message?.usage?.input_tokens ?? 0;
+        case 'message_start': {
+          // Anthropic's `input_tokens` counts only what was NOT served from
+          // cache; OpenAI-compatible providers put the whole input in
+          // `prompt_tokens`. Reading input_tokens alone made a cached turn look
+          // like it had sent 2 tokens — an eval run billed 52 input tokens
+          // across five cases, and the cost meter was out by three orders of
+          // magnitude. Normalise to the total and keep the split for pricing.
+          const u = evt.message?.usage ?? {};
+          cachedTokens = u.cache_read_input_tokens ?? 0;
+          cacheWriteTokens = u.cache_creation_input_tokens ?? 0;
+          promptTokens = (u.input_tokens ?? 0) + cachedTokens + cacheWriteTokens;
           break;
+        }
         case 'content_block_start':
           if (evt.content_block?.type === 'tool_use') {
             const entry = { id: evt.content_block.id, name: evt.content_block.name, jsonBuf: '' };
@@ -297,5 +309,7 @@ async function parseSSE(stream, onDelta) {
     hadApiToolCalls: toolCalls.length > 0,
     promptTokens,
     completionTokens,
+    cachedTokens,
+    cacheWriteTokens,
   };
 }

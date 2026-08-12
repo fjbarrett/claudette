@@ -53,11 +53,38 @@ export function priceFor(model) {
   return null;
 }
 
-// Estimated USD for one set of token counts, or null when the model is unpriced.
-export function estimateCost(model, { promptTokens = 0, completionTokens = 0 } = {}) {
+// Cache pricing, as multiples of the base input rate. These are Anthropic's
+// published ratios (0.1x to read, 1.25x to write a 5-minute entry); OpenAI
+// discounts cached input too, between 0.1x and 0.5x depending on the family, so
+// treating them the same is an approximation in the same spirit as the rest of
+// this table. Getting it merely close beats the alternative: caching is on by
+// default here, so billing every cached token at full price overstates a long
+// session badly.
+const CACHE_READ_RATE = 0.1;
+const CACHE_WRITE_RATE = 1.25;
+
+/**
+ * Estimated USD for one set of token counts, or null when the model is unpriced.
+ *
+ * `cachedTokens` and `cacheWriteTokens` are subsets of `promptTokens`, not
+ * additions to it — every provider we speak to reports the total input and the
+ * cached part of it separately.
+ */
+export function estimateCost(model, {
+  promptTokens = 0, completionTokens = 0, cachedTokens = 0, cacheWriteTokens = 0,
+} = {}) {
   const p = priceFor(model);
   if (!p) return null;
-  return (promptTokens / 1e6) * (p.in ?? 0) + (completionTokens / 1e6) * (p.out ?? 0);
+  const inRate = p.in ?? 0;
+  const cached = Math.min(cachedTokens, promptTokens);
+  const written = Math.min(cacheWriteTokens, Math.max(0, promptTokens - cached));
+  const fullPrice = Math.max(0, promptTokens - cached - written);
+  return (
+    (fullPrice / 1e6) * inRate +
+    (cached / 1e6) * inRate * CACHE_READ_RATE +
+    (written / 1e6) * inRate * CACHE_WRITE_RATE +
+    (completionTokens / 1e6) * (p.out ?? 0)
+  );
 }
 
 export function formatUsd(n) {

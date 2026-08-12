@@ -40,6 +40,7 @@
 // node bench/evals.js --list
 // node bench/evals.js --all --model anthropic/claude-opus-4-8 --repeat 3
 // node bench/evals.js --case edit-config --verbose
+// node bench/evals.js --case edit-config --cache    # replay recorded replies
 
 import '../src/env-autoload.js'; // load .env before anything reads process.env
 import fs from 'node:fs/promises';
@@ -261,7 +262,7 @@ export async function loadCases() {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  process.env.CLAUDETTE_BENCH_CACHE = args.noCache ? '0' : '1';
+  process.env.CLAUDETTE_BENCH_CACHE = args.cache ? '1' : '0';
   const cases = await loadCases();
 
 
@@ -288,7 +289,8 @@ async function main() {
   }
 
   const startedAt = Date.now();
-  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}`);
+  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}` +
+    `  |  response cache: ${args.cache ? 'ON (--cache; timings are not measurements)' : 'OFF (default)'}`);
   const results = [];
   for (const caseDef of selected) {
     const repeat = args.repeat ?? caseDef.repeat ?? 1;
@@ -327,6 +329,9 @@ async function main() {
     model,
     generatedAt: new Date().toISOString(),
     trim: args.trim,
+    // Recorded so a report is interpretable later: with the cache on, the
+    // durations and token counts may belong to a run from another day.
+    cache: args.cache,
     totals: {
       cases: results.length,
       passed: results.filter(r => r.passAtK).length,
@@ -373,8 +378,8 @@ async function writeReport(summary, model) {
   return file;
 }
 
-function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false, trim: true, json: false };
+export function parseArgs(argv) {
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, cache: false, trim: true, json: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -384,7 +389,15 @@ function parseArgs(argv) {
     else if (arg === '--repeat') args.repeat = Number(argv[++i]);
     else if (arg === '--keep') args.keep = true;
     else if (arg === '--verbose') args.verbose = true;
-    else if (arg === '--no-cache') args.noCache = true;
+    // The response cache replays a recorded reply for an identical (model,
+    // messages) key. That is what you want while writing a case, and the wrong
+    // thing by default: a replayed run reports the tokens recorded whenever it
+    // was captured and a near-zero duration, so a cached model looks both cheap
+    // and instant next to one being measured for real. It cost an afternoon —
+    // an Anthropic run kept reporting 2 input tokens per request after the bug
+    // that caused it had already been fixed.
+    else if (arg === '--cache') args.cache = true;
+    else if (arg === '--no-cache') args.cache = false;   // now the default; kept so old commands still run
     else if (arg === '--json') args.json = true;
     else if (arg === '--trim') args.trim = true;       // context trimming on (default)
     else if (arg === '--no-trim') args.trim = false;   // baseline: re-send everything

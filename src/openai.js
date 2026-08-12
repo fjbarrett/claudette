@@ -367,6 +367,7 @@ async function parseChatCompletionsSSE(stream, onDelta) {
   const order = [];                 // first-seen index order
   let promptTokens = 0;
   let completionTokens = 0;
+  let cachedTokens = 0;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -386,6 +387,9 @@ async function parseChatCompletionsSSE(stream, onDelta) {
       if (chunk.usage) {
         promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
         completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+        // Already inside prompt_tokens here — unlike Anthropic, which reports
+        // cached input separately. Kept only so the cost meter can discount it.
+        cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
       }
 
       const choice = chunk.choices?.[0];
@@ -429,5 +433,6 @@ async function parseChatCompletionsSSE(stream, onDelta) {
     hadApiToolCalls: toolCalls.length > 0,
     promptTokens,
     completionTokens,
+    cachedTokens,
   };
 }

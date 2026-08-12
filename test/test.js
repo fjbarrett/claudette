@@ -1267,6 +1267,52 @@ describe('anthropic.js', async () => {
     }
   });
 
+  // Prompt caching is on by default here, and Anthropic's `input_tokens` counts
+  // only the uncached remainder. Reading it alone reported a five-case eval run
+  // as 52 input tokens total, so the cost meter was out by ~1000x.
+  test('chatStream counts cached input, not just the uncached remainder', async () => {
+    const events = [
+      { type: 'message_start', message: { usage: {
+        input_tokens: 2, cache_read_input_tokens: 4096, cache_creation_input_tokens: 512,
+      } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 7 } },
+      { type: 'message_stop' },
+    ];
+    const mockServer = http.createServer((req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        for (const e of events) res.write(`data: ${JSON.stringify(e)}\n\n`);
+        res.end();
+      });
+    });
+    await new Promise(r => mockServer.listen(0, '127.0.0.1', r));
+    const { port } = mockServer.address();
+    const prevBase = process.env.ANTHROPIC_BASE_URL;
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
+    process.env.ANTHROPIC_API_KEY = 'test-key';
+    try {
+      const { chatStream } = await import('../src/anthropic.js');
+      const result = await chatStream({
+        model: 'anthropic/claude-opus-5',
+        messages: [{ role: 'user', content: 'hi' }],
+        tools: [],
+      });
+      assert.equal(result.promptTokens, 4610, 'uncached + cache read + cache write');
+      assert.equal(result.cachedTokens, 4096);
+      assert.equal(result.cacheWriteTokens, 512);
+      assert.equal(result.completionTokens, 7);
+    } finally {
+      if (prevBase == null) delete process.env.ANTHROPIC_BASE_URL; else process.env.ANTHROPIC_BASE_URL = prevBase;
+      if (prevKey == null) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = prevKey;
+      await new Promise((resolve, reject) => mockServer.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
   test('chatStream sends output_config.effort only when effort is set', async () => {
     const events = [
       { type: 'message_start', message: { usage: { input_tokens: 1 } } },
@@ -2692,6 +2738,24 @@ describe('cost & request tuning', async () => {
     assert.equal(estimateCost('mystery-model', { promptTokens: 1_000_000 }), null, 'unknown model → null');
     assert.equal(formatUsd(0.004), '$0.0040');
     assert.equal(formatUsd(1.5), '$1.50');
+  });
+
+  test('estimateCost discounts cached input instead of billing it as fresh', async () => {
+    const { estimateCost } = await import('../src/cost.js');
+    const M = 1_000_000;
+    // Opus 5 input is $5/M. A fully cached million tokens is a read, at 0.1x.
+    assert.equal(estimateCost('anthropic/claude-opus-5', { promptTokens: M, cachedTokens: M }), 0.5);
+    // Writing the cache entry costs 1.25x — caching is not free on the first turn.
+    assert.equal(estimateCost('anthropic/claude-opus-5', { promptTokens: M, cacheWriteTokens: M }), 6.25);
+    // The subsets come out of the total, they do not add to it.
+    assert.equal(
+      estimateCost('anthropic/claude-opus-5', { promptTokens: M, cachedTokens: M / 2 }),
+      2.5 + 0.25,
+      'half fresh at $5/M, half cached at $0.50/M',
+    );
+    // A count that over-claims cannot push the estimate negative.
+    assert.equal(estimateCost('anthropic/claude-opus-5', { promptTokens: 1000, cachedTokens: 9_999_999 }),
+      estimateCost('anthropic/claude-opus-5', { promptTokens: 1000, cachedTokens: 1000 }));
   });
 
   test('formatTokens: compact counts for the live status line', async () => {
@@ -4310,8 +4374,17 @@ describe('session durability (atomic writes, compaction archive)', async () => {
 // executeTool runs against a throwaway sandbox.
 
 describe('bench/evals.js (eval loops)', async () => {
-  const { runEvalIteration, matchToolCalls, argsMatch, loadCases } =
+  const { runEvalIteration, matchToolCalls, argsMatch, loadCases, parseArgs } =
     await import('../bench/evals.js');
+
+  // A replayed response reports the tokens recorded when it was captured and a
+  // duration near zero, so a cached model reads as both cheaper and faster than
+  // one actually being measured. Comparing models is what this harness is for.
+  test('the response cache is opt-in, so a bake-off measures live calls', () => {
+    assert.equal(parseArgs(['--all']).cache, false, 'off unless asked for');
+    assert.equal(parseArgs(['--cache']).cache, true);
+    assert.equal(parseArgs(['--no-cache']).cache, false, 'older commands still parse');
+  });
 
   // A chatFn that replays a fixed sequence of model responses.
   function scriptedModel(responses) {

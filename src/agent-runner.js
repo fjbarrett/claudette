@@ -277,7 +277,9 @@ export async function runAgent({
   const readCache = toolContext.readCache ?? new Map();
   const nudger = createActNudger(actNudge);
   const repeater = createRepeatDetector(repeatGuard);
-  const usage = { promptTokens: 0, completionTokens: 0 };
+  // cachedTokens/cacheWriteTokens are subsets of promptTokens, carried so the
+  // cost meter can price cache hits at their discount instead of full input.
+  const usage = { promptTokens: 0, completionTokens: 0, cachedTokens: 0, cacheWriteTokens: 0 };
   const toolCalls = [];
 
   let iteration = 0;
@@ -336,6 +338,8 @@ export async function runAgent({
 
       usage.promptTokens += result.promptTokens ?? 0;
       usage.completionTokens += result.completionTokens ?? 0;
+      usage.cachedTokens += result.cachedTokens ?? 0;
+      usage.cacheWriteTokens += result.cacheWriteTokens ?? 0;
       await emit('usage', { iteration, ...usage, last: result });
 
       // With no tools offered, text that merely looks like a tool call is just
