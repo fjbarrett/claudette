@@ -7,14 +7,16 @@ Models did not all run the same cases — check the coverage table before compar
 
 | Model | Score | Sec | In | Out | Failed |
 |---|---|---|---|---|---|
+| `qwen3.6:35b-a3b-q4_K_M` | 9/9 | 161 | 85,101 | 2,955 | — |
+| `qwen3.6:27b-opencode` | 9/9 | 698 | 86,198 | 2,627 | — |
 | `openai/gpt-5.6-sol` | 5/5 | 56 | 70,291 | 612 | — |
-| `qwen3.6:35b-a3b-q4_K_M` | 5/5 | 78 | 31,902 | 858 | — |
-| `anthropic/claude-opus-5` | 5/5 | 88 | 52 | 1,949 | — |
-| `ornith:35b` | 5/5 | 334 | 39,364 | 1,020 | — |
-| `qwen3.6:27b-opencode` | 5/5 | 350 | 39,175 | 885 | — |
+| `anthropic/claude-opus-5` | 5/5 | 89 | 3,699 | 1,966 | — |
 | `qwen3.6:35b-a3b-opencode` | 8/9 | 115 | 64,285 | 1,977 | multi-file-rename |
+| `qwen3.6:35b-a3b-coding-nvfp4` | 8/9 | 132 | 102,992 | 3,494 | multi-file-rename |
+| `ornith:35b` | 8/9 | 399 | 90,932 | 2,809 | fix-failing-test |
 | `qwen2.5-coder:7b` | 4/5 | 234 | 109,487 | 794 | context-stress-reads |
 | `qwen3:4b` | 4/5 | 698 | 53,003 | 24,433 | context-stress-reads |
+| `qwen3-coder:30b` | 6/9 | 187 | 160,827 | 3,339 | ambiguous-anchor, fix-failing-test, write-then-verify |
 | `muse-glimmer:30b-mlx` | 3/5 | 221 | 22,061 | 1,113 | context-stress-reads, edit-not-rewrite |
 | `llama3.2:3b` | 2/5 | 17 | 11,501 | 435 | context-stress-reads, edit-not-rewrite, read-secret |
 | `openrouter/anthropic/claude-opus-5` | 2/5 | 60 | 96,793 | 1,048 | edit-not-rewrite, read-secret, write-then-verify |
@@ -23,14 +25,16 @@ Models did not all run the same cases — check the coverage table before compar
 
 | Model | already-correct | ambiguous-anchor | bash-echo | context-stress-reads | edit-not-rewrite | fix-failing-test | multi-file-rename | read-secret | write-then-verify |
 |---|---|---|---|---|---|---|---|---|---|
+| `qwen3.6:35b-a3b-q4_K_M` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `qwen3.6:27b-opencode` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `openai/gpt-5.6-sol` | · | · | ✓ | ✓ | ✓ | · | · | ✓ | ✓ |
-| `qwen3.6:35b-a3b-q4_K_M` | · | · | ✓ | ✓ | ✓ | · | · | ✓ | ✓ |
 | `anthropic/claude-opus-5` | · | · | ✓ | ✓ | ✓ | · | · | ✓ | ✓ |
-| `ornith:35b` | · | · | ✓ | ✓ | ✓ | · | · | ✓ | ✓ |
-| `qwen3.6:27b-opencode` | · | · | ✓ | ✓ | ✓ | · | · | ✓ | ✓ |
 | `qwen3.6:35b-a3b-opencode` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
+| `qwen3.6:35b-a3b-coding-nvfp4` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ |
+| `ornith:35b` | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✓ |
 | `qwen2.5-coder:7b` | · | · | ✓ | ✗ | ✓ | · | · | ✓ | ✓ |
 | `qwen3:4b` | · | · | ✓ | ✗ | ✓ | · | · | ✓ | ✓ |
+| `qwen3-coder:30b` | ✓ | ✗ | ✓ | ✓ | ✓ | ✗ | ✓ | ✓ | ✗ |
 | `muse-glimmer:30b-mlx` | · | · | ✓ | ✗ | ✗ | · | · | ✓ | ✓ |
 | `llama3.2:3b` | · | · | ✓ | ✗ | ✗ | · | · | ✗ | ✓ |
 | `openrouter/anthropic/claude-opus-5` | · | · | ✓ | ✓ | ✗ | · | · | ✗ | ✗ |

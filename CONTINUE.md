@@ -141,6 +141,42 @@ budget — which is how correctness ties break.
 **Do not compare a cached run against a live one.** `bench/evals.js` used to
 turn the response cache ON by default; it is now opt-in (`--cache`).
 
+#### Result so far — winner on this machine: `qwen3.6:35b-a3b-q4_K_M`
+**9/9 in 161s.** The only other clean sweep, `qwen3.6:27b-opencode`, takes
+**698s for the same work** — 4.3x, and the dense/MoE split is the whole gap.
+Full table in `bench/BAKEOFF.md` (regenerate with `bench/eval-summary.js --write`).
+
+Read the table with two caveats:
+- `qwen3.6:35b-a3b-opencode`'s (the previous incumbent's) `multi-file-rename`
+  failure is **infrastructure, not the model** — Ollama auto-updated mid-run and
+  killed the request. Re-run that one case to settle it.
+- `qwen3-coder:30b`'s 6/9 predates the XML tool-call fix; its
+  `write-then-verify` failure was claudette failing to parse a correct call.
+  Re-run it for an honest number.
+
+**STOPPED at the user's request (needed the GPU/CPU) partway through
+`gpt-oss:20b`.** Not yet benchmarked: `gpt-oss:20b`, `devstral:24b`,
+`qwen3.6:27b-q4_K_M`. Skip `qwen3.6:latest` — same blob id (07d35212591f) as
+`qwen3.6:35b-a3b-q4_K_M`, so it is that model under a second tag.
+
+To resume (one pass per model — a swap costs 12-120s of load, so revisiting a
+model is the expensive mistake):
+```sh
+export CLAUDETTE_MAX_RETRIES=4
+for m in gpt-oss:20b devstral:24b qwen3.6:27b-q4_K_M; do
+  node bench/evals.js --model "$m" --all; ollama stop "$m"
+done
+node bench/evals.js --model qwen3-coder:30b --all            # re-run: XML parser fix
+node bench/evals.js --model qwen3.6:35b-a3b-opencode --case multi-file-rename
+node bench/eval-summary.js --since 2026-08-11 --write
+```
+
+**RAM is the binding constraint, not compute.** `qwen3.6:35b-a3b-coding-nvfp4`
+sat at 27GB resident on a 32GB machine: 31G used, 298MB free, 4.1GB swapped, and
+the machine unusable for anything else. It was still fast (8/9, 132s), but it is
+not a model to keep loaded while working. The q4_K_M winner is 23GB and leaves
+room.
+
 ### Four bugs found by trying to read the bake-off numbers (2026-08-11 evening)
 1. **Retry backoff could be ~0.** Full jitter draws from `[0, exponential]`, so
    three attempts fit inside a second. Now half jitter, and a *connection*

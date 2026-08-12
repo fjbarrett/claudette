@@ -82,9 +82,11 @@ async function loadLatestPerModel(since) {
         perCase: new Map(results.map(r => [r.caseId, r.passAtK])),
       };
     })
-    // Correctness first, then wall clock — on this machine several models tie on
-    // score and the gap between them is entirely speed.
-    .sort((a, b) => rate(b) - rate(a) || a.seconds - b.seconds || a.model.localeCompare(b.model));
+    // Correctness first, then coverage, then wall clock. Coverage has to outrank
+    // time or a clean 5-case run sorts above a clean 9-case one that includes
+    // the hard cases; on this machine the remaining gap is entirely speed.
+    .sort((a, b) =>
+      rate(b) - rate(a) || b.cases - a.cases || a.seconds - b.seconds || a.model.localeCompare(b.model));
 }
 
 const rate = (run) => (run.cases ? run.passed / run.cases : 0);
