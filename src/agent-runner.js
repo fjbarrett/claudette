@@ -19,6 +19,8 @@
 // persistent history sees later in-place edits (the action nudge appends to the
 // last tool result) without any extra bookkeeping.
 
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { chatStream } from './provider.js';
 import { executeTool } from './tools.js';
 import { trimToolOutputs } from './context.js';
@@ -118,13 +120,46 @@ export function looksLikeVerification(command) {
     });
 }
 
-export function buildVerifyNudge(verifyRan) {
+// What this workspace can actually be verified with. The nudge used to name
+// `npm run build` and `npx tsc --noEmit` unconditionally, which sent models
+// hunting for a build system in directories that have none: one eval trajectory
+// finished a three-file rename in 8 tool calls, then spent 11 more on
+// verification, three of them re-checking whether package.json existed. Say what
+// is there, or say plainly that there is nothing.
+const MANIFEST_HINTS = [
+  ['package.json', '`npm test` or `npm run build` (check the scripts first), or `node --check <file>`'],
+  ['pyproject.toml', '`pytest`, or `python3 -m py_compile <file>`'],
+  ['requirements.txt', '`pytest`, or `python3 -m py_compile <file>`'],
+  ['Cargo.toml', '`cargo check` or `cargo test`'],
+  ['go.mod', '`go build ./...` or `go test ./...`'],
+  ['Makefile', '`make` or `make test`'],
+];
+
+export function verifyHint(workspace) {
+  if (!workspace) return null;
+  for (const [file, hint] of MANIFEST_HINTS) {
+    if (existsSync(path.join(workspace, file))) return hint;
+  }
+  return null;
+}
+
+export function buildVerifyNudge(verifyRan, hint) {
   if (verifyRan) {
     return '[automated check] Your last build/test/typecheck did not pass. Fix the errors and re-run it — do not finish with a failing check.';
   }
-  return "[automated check] You edited files but haven't verified the result works. Before finishing, run the project's build, typecheck, or tests " +
-    '(e.g. `npm run build`, `npx tsc --noEmit`, or the test command) and fix any errors. Do not report the task complete until a check passes. ' +
-    'If it can only be exercised by a long-running server (e.g. `npm run dev`) that cannot finish here, say so explicitly and explain how you otherwise confirmed the change works.';
+  const lead = "[automated check] You edited files but haven't verified the result works. ";
+  const tail = ' Do not report the task complete until a check passes.';
+  if (!hint) {
+    // No manifest, so no run script to point at — and the long-running-server
+    // caveat below would name a build tool this workspace does not have, which
+    // is the whole reason models were hunting for one.
+    return lead + 'This workspace has no build, test, or dependency manifest — do not go looking for one. ' +
+      'Exercise what you changed directly instead: run the script, or a one-liner that calls it, ' +
+      'or at minimum syntax-check the edited files.' + tail;
+  }
+  return lead + `Run ${hint} and fix any errors.` + tail +
+    ' If it can only be exercised by a long-running server (e.g. `npm run dev`) that cannot finish here, ' +
+    'say so explicitly and explain how you otherwise confirmed the change works.';
 }
 
 const VERIFY_MAX = 2; // gate fires at most twice per turn (initial + one fix cycle)
@@ -368,7 +403,7 @@ export async function runAgent({
         if (verifyGate && turnEdited && !verifyOk && verifyNudges < VERIFY_MAX) {
           verifyNudges++;
           await emit('verify_nudge', { verifyRan, attempt: verifyNudges });
-          await append({ role: 'user', content: buildVerifyNudge(verifyRan) });
+          await append({ role: 'user', content: buildVerifyNudge(verifyRan, verifyHint(toolContext.workspace)) });
           continue;
         }
 

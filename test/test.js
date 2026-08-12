@@ -3249,8 +3249,29 @@ describe('chat.js (effort + bypass)', async () => {
   });
 
   test('buildVerifyNudge: distinct messages for never-ran vs failing', () => {
-    assert.match(buildVerifyNudge(false), /haven't verified|run the project's build/);
+    assert.match(buildVerifyNudge(false), /haven't verified/);
     assert.match(buildVerifyNudge(true), /did not pass|do not finish with a failing/);
+  });
+
+  // Measured on a qwen3.6 eval trajectory: a three-file rename took 8 tool calls,
+  // then 11 more on verification, three of them re-checking for a package.json
+  // that a bare sandbox was never going to have. The nudge was naming npm and tsc
+  // whatever the workspace looked like.
+  test('the verify nudge names what the workspace actually has', async () => {
+    const { verifyHint } = await import('../src/agent-runner.js');
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-verify-'));
+    try {
+      assert.equal(verifyHint(dir), null, 'nothing to find in a bare directory');
+      assert.match(buildVerifyNudge(false, verifyHint(dir)), /no build, test, or dependency manifest/);
+      assert.doesNotMatch(buildVerifyNudge(false, verifyHint(dir)), /npm|tsc/,
+        'must not send the model hunting for a build system that is not there');
+
+      await fsp.writeFile(path.join(dir, 'package.json'), '{}');
+      assert.match(verifyHint(dir), /npm/);
+      assert.match(buildVerifyNudge(false, verifyHint(dir)), /npm test/);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
   });
 
   test('resolveActNudge: default 15, env override, 0 disables', () => {
