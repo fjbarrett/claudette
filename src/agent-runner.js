@@ -294,7 +294,12 @@ export async function runAgent({
     await emit('message', { message });
     return message;
   };
-  const finish = (status) => ({ status, content, messages, usage, iterations: iteration, toolCalls });
+  // `error` is carried on a failed run so callers can say *why*. Without it a
+  // batch runner reports "agent run failed after 1 iterations" and the provider
+  // error — the only thing that explains a whole model's column of failures —
+  // is gone by the time anyone reads the report.
+  const finish = (status, error = null) =>
+    ({ status, content, messages, usage, iterations: iteration, toolCalls, error });
 
   while (true) {
     while (iteration < budget) {
@@ -332,7 +337,7 @@ export async function runAgent({
           return finish('cancelled');
         }
         await emit('failed', { iteration, error: err });
-        return finish('failed');
+        return finish('failed', err);
       }
       await emit('request_end', { iteration, result, streamed });
 

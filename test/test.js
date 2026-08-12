@@ -4562,6 +4562,25 @@ describe('bench/evals.js (eval loops)', async () => {
     assert.ok(!record.failures.some(f => f.includes('final answer')), 'the answer itself matched');
   });
 
+  // A whole model's column of failures used to read "agent run failed after 1
+  // iterations", with the provider error — the only thing that explains it —
+  // dropped on the floor.
+  test('runEvalIteration reports the provider error behind a failed run', async () => {
+    const record = await runEvalIteration({
+      id: 'mock-provider-error',
+      prompt: 'anything',
+      maxTurns: 4,
+      expect: { answer: { matches: 'never' } },
+    }, {
+      model: 'mock',
+      chatFn: async () => { throw Object.assign(new Error('OpenRouter chat (402): credits exhausted'), { status: 402 }); },
+    });
+
+    assert.ok(!record.pass);
+    assert.match(record.error, /credits exhausted/, 'the cause survives into the report');
+    assert.match(record.failures[0], /402/);
+  });
+
   test('runEvalIteration stops at maxTurns without a final answer', async () => {
     const record = await runEvalIteration({
       id: 'mock-loop',

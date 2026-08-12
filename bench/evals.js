@@ -133,7 +133,10 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
     record.finalText = run.status === 'completed' ? run.content : '';
     record.promptTokens = run.usage.promptTokens;
     record.completionTokens = run.usage.completionTokens;
-    if (run.status === 'failed') throw new Error(`agent run failed after ${run.iterations} iterations`);
+    if (run.status === 'failed') {
+      throw new Error(`agent run failed after ${run.iterations} iterations: ` +
+        `${run.error?.message ?? 'no error reported'}`);
+    }
 
     const { pass, failures } = await evaluateExpectations(record, caseDef.expect ?? {}, sandbox);
     record.pass = pass;
