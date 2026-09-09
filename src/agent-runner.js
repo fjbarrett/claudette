@@ -292,6 +292,7 @@ export async function runAgent({
   messages,
   tools = [],
   toolContext = {},
+  execute = executeTool,
   chatFn = chatStream,
   effort = null,
   signal = undefined,
@@ -431,7 +432,7 @@ export async function runAgent({
         let output;
         let isError = false;
         try {
-          output = String(await executeTool(name, args, { ...toolContext, readCache, signal }));
+          output = String(await execute(name, args, { ...toolContext, readCache, signal }));
         } catch (err) {
           output = `Error: ${err.message}`;
           isError = true;
