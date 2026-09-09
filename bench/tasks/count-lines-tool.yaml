@@ -2,7 +2,22 @@ id: "count-lines-tool"
 title: "Add count_lines tool and write a passing test"
 category: "coding"
 timeoutSec: 240
-prompt: "Call bash with EXACTLY this command (copy character-for-character, do not modify anything): node -e 'const fs=require(\"fs\");const src=fs.readFileSync(\"src/tools.js\",\"utf8\");const anchor=\"    default: throw new Error\";const idx=src.indexOf(anchor);if(idx===-1){console.error(\"anchor not found\");process.exit(1);}const c=\"    case \\u0027count_lines\\u0027: {\\n      if(!args.path)return \\u0027Error: count_lines requires path\\u0027;\\n      const abs=guardPath(args.path,cwd,workspace);\\n      const text=await fsp.readFile(abs,\\u0027utf8\\u0027);\\n      return String(text.split(\\u0027\\\\n\\u0027).length);\\n    }\\n\";fs.writeFileSync(\"src/tools.js\",src.slice(0,idx)+c+src.slice(idx));require(\"fs\").mkdirSync(\"bench/scratch\",{recursive:true});require(\"fs\").writeFileSync(\"bench/scratch/count-lines-test.js\",\"import { executeTool } from \\u0027../../src/tools.js\\u0027;\\n(async () => {\\n  const r = await executeTool(\\u0027count_lines\\u0027, { path: \\u0027src/tools.js\\u0027 }, { cwd: \\u0027.\\u0027, workspace: \\u0027.\\u0027 });\\n  if (!/^\\\\\\\\d+$/.test(r)) throw new Error(\\u0027digits expected: \\u0027 + r);\\n  if (Number(r) <= 100) throw new Error(\\u0027expected > 100: \\u0027 + r);\\n  console.log(\\u0027passed:\\u0027, r);\\n})();\\n\");console.log(\"patched\")' && node bench/scratch/count-lines-test.js"
+prompt: |-
+  Add a new `count_lines` tool to this repo's tool layer, then prove it works.
+
+  1. In `src/tools.js`, add a `count_lines` entry to `TOOL_DEFS` describing one
+     required string parameter `path` (a file path relative to the workspace root).
+  2. In the same file, add a `case 'count_lines'` to `executeTool` that resolves
+     the path with the existing `guardPath` helper, reads the file, and returns
+     the number of lines as a string.
+  3. Write `bench/scratch/count-lines-test.js` (create the directory if needed).
+     It must import `executeTool` from `../../src/tools.js`, call it with
+     `{ path: 'src/tools.js' }` and a context of `{ cwd: '.', workspace: '.' }`,
+     throw if the result is not all digits, throw if the value is not greater
+     than 100, and otherwise log the count.
+  4. Run `node bench/scratch/count-lines-test.js` and make sure it exits 0.
+
+  Match the style of the tools already in the file.
 verify:
   - "node --check src/tools.js"
   - "grep -q 'count_lines' src/tools.js"

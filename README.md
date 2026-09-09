@@ -7,10 +7,13 @@ Fireworks, Groq, HuggingFace), or local models via Ollama. No local GPU required
 
 ## What it includes
 
-- Browser UI with session history, model switching, and streamed responses
-- Local CLI with slash commands and streamed chat
+- Local CLI with slash commands, tool use, and streamed chat
+- Headless one-shot mode (`-p`) and a JSONL line protocol (`--json-ipc`) for scripts
+- Browser dashboard with session history, model switching, streamed responses, and
+  per-turn traces (chat and trace only — the tool-running agent is the CLI)
 - Persistent JSON session storage in `data/sessions`
 - `@relative/path` file expansion so prompts can inline workspace files
+- A benchmark harness (`bench/`) that runs the same agent loop the CLI ships
 
 ## Setup
 
@@ -40,15 +43,110 @@ In another terminal:
 npm run cli
 ```
 
-Inside the CLI, the main git workflow commands are:
+Inside the CLI, `Tab` completes slash commands and `@paths`, and `/help` lists
+everything. The git-oriented commands are:
 
 ```text
 /status               show branch + working tree state
-/feature <name>       create and switch to feature/<name>
-/save <message>       git add -A && git commit -m "<message>"
-/publish              push the current branch to origin
-/update               pull latest changes with --ff-only
+/diff                 show the unstaged diff
+/commit               write and run a git commit for the staged changes
+/review               review the staged changes
 ```
+
+### Running it without a terminal
+
+```bash
+claudette -p "why does the build fail?"     # one prompt, prints the answer, exits
+claudette -p "fix the lint errors" -y       # …with tools auto-approved
+claudette --continue                        # reattach to the newest session
+claudette --resume 3f9a1c2b                 # reattach to a specific session
+claudette --json-ipc                        # JSONL protocol on stdin/stdout
+```
+
+`-p` prints the reply and nothing else — no banner, spinner, or cost footer — so
+`claudette -p "…" > answer.txt` gives you exactly the response. It exits non-zero
+when the turn fails, so a script can branch on it.
+
+## Use it from a script
+
+```bash
+npm install claudette      # or: npm link, from a clone
+```
+
+```js
+import { run, stream, createAgent } from 'claudette';
+
+// One turn, tools and all. `cwd` is a hard boundary — the agent cannot read
+// or write outside it.
+const { text, toolCalls, costUsd, status } = await run('fix the failing test', {
+  cwd: './my-project',
+  model: 'openrouter/openai/gpt-5-nano',   // or a bare Ollama id
+});
+
+// Watch it work.
+for await (const ev of stream('audit src/auth.js for injection risks')) {
+  if (ev.type === 'text') process.stdout.write(ev.text);
+  if (ev.type === 'tool_call') console.error('→', ev.name, ev.args);
+  if (ev.type === 'result') console.error('\ndone:', ev.status, ev.usage);
+}
+
+// Keep a conversation.
+const agent = createAgent({ cwd: './my-project' });
+await agent.send('what does src/index.js export?');
+await agent.send('add JSDoc to each of them');   // remembers the answer above
+```
+
+Useful options: `tools: false` for a plain completion, `approve: (name) => name !== 'bash'`
+to gate what it may run (default allows everything, since a script has nobody to ask),
+`signal` to cancel, `maxIterations`, `system` / `append` to shape the prompt, and
+`messages` to continue an earlier conversation.
+
+Lower-level pieces are exported too — `runAgent` (the loop, fully hookable),
+`executeTool`, `chatStream`, `getModels` — for building something else on top.
+TypeScript definitions ship in `index.d.ts`.
+
+## Benchmarks
+
+`bench/` is a private regression suite: worktree-isolated task runs, hard checks,
+an LLM judge, and a leaderboard.
+
+```bash
+npm run bench -- --task <id> --model <provider/model> --judge <provider/model>
+npm run bench:list
+npm run bench:leaderboard
+npm run eval -- --all --model <provider/model>   # fast in-process tool-usage evals
+npm run eval -- --all --model <m> --json        # one JSON document, for comparing models
+```
+
+For comparable public numbers, claudette runs as a **Terminal-Bench 2.x agent**
+through Harbor:
+
+```bash
+uv venv .venv-harbor --python "$(command -v python3)"   # must be a native arm64/x86_64 python
+uv pip install -p .venv-harbor -e bench/harbor
+
+.venv-harbor/bin/harbor run -d terminal-bench@2.0 \
+  -a claudette_harbor:Claudette \
+  -m ollama/qwen3.6:35b-a3b-opencode \
+  --agent-kwarg version=main \
+  -i openssl-selfsigned-cert -o bench/runs/harbor -n 1
+```
+
+The adapter installs claudette into the task container from a GitHub tarball, so
+`version=` must name a pushed ref. A local `ollama/…` model works: the loopback
+URL is rewritten to `host.docker.internal` so the container can reach Ollama on
+the host, which makes benchmark runs free.
+
+## Tests
+
+```bash
+npm test           # the offline suite — what CI runs, ~60s, no key or GPU needed
+npm run test:live  # adds the Stress suite, which drives a real local Ollama model
+```
+
+No dependencies to install; the offline suite drives a mock Ollama over loopback.
+`test:live` is slow by nature — each prompt is a real generation, so a 27B model
+turns it into a 40-minute run.
 
 ## Models & providers
 
@@ -126,6 +224,40 @@ Ollama use their own native APIs (`src/anthropic.js`, `src/ollama.js`).
   `PERPLEXITY_BASE_URL`
 - `ANTHROPIC_MAX_TOKENS`: max output tokens for Anthropic responses, default `4096`
 - `WORKSPACE_ROOT`: allowed root for `@file` expansion, default repo root
+
+### Agent behaviour
+
+- `CLAUDETTE_MAX_ITERATIONS`: tool iterations per turn, default `150` (`--max-iterations N`)
+- `CLAUDETTE_ACT_NUDGE`: read-only tool calls before the agent is pushed to act, default `15`; `0` disables
+- `CLAUDETTE_VERIFY_GATE`: `0` lets a turn finish without a passing build/test after editing
+- `CLAUDETTE_AUTO_COMPACT` / `CLAUDETTE_COMPACT_TOKENS`: history compaction (`0` / default `60000`).
+  Compaction archives the full history to `data/sessions/archive/` before summarising
+- `CLAUDETTE_BASH_TIMEOUT` / `CLAUDETTE_BASH_OUTPUT_CHARS`: bash tool limits, default `120000` ms / `16000` chars
+- `CLAUDETTE_NUM_CTX`: Ollama context window, default `32768`. Raise it for models
+  that support more (qwen3.6 exposes 256k); Ollama's own default is 4096, which
+  truncates an agent loop almost immediately, so one is always sent
+
+Ctrl+C interrupts a running tool as well as the model request, so a hung
+`npm run build` can be stopped without killing the session.
+
+### Provider resilience
+
+- `CLAUDETTE_MAX_RETRIES`: retries for rate limits and transient 5xx, default `2`.
+  Backoff is exponential with jitter and honours `Retry-After`. A response that has
+  already started streaming is never retried, so output can't be duplicated
+- `CLAUDETTE_STALL_TIMEOUT`: give up when a provider sends nothing for this long,
+  default `300000` ms; `0` waits indefinitely
+- `CLAUDETTE_QUIET_RETRIES=1`: don't print the retry notice
+
+### Web server
+
+- `CLAUDETTE_MAX_BODY_BYTES`: request body cap, default `1048576` (1 MB); over it the
+  server answers 413
+- One turn per session at a time; a second concurrent POST gets 409. Closing the tab
+  aborts the provider call instead of paying for a response nobody reads
+
+The server binds loopback and has no authentication. `HOST=0.0.0.0` exposes an
+unauthenticated agent to your LAN — don't.
 
 > Note: `OPENAI_BASE_URL` / `OPENAI_API_BASE` no longer configure Ollama (that was
 > a legacy fallback). `OPENAI_BASE_URL` now configures the OpenAI provider; use

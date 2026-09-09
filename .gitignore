@@ -1,18 +1,29 @@
+# Dependencies (there are none — the project is zero-dep — but npm may still
+# create this if a tool is installed locally)
 node_modules/
+
+# Generated agent state. Sessions, transcripts, usage logs and prompt history
+# are per-machine records, not sources, and they grow without bound.
+data/
+
+# Benchmark output: worktree runs, reports, the request cache, and the sandbox
+# tasks write into.
 bench/runs/
 bench/scratch/
-data/sessions/
-data/transcripts/
-data/usage/
-data/history/
 .ship-worktree/
+
+# Secrets. .env.example is the tracked template.
 .env
 .env.*
 !.env.example
-tmp/
+
+# Local scratch
 test_prompts.txt
 .claude/settings.local.json
-.DS_Store
+
+# Harbor adapter virtualenv + Python bytecode
 .venv-harbor/
 __pycache__/
 *.pyc
+
+.DS_Store

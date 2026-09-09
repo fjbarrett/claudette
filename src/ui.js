@@ -4,6 +4,13 @@ import { formatUsd } from './cost.js';
 
 const jsonIpc = process.argv.includes('--json-ipc');
 
+// Headless (`-p "…"`) shares IPC's "no terminal chrome" rule: a spinner repainting
+// a line 12×/second is unreadable once stdout is a pipe, and the trailing model /
+// token footer is not part of the answer a script asked for. Chat output itself
+// still prints, so `claudette -p "…" > out.txt` gives you exactly the reply.
+const headless = process.argv.includes('-p') || process.argv.includes('--print');
+const quiet = jsonIpc || headless;
+
 // Palette: VS Code Default Dark+ (24-bit truecolor). Honors NO_COLOR.
 const NO_COLOR = process.env.NO_COLOR != null && process.env.NO_COLOR !== '';
 const sgr = (code) => (NO_COLOR ? '' : code);
@@ -49,7 +56,7 @@ let _usageStatus = '';
 export function setUsageStatus(text) { _usageStatus = String(text ?? ''); }
 
 export function startSpinner(label = 'Thinking') {
-  if (jsonIpc) return;
+  if (quiet) return;
   if (_spinTimer) return;
   process.stdout.write('\n');
   _spinTimer = setInterval(() => {
@@ -59,7 +66,7 @@ export function startSpinner(label = 'Thinking') {
 }
 
 export function stopSpinner() {
-  if (jsonIpc) return;
+  if (quiet) return;
   if (!_spinTimer) return;
   clearInterval(_spinTimer);
   _spinTimer = null;
@@ -116,7 +123,7 @@ export function printBanner({ model, cwd, sessionId, effort, autoApprove }) {
 }
 
 export function printAssistantStart() {
-  if (jsonIpc) return;
+  if (quiet) return; // headless emits the answer text alone, with no ◆ gutter
   process.stdout.write(`\n${B}${P}◆${R} `);
 }
 
@@ -128,7 +135,7 @@ export function printAssistantMessage(text) {
 }
 
 export function printAssistantEnd({ model: m, tokens, costUsd, sessionCostUsd } = {}) {
-  if (jsonIpc) return;
+  if (quiet) { if (headless) process.stdout.write('\n'); return; }
   const turnCost = formatUsd(costUsd);
   const sessCost = formatUsd(sessionCostUsd);
   const info = [

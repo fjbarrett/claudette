@@ -7,11 +7,18 @@ import net from 'node:net';
 
 const execFile = promisify(_execFile);
 
-// Workspace boundary check using relative path. Error messages are written to be
-// actionable: the usage logs showed the model repeating the same mistakes — paths
-// outside the workspace (31×) and missing paths (38×) — because the raw errors
-// gave it nothing to recover with.
-function guardPath(filePath, cwd, workspace) {
+// Workspace boundary check. Error messages are written to be actionable: the
+// usage logs showed the model repeating the same mistakes — paths outside the
+// workspace (31×) and missing paths (38×) — because the raw errors gave it
+// nothing to recover with.
+//
+// Two checks, because a lexical one is not a boundary. `../etc/passwd` is caught
+// by comparing the relative path, but a SYMLINK inside the workspace pointing
+// out of it is lexically innocent: `ln -s /etc/passwd notes.txt` followed by
+// `read_file notes.txt` used to walk straight out. So the real path is resolved
+// and re-checked. The file may not exist yet (write_file creates it), so we
+// resolve the deepest ancestor that does.
+async function guardPath(filePath, cwd, workspace) {
   if (!filePath || typeof filePath !== 'string') {
     throw new Error(`Missing required 'path' argument (got: ${JSON.stringify(filePath)}). Pass a path relative to the workspace root, e.g. "src/index.js".`);
   }
@@ -20,7 +27,39 @@ function guardPath(filePath, cwd, workspace) {
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
     throw new Error(`Path '${filePath}' is outside the workspace root. Use a path relative to the workspace (no leading '/' and no '..'); the workspace is the project you are working in.`);
   }
+
+  // The workspace itself is often reached through a symlink (/tmp on macOS is
+  // /private/tmp), so resolve both sides before comparing.
+  const realRoot = await realpathOrSelf(workspace);
+  const realAbs = await resolveDeepest(abs);
+  const realRel = path.relative(realRoot, realAbs);
+  if (realRel.startsWith('..') || path.isAbsolute(realRel)) {
+    throw new Error(`Path '${filePath}' is a symlink that resolves outside the workspace root (${realAbs}). Only files that genuinely live inside the workspace can be read or written.`);
+  }
   return abs;
+}
+
+async function realpathOrSelf(p) {
+  try { return await fsp.realpath(p); } catch { return p; }
+}
+
+// realpath() of the deepest existing ancestor, with the not-yet-created tail
+// re-appended. Lets a brand-new file be checked as strictly as an existing one.
+async function resolveDeepest(target) {
+  const missing = [];
+  let current = target;
+  for (;;) {
+    try {
+      const real = await fsp.realpath(current);
+      return missing.length ? path.join(real, ...[...missing].reverse()) : real;
+    } catch (err) {
+      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
+      const parent = path.dirname(current);
+      if (parent === current) return target; // hit the filesystem root
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 // ─── Tool definitions (Ollama/OpenAI function calling format) ─────────────────
@@ -178,7 +217,11 @@ export const TOOL_DEFS = [
 
 // ─── Executor dispatch ────────────────────────────────────────────────────────
 
-export async function executeTool(name, args, { cwd, workspace, readCache } = {}) {
+export async function executeTool(name, args, { cwd, workspace, readCache, signal } = {}) {
+  // execFile validates options.signal strictly: an AbortSignal or undefined, but
+  // NOT null. Callers with no signal to give (the eval harness) naturally pass
+  // null, which threw ERR_INVALID_ARG_TYPE before the command ever ran.
+  signal = signal ?? undefined;
   switch (name) {
     case 'bash': {
       let cmd = args.command;
@@ -195,7 +238,7 @@ export async function executeTool(name, args, { cwd, workspace, readCache } = {}
       // instead of bash's cryptic "-c: option requires an argument".
       cmd = cmd == null ? '' : String(cmd);
       if (!cmd.trim()) throw new Error("bash: missing required argument 'command' — pass the shell command as {\"command\": \"...\"}");
-      return runBash(cmd, cwd);
+      return runBash(cmd, cwd, signal);
     }
     case 'read_file': {
       if (!args.path) return 'Error: read_file requires {"path": "relative/path/to/file"}';
@@ -208,7 +251,7 @@ export async function executeTool(name, args, { cwd, workspace, readCache } = {}
       if (readCache) {
         const key = `${args.offset ?? ''}|${args.limit ?? ''}`;
         try {
-          const mtime = (await fsp.stat(guardPath(args.path, cwd, workspace))).mtimeMs;
+          const mtime = (await fsp.stat(await guardPath(args.path, cwd, workspace))).mtimeMs;
           const entry = readCache.get(args.path);
           if (entry && entry.mtime === mtime) {
             // Exact same range, unchanged → already in context.
@@ -245,7 +288,7 @@ export async function executeTool(name, args, { cwd, workspace, readCache } = {}
     }
     case 'glob': {
       if (!args.pattern) return 'Error: glob requires {"pattern": "**/*.js"}';
-      return runGlob(args.pattern, cwd);
+      return runGlob(args.pattern, cwd, workspace);
     }
     case 'list_dir': {
       // Treat an empty/blank path as the workspace root (models sometimes send "").
@@ -256,16 +299,16 @@ export async function executeTool(name, args, { cwd, workspace, readCache } = {}
       if (!args.pattern) return 'Error: search_code requires {"pattern": "search regex", "path": "optional/dir"}';
       // Empty/blank path → search the whole workspace (models often send "").
       const sp = (typeof args.path === 'string' && args.path.trim()) ? args.path : '.';
-      return runSearchCode(args.pattern, sp, args.include, cwd, workspace);
+      return runSearchCode(args.pattern, sp, args.include, cwd, workspace, signal);
     }
     case 'grep': {
       if (!args.pattern) return 'Error: grep requires {"pattern": "search regex", "path": "optional/dir"}';
       const gp = (typeof args.path === 'string' && args.path.trim()) ? args.path : '.';
-      return runGrep(args.pattern, gp, args.include, cwd);
+      return runGrep(args.pattern, gp, args.include, cwd, signal);
     }
     case 'fetch_url': {
       if (!args.url) return 'Error: fetch_url requires {"url": "https://..."}';
-      return fetchUrl(args.url);
+      return fetchUrl(args.url, signal);
     }
     case 'patch_file': {
       if (!args.path) return 'Error: patch_file requires a "path" field.';
@@ -285,17 +328,24 @@ export function resolveBashTimeout(env = process.env) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : 120_000;
 }
 
-async function runBash(command, cwd) {
+async function runBash(command, cwd, signal) {
   const timeout = resolveBashTimeout();
   try {
     const { stdout, stderr } = await execFile('bash', ['-c', command], {
       cwd,
       timeout,
+      signal,
       maxBuffer: 2 * 1024 * 1024,
     });
     const out = [stdout, stderr].filter(Boolean).join('\n').trim();
     return capBashOutput(out) || '(exit 0, no output)';
   } catch (err) {
+    // Ctrl+C during a foreground command. Distinguished from a timeout because
+    // both arrive as a killed child, and telling the model "it timed out" would
+    // send it off tuning CLAUDETTE_BASH_TIMEOUT for something the user did.
+    if (signal?.aborted || err.name === 'AbortError' || err.code === 'ABORT_ERR') {
+      throw new Error('Command interrupted by the user before it finished.');
+    }
     if (err.killed) {
       throw new Error(
         `Command timed out after ${Math.round(timeout / 1000)}s. ` +
@@ -310,7 +360,7 @@ async function runBash(command, cwd) {
 }
 
 async function readFile(filePath, cwd, workspace, { offset, limit } = {}) {
-  const abs = guardPath(filePath, cwd, workspace);
+  const abs = await guardPath(filePath, cwd, workspace);
   let stat;
   try {
     stat = await fsp.stat(abs);
@@ -351,7 +401,7 @@ async function readFile(filePath, cwd, workspace, { offset, limit } = {}) {
 }
 
 async function writeFile(filePath, content, cwd, workspace) {
-  const abs = guardPath(filePath, cwd, workspace);
+  const abs = await guardPath(filePath, cwd, workspace);
   await fsp.mkdir(path.dirname(abs), { recursive: true });
   // Models sometimes double-escape newlines/tabs (\\n → \n literal) in JSON content.
   // If the content has no real newlines but has literal \n sequences, unescape them.
@@ -370,7 +420,7 @@ async function writeFile(filePath, content, cwd, workspace) {
 }
 
 async function strReplace(filePath, oldStr, newStr, cwd, workspace) {
-  const abs = guardPath(filePath, cwd, workspace);
+  const abs = await guardPath(filePath, cwd, workspace);
   const current = await fsp.readFile(abs, 'utf8');
   if (oldStr === newStr) {
     throw new Error(`No changes: old_str and new_str are identical in ${filePath}`);
@@ -398,29 +448,89 @@ function similarLinesHint(content, oldStr) {
   return '\nPossible matching lines:\n' + matches.map(m => `  ${m.n}: ${m.line}`).join('\n');
 }
 
-async function runGlob(pattern, cwd) {
-  // Belt and braces: `glob` is auto-approved (no permission prompt), so refuse
-  // command-substitution syntax outright before bash ever sees it.
-  if (pattern.includes('`') || pattern.includes('$(')) return '(no matches)';
-  // bash globstar handles ** reliably, but the pattern is model-controlled, so it
-  // must never be interpolated into the script text — `$(...)` and backticks would
-  // execute. Passed as a positional parameter it stays data: `files=($1)` still
-  // word-splits and glob-expands, while bash does not re-run command substitution
-  // on parameter expansion.
-  const script = `shopt -s globstar nullglob dotglob 2>/dev/null; files=($1); printf '%s\\n' "\${files[@]}"`;
-  try {
-    const { stdout } = await execFile('bash', ['-c', script, 'glob', pattern], { cwd, timeout: 10_000 });
-    const files = stdout.trim().split('\n')
-      .filter(f => f && !f.includes('node_modules') && !f.includes('/.git/'));
-    if (!files.length) return '(no matches)';
-    return files.length > 200 ? files.slice(0, 200).join('\n') + `\n… (${files.length - 200} more)` : files.join('\n');
-  } catch {
-    return '(no matches)';
+/**
+ * Translate a glob to a RegExp. Supports the syntax the tool documents — `**`
+ * (crosses directory separators), `*` and `?` (do not) — and escapes everything
+ * else, so no pattern can mean anything but "match this path".
+ */
+export function globToRegExp(pattern) {
+  let re = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        i++;
+        if (pattern[i + 1] === '/') { i++; re += '(?:[^/]+/)*'; } // `**/` = zero or more dirs
+        else re += '.*';
+      } else {
+        re += '[^/]*';
+      }
+    } else if (c === '?') {
+      re += '[^/]';
+    } else {
+      re += c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
   }
+  return new RegExp(`^${re}$`);
+}
+
+const GLOB_SKIP_DIRS = new Set(['node_modules', '.git']);
+const GLOB_MAX_ENTRIES = 20_000; // walk bound, so a huge tree can't hang the turn
+
+/**
+ * Match files under the workspace against a glob, walking the tree directly.
+ *
+ * This used to shell out to `bash -c 'shopt -s globstar; files=($1); …'` with the
+ * MODEL-CONTROLLED pattern as a positional parameter. That was careful, and it
+ * still meant an auto-approved tool handing attacker-influenced text to a shell.
+ * There is no shell here now, so there is nothing to escape. Skipping
+ * node_modules/.git during the walk (rather than filtering matches afterwards)
+ * also stops it from descending into them at all.
+ */
+async function runGlob(pattern, cwd, workspace = cwd) {
+  const re = globToRegExp(pattern);
+  const root = await realpathOrSelf(workspace);
+  const matches = [];
+  let visited = 0;
+
+  async function walk(relDir) {
+    if (visited >= GLOB_MAX_ENTRIES) return;
+    let entries;
+    try {
+      entries = await fsp.readdir(path.join(cwd, relDir), { withFileTypes: true });
+    } catch {
+      return; // unreadable directory — skip it rather than failing the whole glob
+    }
+    for (const entry of entries) {
+      if (visited >= GLOB_MAX_ENTRIES) return;
+      visited++;
+      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      if (entry.isDirectory()) {
+        if (GLOB_SKIP_DIRS.has(entry.name)) continue;
+        if (re.test(rel)) matches.push(rel);
+        await walk(rel);
+      } else if (entry.isSymbolicLink()) {
+        // Never report a link that points out of the workspace.
+        const real = await realpathOrSelf(path.join(cwd, rel));
+        const inside = path.relative(root, real);
+        if (inside.startsWith('..') || path.isAbsolute(inside)) continue;
+        if (re.test(rel)) matches.push(rel);
+      } else if (re.test(rel)) {
+        matches.push(rel);
+      }
+    }
+  }
+
+  await walk('');
+  if (!matches.length) return '(no matches)';
+  matches.sort();
+  return matches.length > 200
+    ? `${matches.slice(0, 200).join('\n')}\n… (${matches.length - 200} more)`
+    : matches.join('\n');
 }
 
 async function listDir(targetPath, depth, cwd, workspace) {
-  const abs = guardPath(targetPath, cwd, workspace);
+  const abs = await guardPath(targetPath, cwd, workspace);
   const stat = await fsp.stat(abs);
   if (!stat.isDirectory()) {
     throw new Error(`${targetPath} is not a directory`);
@@ -445,12 +555,12 @@ async function listDir(targetPath, depth, cwd, workspace) {
   }
 }
 
-async function runGrep(pattern, searchPath, include, cwd) {
+async function runGrep(pattern, searchPath, include, cwd, signal) {
   const args = ['-r', '-n', '--color=never', '-I'];
   if (include) args.push(`--include=${include}`);
   args.push('--', pattern, searchPath);
   try {
-    const { stdout } = await execFile('grep', args, { cwd, timeout: 15_000, maxBuffer: 1024 * 1024 });
+    const { stdout } = await execFile('grep', args, { cwd, timeout: 15_000, signal, maxBuffer: 1024 * 1024 });
     const lines = stdout.trim().split('\n').filter(Boolean);
     if (!lines.length) return '(no matches)';
     if (lines.length > 60) return lines.slice(0, 60).join('\n') + `\n… (${lines.length - 60} more matches)`;
@@ -461,20 +571,20 @@ async function runGrep(pattern, searchPath, include, cwd) {
   }
 }
 
-async function runSearchCode(pattern, searchPath, include, cwd, workspace) {
-  const abs = guardPath(searchPath, cwd, workspace);
+async function runSearchCode(pattern, searchPath, include, cwd, workspace, signal) {
+  const abs = await guardPath(searchPath, cwd, workspace);
   const relative = path.relative(cwd, abs) || '.';
   try {
     const args = ['--line-number', '--no-heading', '--color=never'];
     if (include) args.push('--glob', include);
     args.push(pattern, relative);
-    const { stdout } = await execFile('rg', args, { cwd, timeout: 15_000, maxBuffer: 1024 * 1024 });
+    const { stdout } = await execFile('rg', args, { cwd, timeout: 15_000, signal, maxBuffer: 1024 * 1024 });
     const lines = stdout.trim().split('\n').filter(Boolean);
     if (!lines.length) return '(no matches)';
     return lines.length > 80 ? lines.slice(0, 80).join('\n') + `\n… (${lines.length - 80} more matches)` : lines.join('\n');
   } catch (err) {
     if (err.code === 1) return '(no matches)';
-    return runGrep(pattern, relative, include, cwd);
+    return runGrep(pattern, relative, include, cwd, signal);
   }
 }
 
@@ -512,7 +622,7 @@ async function assertPublicHost(parsed) {
   }
 }
 
-async function fetchUrl(url) {
+async function fetchUrl(url, signal) {
   let parsed;
   try {
     parsed = new URL(url);
@@ -530,8 +640,9 @@ async function fetchUrl(url) {
     if (hop > 5) throw new Error('Too many redirects');
     await assertPublicHost(parsed);
     response = await fetch(parsed, {
-      headers: { 'User-Agent': 'ollama-code/1.0' },
+      headers: { 'User-Agent': 'claudette/1.0' },
       redirect: 'manual',
+      signal,
     });
     const location = response.status >= 300 && response.status < 400 ? response.headers.get('location') : null;
     if (!location) break;
@@ -559,7 +670,7 @@ async function fetchUrl(url) {
 }
 
 async function patchFile(filePath, args, cwd, workspace) {
-  const abs = guardPath(filePath, cwd, workspace);
+  const abs = await guardPath(filePath, cwd, workspace);
   let content = await fsp.readFile(abs, 'utf8');
   const patches = Array.isArray(args.patches) && args.patches.length
     ? args.patches

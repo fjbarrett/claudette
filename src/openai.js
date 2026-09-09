@@ -7,6 +7,7 @@
 // and model list while sharing this wire protocol.
 
 import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
+import { providerHttpError } from './retry.js';
 
 const PREFIX = 'openai/';
 export const KEY_ENV = 'OPENAI_API_KEY';
@@ -106,25 +107,86 @@ export async function chatCompletionsStream({
     applyAnthropicCacheBreakpoints(body.messages);
   }
 
-  const res = await fetch(`${baseUrl}/chat/completions`, {
+  const post = (payload) => fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
       ...extraHeaders,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
     signal,
   });
 
+  let payload = body;
+  let res = await post(payload);
+
+  // Newer OpenAI models reject request fields older ones required: the gpt-5
+  // family wants `max_completion_tokens` instead of `max_tokens`, and refuses
+  // any `temperature` but the default. Gateways like OpenRouter normalise this,
+  // so the same model worked through OpenRouter and 400'd against
+  // api.openai.com — claudette could not reach ANY current OpenAI model
+  // directly. A hardcoded per-model table would rot with the next release, so
+  // adapt from what the API says is wrong and retry, bounded so a genuinely
+  // broken request still fails fast.
+  for (let attempt = 0; !res.ok && res.status === 400 && attempt < ADAPTABLE_FIELDS.length; attempt++) {
+    const txt = await res.text().catch(() => '');
+    const next = adaptPayload(payload, txt);
+    if (!next) throw providerHttpError(label, { status: 400, headers: res.headers }, txt);
+    payload = next;
+    res = await post(payload);
+  }
+
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`${label} chat (${res.status}): ${txt}`);
+    // Carries .status + any Retry-After so provider.js can decide to retry.
+    throw providerHttpError(label, res, txt);
   }
 
   const result = await parseChatCompletionsSSE(res.body, onDelta);
   result.toolMode = tools.length ? 'native' : 'none';
   return result;
+}
+
+// Request fields a 400 may tell us to drop. Deliberately a short allowlist of
+// tuning knobs: dropping one changes sampling, never meaning. `messages`,
+// `model`, and `tools` are never touched — if the API objects to those, the
+// request really is wrong and should fail.
+const ADAPTABLE_FIELDS = ['max_tokens', 'temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty', 'reasoning_effort'];
+
+/**
+ * Given a 400 body, return a payload with the offending field renamed or
+ * removed, or null when the error isn't one we can adapt to.
+ * Exported for tests — the live behaviour is otherwise only reachable with a key.
+ */
+export function adaptPayload(payload, errorText) {
+  let param = null;
+  try { param = JSON.parse(errorText)?.error?.param ?? null; } catch { /* not JSON */ }
+
+  // `max_tokens` is a rename, not a removal — the cap still has to apply.
+  if (/max_completion_tokens/.test(errorText) && payload.max_tokens != null) {
+    const { max_tokens, ...rest } = payload;
+    return { ...rest, max_completion_tokens: max_tokens };
+  }
+
+  // Some models refuse function tools while any reasoning effort is set, and say
+  // so: "To use function tools, use /v1/responses or set reasoning_effort to
+  // 'none'". Tools are what makes this an agent, so take the trade the API
+  // offers. Only when tools are actually present — a plain completion should
+  // keep the effort the caller asked for.
+  if (/reasoning_effort/.test(errorText) && /'none'/.test(errorText) && payload.tools?.length) {
+    if (payload.reasoning_effort === 'none') return null; // already tried
+    return { ...payload, reasoning_effort: 'none' };
+  }
+
+  if (!param) {
+    // Some errors name the field only in prose.
+    param = ADAPTABLE_FIELDS.find(f => new RegExp(`'${f}'`).test(errorText)) ?? null;
+  }
+  if (!param || !ADAPTABLE_FIELDS.includes(param) || !(param in payload)) return null;
+
+  const { [param]: _dropped, ...rest } = payload;
+  return rest;
 }
 
 // ─── Provider factory ────────────────────────────────────────────────────────
@@ -305,6 +367,7 @@ async function parseChatCompletionsSSE(stream, onDelta) {
   const order = [];                 // first-seen index order
   let promptTokens = 0;
   let completionTokens = 0;
+  let cachedTokens = 0;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -324,6 +387,9 @@ async function parseChatCompletionsSSE(stream, onDelta) {
       if (chunk.usage) {
         promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
         completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+        // Already inside prompt_tokens here — unlike Anthropic, which reports
+        // cached input separately. Kept only so the cost meter can discount it.
+        cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
       }
 
       const choice = chunk.choices?.[0];
@@ -367,5 +433,6 @@ async function parseChatCompletionsSSE(stream, onDelta) {
     hadApiToolCalls: toolCalls.length > 0,
     promptTokens,
     completionTokens,
+    cachedTokens,
   };
 }

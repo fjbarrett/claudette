@@ -2,7 +2,191 @@
 
 ## [Unreleased]
 
+### Security
+
+- **A symlink inside the workspace could read and write outside it.** `guardPath`
+  compared relative paths, which catches `../etc/passwd` but not
+  `ln -s /etc/passwd notes.txt` — that link is lexically innocent, and
+  `read_file notes.txt` walked straight out. The real path is now resolved and
+  re-checked, including for files that do not exist yet (`write_file` creates
+  them), so a new file is validated as strictly as an existing one.
+- **`glob` no longer touches a shell.** It ran `bash -c 'shopt -s globstar;
+  files=($1); …'` with the model-controlled pattern as a positional parameter.
+  That was careful, and it still meant an auto-approved tool handing
+  attacker-influenced text to a shell. The matcher walks the tree directly now,
+  prunes `node_modules`/`.git` during the walk rather than filtering afterwards,
+  and omits symlinks that leave the workspace.
+- **The unauthenticated server accepted unbounded request bodies.** Capped at 1 MB
+  (`CLAUDETTE_MAX_BODY_BYTES`), answering 413 rather than resetting the connection,
+  and malformed JSON is a 400 instead of a 500.
+- **A file you asked Claudette to read could run shell commands with no
+  permission prompt.** `handleMessage` scanned the prompt for a benchmark escape
+  hatch ("Call bash with EXACTLY this command…") and ran whatever followed
+  through `executeTool` directly, skipping `checkPermission` entirely. It scanned
+  the **@file-expanded** prompt, so the sentence only had to appear inside a file
+  you inlined. Reproduced end to end: a `notes.md` containing that sentence, with
+  the prompt `please summarize @notes.md`, executed the command before any model
+  request. The shortcut is gone; the two benchmark tasks that leaned on it
+  (`count-lines-tool`, `extract-print-help`) are now written as real task
+  descriptions, which is what their judge rubrics always claimed to score.
+- **"Always allow" on one bash command authorised every later command.**
+  `needsApproval` built a per-command `bash:<cmd>` key, but `checkPermission`
+  stored the bare tool name — so answering `a` to `rm -rf build` silently
+  approved every command for the rest of the session. Bash approvals are now
+  scoped to the exact command (`permissionKey`), and the prompt says which.
+
 ### Fixed
+
+- **Cached input tokens were not counted, so a long session under-reported its
+  cost by orders of magnitude.** Anthropic's `input_tokens` is the *uncached*
+  remainder, while OpenAI-compatible providers put the whole input in
+  `prompt_tokens` — and prompt caching is on by default here. The adapter read
+  `input_tokens` alone and called it the total: a five-case eval run against
+  `anthropic/claude-opus-5` reported 52 input tokens, and the live API said 371
+  for a single request the adapter was scoring at 2. `promptTokens` is now the
+  true total for both families, with the cache split carried alongside so
+  `estimateCost` prices a read at 0.1x and a write at 1.25x instead of billing
+  both as fresh input.
+- **A retry could fire instantly, three times, and give up inside a second.**
+  Backoff used full jitter — uniform over `[0, exponential]` — so an unlucky
+  draw waited ~0ms. It is half jitter now, and a connection-level failure
+  (nothing answering the socket, as against a 429 that answered) starts from a
+  3s base rather than 500ms. Found when Ollama auto-updated itself mid-run,
+  SIGTERMed its own server, and took 8.4s to come back; the whole retry budget
+  had expired long before. Sub-second waits also printed as "in 0s", which read
+  as "it never waited at all".
+- **A failed run threw away the provider error.** `runAgent` caught it, emitted
+  it, and returned a result that did not carry it — so a batch runner reported
+  "agent run failed after 1 iterations" with no way to tell a dead credit
+  balance from a bad model. The failed result carries the error now.
+- **Ctrl+C now interrupts a running tool, not just the model request.** The abort
+  controller was created per model request and cleared before tools ran, so during
+  the long part of a turn — a `npm run build` that hangs — nothing was listening
+  and Ctrl+C killed the process instead. One controller now spans the turn and is
+  threaded into `execFile`/`fetch`. An interrupted command says so, rather than
+  claiming it timed out and sending the model off to tune `CLAUDETTE_BASH_TIMEOUT`.
+- **Two concurrent turns on one web session silently lost one of them.** Both
+  loaded the session, both appended, and the slower save clobbered the faster.
+  The second request gets 409 now, and the slot is claimed synchronously — checking
+  before the first `await` left a window where both passed.
+- Closing the browser tab used to leave the provider call running to completion,
+  billed and discarded; it is aborted with the response.
+- `executeTool` rejected `signal: null`. `execFile` validates that option as
+  AbortSignal-or-undefined, so a caller with no signal to give (the eval harness)
+  broke every command before it ran.
+- **The exact-bash shortcut poisoned sessions on OpenAI-compatible providers.**
+  Both its branches appended a `role: 'tool'` message with no preceding
+  `tool_calls`; OpenAI and Azure reject the entire request with *"messages with
+  role 'tool' must be a response to a preceeding message with 'tool_calls'"*. The
+  failure branch died inside its own recovery loop, and the success branch left
+  the bad message in `session.messages` so the **next** prompt in that session
+  400'd. Removed at the source, and `dropOrphanToolMessages` now strips orphans
+  from every outbound payload so sessions written by older builds still resume.
+  Stored history keeps them.
+- **`--json-ipc` dropped every prompt after the first.** The loop advertises
+  `{"type":"ready"}` each turn, but `rl.question()` only listens while awaited —
+  lines emitted during a turn reached nobody and were discarded, then `rlClosed`
+  ended the loop. Two piped prompts ran one turn; with stdin redirected from a
+  file, even the first was lost. A `createLineQueue` buffers every line, EOF is a
+  value rather than a rejection, and `ready` is no longer advertised into a closed
+  stream. Single-shot piping (the Harbor adapter) is unaffected.
+- Compaction no longer destroys the conversation. `/compact` and auto-compaction
+  replaced `session.messages` with a summary, and the transcript is regenerated
+  from that array — so the original was gone from both places. The full history is
+  archived to `data/sessions/archive/` first, and the path is printed.
+- Session writes are atomic (temp file + rename). A crash mid-write left a
+  truncated JSON that `JSON.parse` rejects, making the session unloadable and
+  silently dropping it from `/sessions`. Sessions are written after every tool
+  result during a turn, so the window was not theoretical.
+- A rate limit or transient 5xx no longer throws away the whole turn. Provider
+  calls retry with exponential backoff plus jitter, honouring `Retry-After`
+  (`CLAUDETTE_MAX_RETRIES`, default 2). Retries stop once bytes have streamed, so
+  visible output is never duplicated, and a bad model slug or missing key still
+  fails on the first attempt instead of three times slower.
+- A hung provider no longer hangs forever. A stall watchdog aborts a request that
+  sends nothing for `CLAUDETTE_STALL_TIMEOUT` (default 300s, `0` disables) and
+  reports it as an actionable error — deliberately not an `AbortError`, which the
+  agent loop reads as "the user pressed Ctrl+C" and would have recorded a real
+  failure as a clean cancellation.
+- Transcripts are throttled instead of rewritten after every tool result. A
+  150-iteration turn re-serialised the whole growing transcript 150 times; it is
+  derived data, so it now writes at most every 2s and is flushed exactly at turn
+  end and on exit (`CLAUDETTE_TRANSCRIPT_THROTTLE`).
+
+### Added
+
+- `bench/eval-summary.js` — rebuilds `bench/BAKEOFF.md` (a ranked model table
+  plus a per-case coverage matrix) from the eval reports on disk, keyed on the
+  latest result per model *and* case, since a bake-off gets run in pieces. The
+  first bake-off's table was kept in a session scratchpad and was gone by the
+  next session, while the reports it came from sat in `bench/runs/evals`
+  untouched. The reports stay gitignored; the summary is committed.
+- Four eval cases that separate models rather than checking they can call a tool:
+  `multi-file-rename` (rename a symbol across three files, not just its
+  definition), `fix-failing-test` (run it, read the error, fix the source,
+  re-run — `test.sh` writes `.passed` only on a green run, so "it passes now" is
+  checkable rather than taken on the agent's word), `already-correct` (the file
+  is already right; the pass condition is not editing it), and `ambiguous-anchor`
+  (a non-unique `str_replace` anchor that has to be recovered from).
+- `CLAUDETTE_NUM_CTX` — Ollama's context window was hardcoded to 32k, so models
+  advertising far more (qwen3.6 exposes 256k) had no way to use it. Still defaults
+  to 32k, because Ollama's own default of 4096 truncates an agent loop immediately.
+- `claudette -p "…"` — headless one-shot mode. Prints the reply and nothing else
+  (no banner, spinner, or cost footer), so it pipes cleanly, and exits non-zero
+  when the turn fails.
+- `claudette --continue` / `--resume <id>` — reattach to the newest or a named
+  session at launch, instead of starting cold and typing `/resume`.
+- `Tab` completion for slash commands and `@paths`. readline supports a
+  `completer` and one was never passed, so Tab did nothing.
+- CI (`.github/workflows/ci.yml`) on Node 20/22/24, plus `npm test` and
+  `npm run test:offline` — a 240-test suite existed and nothing ran it.
+
+### Changed
+
+- **`bench/evals.js` no longer replays cached responses by default** (`--cache`
+  opts in; `--no-cache` still parses). The cache is right while writing a case
+  and wrong while comparing models: a replayed call reports the tokens recorded
+  whenever it was captured and a near-zero duration, so a model with cache
+  entries reads as both cheaper and faster than one being measured for real. It
+  also masked the token-accounting fix above — the same case kept reporting 4
+  input tokens after the bug was gone, and 3,651 once the cache was off. The
+  mode is printed with the run and recorded in the report.
+- **Eval cases can assert more than "the right tool was called".** `files` takes
+  `excludes` and `absent` alongside `includes` (a rewrite that lands the asked-for
+  change but drops the rest of the file now fails), and `expect.maxToolCalls` is
+  an efficiency budget — with several models passing everything, correctness ties
+  break on whether the answer was reached or brute-forced.
+- `AGENTS.md` is the single source for agent conventions; `CLAUDE.md` and
+  `GEMINI.md` point at it. Three near-identical copies had already drifted — one
+  said trim history to 50 rows, another 20, and `GEMINI.md` never carried the
+  commit-attribution rule at all.
+- Removed the legacy `.persist/` state directory (superseded by `PERSIST.md`; it
+  still described the project as "Ollama Code Console" at a path that no longer
+  exists), the orphaned `cli.js`, and the unused `workspace/` fixtures.
+- **The agent loop is now `src/agent-runner.js`, shared by everything.** It lived
+  inside `chat.js`, tangled with readline and the spinner, so `bench/evals.js`
+  carried a second, simpler copy and the browser had none. Every behaviour added
+  to the CLI — the re-read guard, the action nudge, the verification gate, payload
+  trimming — was invisible to the harness measuring it, so the benchmark scored a
+  different agent than the one that ships. `runAgent()` has no terminal in it;
+  callers supply rendering, permissions, and persistence through hooks. The CLI is
+  now a shell around it, and the eval harness runs the real loop. The text
+  tool-call parser moved to `src/tool-call-parser.js` for the same reason.
+
+### Tests
+
+- The live-provider suite was unrunnable, not "environment-dependent". Thirteen
+  tests hardcoded `llama3.2:latest`; they now discover an installed Ollama model
+  (preferring one that advertises tool support) and skip with a reason when none
+  is available.
+- The `normalizeArgs` tests asserted against an inlined **copy** of the alias
+  tables, spawned in a subprocess — a real parser bug could never fail them. They
+  import the shipping function now.
+- New coverage for the extracted runner, retry/backoff/stall behaviour, tab
+  completion, atomic writes, and the compaction archive.
+
+### Fixed (earlier, same release)
+
 - Recoverable tool errors now guide the model instead of repeating. Across real
   sessions 13% of tool calls errored, dominated by three recoverable mistakes —
   file-not-found (59×), missing/empty path (38×), and path-outside-workspace

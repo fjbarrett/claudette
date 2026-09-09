@@ -3,6 +3,26 @@
   "version": "1.0.0",
   "description": "An AI coding assistant with terminal CLI and browser UI, supporting Ollama and 13+ cloud providers (Anthropic, OpenAI, Gemini, and more)",
   "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": "./index.js",
+    "./env": "./src/env-autoload.js",
+    "./agent-runner": "./src/agent-runner.js",
+    "./tools": "./src/tools.js",
+    "./provider": "./src/provider.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "claudette.js",
+    "server.js",
+    "src/",
+    "public/",
+    "README.md",
+    "Changelog.md"
+  ],
   "bin": {
     "claudette": "./claudette.js"
   },
@@ -10,6 +30,8 @@
     "start": "node server.js",
     "cli": "node claudette.js",
     "dev": "node claudette.js",
+    "test": "NODE_ENV=test CLAUDETTE_SKIP_LIVE=1 node --test test/test.js",
+    "test:live": "NODE_ENV=test node --test test/test.js",
     "bench": "node bench/run.js",
     "bench:leaderboard": "node bench/leaderboard.js --write",
     "bench:list": "node bench/run.js --list",

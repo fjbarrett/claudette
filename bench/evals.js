@@ -20,10 +20,17 @@
 //       "tools":  [ {"name": "read_file", "args": {"path": "src/config.js"}},
 //                   {"name": "str_replace"} ],      // ordered subsequence
 //       "forbid": ["write_file"],                   // must never be called
-//       "files":  { "src/config.js": {"includes": "90"} },
+//       "files":  { "src/config.js": {"includes": "90", "excludes": "30"},
+//                   "src/config.js.bak": {"absent": true} },
+//       "maxToolCalls": 6,                          // efficiency budget
 //       "answer": { "matches": "done" }             // regex on final text
 //     }
 //   }
+//
+// `includes`/`excludes` take a string or an array of them. `excludes` is how a
+// case catches collateral damage — the asked-for change landed, but the model
+// rewrote the file and lost the rest. `maxToolCalls` is how correctness ties
+// break: several models get the right answer, fewer get it without flailing.
 //
 // Arg matching: expected string values must be contained in the actual value
 // (substring), everything else compares strictly. Repeating a case N times
@@ -33,6 +40,7 @@
 // node bench/evals.js --list
 // node bench/evals.js --all --model anthropic/claude-opus-4-8 --repeat 3
 // node bench/evals.js --case edit-config --verbose
+// node bench/evals.js --case edit-config --cache    # replay recorded replies
 
 import '../src/env-autoload.js'; // load .env before anything reads process.env
 import fs from 'node:fs/promises';
@@ -41,9 +49,8 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { chatStream, defaultCloudModels } from '../src/provider.js';
-import { TOOL_DEFS, executeTool } from '../src/tools.js';
-import { parseTextToolCalls } from '../src/chat.js';
-import { trimToolOutputs } from '../src/context.js';
+import { TOOL_DEFS } from '../src/tools.js';
+import { runAgent } from '../src/agent-runner.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,64 +105,37 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
     ];
     const maxTurns = caseDef.maxTurns ?? 8;
 
-    for (let turn = 1; turn <= maxTurns; turn++) {
-      record.turns = turn;
-      const result = await chatFn({
-        model,
-        // Mirror the interactive agent loop: collapse old tool outputs in the
-        // payload (not in stored `messages`) so a long tool loop stops re-sending
-        // every file read. `trim:false` measures the un-trimmed baseline.
-        messages: trim ? trimToolOutputs(messages) : messages,
-        tools: TOOL_DEFS,
-        onDelta: () => {},
-      });
-
-      const inTok = result.promptTokens ?? 0;
-      record.promptTokens += inTok;
-      record.completionTokens += result.completionTokens ?? 0;
-      if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
-
-      // Merge text-emitted tool calls the same way the interactive CLI does.
-      let toolCalls = result.toolCalls ?? [];
-      if (result.content) {
-        const textParsed = parseTextToolCalls(result.content);
-        if (textParsed.length) {
-          const apiKeys = new Set(toolCalls.map(c => JSON.stringify(c.function)));
-          const novel = textParsed.filter(c => !apiKeys.has(JSON.stringify(c.function)));
-          toolCalls = [...novel, ...toolCalls];
+    // The same loop the CLI runs — that is the point. This harness used to carry
+    // its own copy, so it silently measured an agent without the re-read guard,
+    // the action nudge, or the verification gate.
+    const run = await runAgent({
+      model,
+      messages,
+      tools: TOOL_DEFS,
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      chatFn: trim
+        ? chatFn
+        // `--no-trim` measures the un-trimmed baseline: undo the runner's
+        // payload trimming by handing the provider the full message list.
+        : (opts => chatFn({ ...opts, messages })),
+      maxIterations: maxTurns,
+      emit: (type, data) => {
+        if (type === 'iteration_start') record.turns = data.iteration;
+        else if (type === 'usage') {
+          const inTok = data.last?.promptTokens ?? 0;
+          if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
+        } else if (type === 'tool_result') {
+          record.toolCalls.push({ name: data.name, args: data.args, isError: data.isError, output: truncate(data.result, 2000) });
         }
-      }
+      },
+    });
 
-      if (!toolCalls.length) {
-        record.finalText = result.content ?? '';
-        break;
-      }
-
-      messages.push({ role: 'assistant', content: result.content ?? '', tool_calls: toolCalls });
-
-      for (const call of toolCalls) {
-        const name = call.function?.name;
-        let args;
-        try {
-          args = typeof call.function?.arguments === 'string'
-            ? JSON.parse(call.function.arguments)
-            : (call.function?.arguments ?? {});
-        } catch {
-          args = { raw: call.function?.arguments };
-        }
-
-        let output;
-        let isError = false;
-        try {
-          output = String(await executeTool(name, args, { cwd: sandbox, workspace: sandbox }));
-        } catch (err) {
-          output = `Error: ${err.message}`;
-          isError = true;
-        }
-
-        record.toolCalls.push({ name, args, isError, output: truncate(output, 2000) });
-        messages.push({ role: 'tool', content: output, ...(call.id ? { tool_call_id: call.id } : {}) });
-      }
+    record.finalText = run.status === 'completed' ? run.content : '';
+    record.promptTokens = run.usage.promptTokens;
+    record.completionTokens = run.usage.completionTokens;
+    if (run.status === 'failed') {
+      throw new Error(`agent run failed after ${run.iterations} iterations: ` +
+        `${run.error?.message ?? 'no error reported'}`);
     }
 
     const { pass, failures } = await evaluateExpectations(record, caseDef.expect ?? {}, sandbox);
@@ -232,12 +212,32 @@ export async function evaluateExpectations(record, expect, sandbox) {
     try {
       content = await fs.readFile(path.join(sandbox, rel), 'utf8');
     } catch {
-      failures.push(`expected file missing: ${rel}`);
+      // `absent: true` is the only expectation a missing file satisfies.
+      if (!check.absent) failures.push(`expected file missing: ${rel}`);
       continue;
     }
-    if (check.includes && !content.includes(check.includes)) {
-      failures.push(`file ${rel} does not include ${JSON.stringify(check.includes)}`);
+    if (check.absent) {
+      failures.push(`file ${rel} should not exist`);
+      continue;
     }
+    for (const want of [].concat(check.includes ?? [])) {
+      if (!content.includes(want)) {
+        failures.push(`file ${rel} does not include ${JSON.stringify(want)}`);
+      }
+    }
+    // `excludes` is what catches collateral damage: the edit landed, but the
+    // model rewrote the file and dropped everything it was not asked to touch.
+    for (const unwanted of [].concat(check.excludes ?? [])) {
+      if (content.includes(unwanted)) {
+        failures.push(`file ${rel} still includes ${JSON.stringify(unwanted)}`);
+      }
+    }
+  }
+
+  // A budget, not a cap: the loop is not interrupted, the case just fails when a
+  // model brute-forces its way to a correct answer. Ties on correctness break here.
+  if (expect.maxToolCalls != null && record.toolCalls.length > expect.maxToolCalls) {
+    failures.push(`used ${record.toolCalls.length} tool calls, budget is ${expect.maxToolCalls}`);
   }
 
   if (expect.answer?.matches) {
@@ -265,7 +265,7 @@ export async function loadCases() {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  process.env.CLAUDETTE_BENCH_CACHE = args.noCache ? '0' : '1';
+  process.env.CLAUDETTE_BENCH_CACHE = args.cache ? '1' : '0';
   const cases = await loadCases();
 
 
@@ -291,7 +291,9 @@ async function main() {
     );
   }
 
-  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}`);
+  const startedAt = Date.now();
+  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}` +
+    `  |  response cache: ${args.cache ? 'ON (--cache; timings are not measurements)' : 'OFF (default)'}`);
   const results = [];
   for (const caseDef of selected) {
     const repeat = args.repeat ?? caseDef.repeat ?? 1;
@@ -326,6 +328,33 @@ async function main() {
     });
   }
 
+  const summary = {
+    model,
+    generatedAt: new Date().toISOString(),
+    trim: args.trim,
+    // Recorded so a report is interpretable later: with the cache on, the
+    // durations and token counts may belong to a run from another day.
+    cache: args.cache,
+    totals: {
+      cases: results.length,
+      passed: results.filter(r => r.passAtK).length,
+      passedAll: results.filter(r => r.passAllK).length,
+      durationMs: Date.now() - startedAt,
+      promptTokens: results.reduce((a, r) => a + r.avgPromptTokens * r.repeat, 0),
+      completionTokens: results.reduce((a, r) => a + r.avgCompletionTokens * r.repeat, 0),
+      peakInputTokens: Math.max(0, ...results.map(r => r.avgPeakInputTokens)),
+    },
+    results,
+  };
+
+  if (args.json) {
+    // One JSON document on stdout and nothing else, so a caller can pipe it.
+    console.log(JSON.stringify(summary));
+    await writeReport(summary, model);
+    if (results.some(r => r.passes === 0)) process.exitCode = 1;
+    return;
+  }
+
   console.log('\n═══ Eval summary ═══');
   for (const r of results) {
     const rate = `${r.passes}/${r.repeat}`;
@@ -336,10 +365,7 @@ async function main() {
     );
   }
 
-  await fs.mkdir(REPORTS_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(REPORTS_DIR, `${stamp}-${model.replace(/[^a-zA-Z0-9._-]+/g, '-')}.json`);
-  await fs.writeFile(file, JSON.stringify({ model, generatedAt: new Date().toISOString(), results }, null, 2));
+  const file = await writeReport(summary, model);
   console.log(`\nreport: ${path.relative(process.cwd(), file)}`);
 
   if (results.some(r => r.passes === 0)) {
@@ -347,8 +373,16 @@ async function main() {
   }
 }
 
-function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false, trim: true };
+async function writeReport(summary, model) {
+  await fs.mkdir(REPORTS_DIR, { recursive: true });
+  const stamp = summary.generatedAt.replace(/[:.]/g, '-');
+  const file = path.join(REPORTS_DIR, `${stamp}-${model.replace(/[^a-zA-Z0-9._-]+/g, '-')}.json`);
+  await fs.writeFile(file, JSON.stringify(summary, null, 2));
+  return file;
+}
+
+export function parseArgs(argv) {
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, cache: false, trim: true, json: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -358,7 +392,16 @@ function parseArgs(argv) {
     else if (arg === '--repeat') args.repeat = Number(argv[++i]);
     else if (arg === '--keep') args.keep = true;
     else if (arg === '--verbose') args.verbose = true;
-    else if (arg === '--no-cache') args.noCache = true;
+    // The response cache replays a recorded reply for an identical (model,
+    // messages) key. That is what you want while writing a case, and the wrong
+    // thing by default: a replayed run reports the tokens recorded whenever it
+    // was captured and a near-zero duration, so a cached model looks both cheap
+    // and instant next to one being measured for real. It cost an afternoon —
+    // an Anthropic run kept reporting 2 input tokens per request after the bug
+    // that caused it had already been fixed.
+    else if (arg === '--cache') args.cache = true;
+    else if (arg === '--no-cache') args.cache = false;   // now the default; kept so old commands still run
+    else if (arg === '--json') args.json = true;
     else if (arg === '--trim') args.trim = true;       // context trimming on (default)
     else if (arg === '--no-trim') args.trim = false;   // baseline: re-send everything
     else throw new Error(`Unknown flag: ${arg}`);

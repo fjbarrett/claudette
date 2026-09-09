@@ -48,7 +48,7 @@ const server = http.createServer(async (req, res) => {
       writeNdjson(res, { type: "error", error: message });
       res.end();
     } else {
-      sendJson(res, 500, { error: message });
+      sendJson(res, error?.status ?? 500, { error: message });
     }
   }
 });
@@ -175,7 +175,26 @@ async function serveStatic(req, res, url) {
   }
 }
 
+// One turn per session at a time. Two overlapping POSTs to the same session both
+// loaded it, both appended, and the slower save clobbered the faster one — the
+// first turn's messages simply vanished.
+const activeTurns = new Set();
+
 async function streamAssistantReply({ req, res, sessionId, body }) {
+  // Claim the slot synchronously. Checking here and adding after `loadSession`
+  // left a window where two requests both passed the check.
+  if (activeTurns.has(sessionId)) {
+    sendJson(res, 409, { error: "This session already has a turn in flight. Wait for it to finish." });
+    return;
+  }
+  activeTurns.add(sessionId);
+  try {
+    await runTurn();
+  } finally {
+    activeTurns.delete(sessionId);
+  }
+
+  async function runTurn() {
   const session = await loadSession(sessionId);
   if (!Array.isArray(session.turns)) {
     session.turns = [];
@@ -238,18 +257,35 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
   trace.event("model_request_started", { model });
   trace.event("assistant_stream_started", {});
 
+  // A closed tab used to leave the provider call running to completion, billed
+  // and discarded. Abort it with the response.
+  const clientGone = new AbortController();
+  const onClose = () => clientGone.abort();
+  res.on("close", onClose);
+
   let assistantText = "";
   let result;
   try {
     result = await chatStream({
       model,
       messages: conversation,
+      signal: clientGone.signal,
       onDelta: (delta) => {
         assistantText += delta;
         writeNdjson(res, { type: "delta", content: delta });
       }
     });
   } catch (error) {
+    res.off("close", onClose);
+    if (clientGone.signal.aborted) {
+      // The client hung up; record the turn honestly and stop.
+      trace.cancel();
+      trace.event("assistant_aborted", {});
+      session.updatedAt = new Date().toISOString();
+      await saveSession(session);
+      res.end();
+      return;
+    }
     // Provider unreachable or stream failed mid-flight. Headers are already
     // sent, so finish the ndjson stream with an error record — otherwise the
     // client hangs waiting for "done" that never comes.
@@ -262,6 +298,7 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
     res.end();
     return;
   }
+  res.off("close", onClose);
   // result.content is the cleaned/full text; prefer it for the saved record.
   assistantText = result.content || assistantText;
 
@@ -280,6 +317,7 @@ async function streamAssistantReply({ req, res, sessionId, body }) {
     traceTurn
   });
   res.end();
+  }
 }
 
 async function ollamaRequest(endpoint, init) {
@@ -439,13 +477,37 @@ function sendJson(res, statusCode, payload) {
   res.end(`${JSON.stringify(payload)}\n`);
 }
 
+// Cap on a request body. Without one, `for await (const chunk of req)` buffers
+// whatever a client sends — an unauthenticated loopback server that will happily
+// accept a gigabyte into memory. 1 MB is far above any real prompt.
+const MAX_BODY_BYTES = Number(process.env.CLAUDETTE_MAX_BODY_BYTES) || 1024 * 1024;
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function readJson(req) {
   const chunks = [];
+  let size = 0;
+  let tooBig = false;
   for await (const chunk of req) {
+    size += chunk.length;
+    // Stop buffering, but keep draining: destroying the socket here resets the
+    // connection, and the client never gets to read the 413 we are about to send.
+    if (size > MAX_BODY_BYTES) { tooBig = true; continue; }
     chunks.push(chunk);
   }
+  if (tooBig) throw new HttpError(413, `Request body exceeds ${MAX_BODY_BYTES} bytes.`);
   const body = Buffer.concat(chunks).toString("utf8");
-  return body ? JSON.parse(body) : {};
+  if (!body) return {};
+  try {
+    return JSON.parse(body);
+  } catch {
+    throw new HttpError(400, "Request body is not valid JSON.");
+  }
 }
 
 async function ensureDir(dirPath) {
