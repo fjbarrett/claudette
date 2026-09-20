@@ -1,0 +1,33 @@
+{
+  "id": "farm-js-python-pipeline",
+  "title": "Repairs a variable-driven JavaScript to Python data pipeline",
+  "prompt": "Run sh pipeline.sh; it is expected to fail. Use its output to repair both seeded bugs, editing only lib/score.mjs and summarize.py: the JavaScript score must scale raw values by SCORE_SCALE, and Python render() must order rows by name ascending. Then run sh pipeline.sh again and confirm it passes with REPORT_PREFIX='night shift' and SCORE_SCALE=3. Do not modify generate.mjs, verify.py, or pipeline.sh. Reply with exactly PIPELINE_REPAIRED.",
+  "maxTurns": 14,
+  "repeat": 1,
+  "files": {
+    "lib/score.mjs": "export function score(raw, scale) {\n  return raw + scale;\n}\n",
+    "generate.mjs": "import { mkdir, writeFile } from 'node:fs/promises';\nimport { score } from './lib/score.mjs';\n\nconst scale = Number.parseInt(process.env.SCORE_SCALE ?? '1', 10);\nconst prefix = process.env.REPORT_PREFIX ?? 'local';\nconst rows = [\n  { name: 'beta', score: score(2, scale) },\n  { name: 'alpha', score: score(4, scale) },\n];\nawait mkdir('out', { recursive: true });\nawait writeFile('out/report.json', JSON.stringify({ prefix, rows }, null, 2) + '\\n');\n",
+    "summarize.py": "import json\n\n\ndef render(payload):\n    rows = sorted(payload[\"rows\"], key=lambda row: row[\"name\"], reverse=True)\n    return \"\\n\".join(\n        f'{payload[\"prefix\"]}:{row[\"name\"]}={row[\"score\"]}' for row in rows\n    )\n\n\nif __name__ == \"__main__\":\n    with open(\"out/report.json\", encoding=\"utf-8\") as handle:\n        print(render(json.load(handle)))\n",
+    "verify.py": "import json\nfrom pathlib import Path\n\nfrom summarize import render\n\nwith open(\"out/report.json\", encoding=\"utf-8\") as handle:\n    payload = json.load(handle)\nassert payload == {\n    \"prefix\": \"night shift\",\n    \"rows\": [\n        {\"name\": \"beta\", \"score\": 6},\n        {\"name\": \"alpha\", \"score\": 12},\n    ],\n}, payload\nassert render(payload) == \"night shift:alpha=12\\nnight shift:beta=6\"\nPath(\".passed\").write_text(\"ok\\n\", encoding=\"utf-8\")\nprint(\"PIPELINE PASS\")\n",
+    "pipeline.sh": "#!/bin/sh\nset -eu\nrm -f .passed\nREPORT_PREFIX='night shift' SCORE_SCALE=3 node generate.mjs\npython3 verify.py\n"
+  },
+  "expect": {
+    "tools": [
+      { "name": "bash", "args": { "command": "sh pipeline.sh" } },
+      { "name": "bash", "args": { "command": "sh pipeline.sh" } }
+    ],
+    "forbid": ["write_file", "fetch_url"],
+    "maxToolCalls": 14,
+    "unchangedFiles": ["generate.mjs", "verify.py", "pipeline.sh"],
+    "allowedFiles": ["lib/score.mjs", "generate.mjs", "summarize.py", "verify.py", "pipeline.sh", "out/report.json", ".passed", "__pycache__/**"],
+    "files": {
+      "lib/score.mjs": { "includes": "raw * scale", "excludes": "raw + scale" },
+      "summarize.py": { "includes": "sorted", "excludes": "reverse=True" },
+      "generate.mjs": { "includes": ["SCORE_SCALE", "REPORT_PREFIX", "writeFile('out/report.json'"] },
+      "verify.py": { "includes": ["night shift:alpha=12", "PIPELINE PASS"] },
+      "pipeline.sh": { "includes": ["REPORT_PREFIX='night shift' SCORE_SCALE=3", "python3 verify.py"] },
+      ".passed": { "equals": "ok\n" }
+    },
+    "answer": { "matches": "^\\s*PIPELINE_REPAIRED\\s*$" }
+  }
+}

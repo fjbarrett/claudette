@@ -1,3 +1,19 @@
+const API_TOKEN_STORAGE_KEY = "claudette.serverToken";
+const suppliedToken = new URLSearchParams(window.location.search).get("token");
+if (suppliedToken) {
+  sessionStorage.setItem(API_TOKEN_STORAGE_KEY, suppliedToken);
+  const cleanUrl = new URL(window.location.href);
+  cleanUrl.searchParams.delete("token");
+  history.replaceState(null, "", `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`);
+}
+const apiToken = sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
+
+function apiFetch(endpoint, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (apiToken) headers.set("Authorization", `Bearer ${apiToken}`);
+  return fetch(endpoint, { ...init, headers });
+}
+
 const state = {
   sessions: [],
   models: [],
@@ -73,7 +89,10 @@ async function loadModels() {
   const response = await fetchJson("/api/models");
   state.models = response.models;
   if (!state.currentModel) {
-    state.currentModel = state.models[0]?.name ?? null;
+    const configuredDefault = state.models.some(model => model.name === response.defaultModel)
+      ? response.defaultModel
+      : null;
+    state.currentModel = configuredDefault ?? state.models[0]?.name ?? null;
   }
   renderModels();
 }
@@ -128,7 +147,7 @@ async function sendPrompt(content) {
 
   setStatus("streaming");
   const assistantNode = appendMessage("assistant", "");
-  const response = await fetch(`/api/sessions/${state.currentSessionId}/messages`, {
+  const response = await apiFetch(`/api/sessions/${state.currentSessionId}/messages`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -148,6 +167,7 @@ async function sendPrompt(content) {
   const decoder = new TextDecoder();
   let buffer = "";
   let activeTurnId = null;
+  const requestedModel = state.currentModel;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -176,11 +196,21 @@ async function sendPrompt(content) {
       if (chunk.type === "trace" && chunk.turnId) {
         addTraceEvent(chunk.turnId, chunk.event);
       }
+      if (chunk.type === "model_switch") {
+        state.currentModel = chunk.to;
+        renderModels();
+        appendMessage("system", `${chunk.from} failed (${chunk.reason}); trying ${chunk.to}`);
+        setStatus("switching model");
+      }
       if (chunk.type === "delta") {
         assistantNode.textContent += chunk.content;
         transcriptEl.scrollTop = transcriptEl.scrollHeight;
       }
       if (chunk.type === "done") {
+        if (chunk.model) {
+          state.currentModel = chunk.model;
+          renderModels();
+        }
         if (chunk.traceTurn) {
           upsertTraceTurn(chunk.traceTurn);
         } else if (activeTurnId) {
@@ -188,6 +218,12 @@ async function sendPrompt(content) {
         }
         await loadSessions();
         setStatus("idle");
+      }
+      if (chunk.type === "error") {
+        state.currentModel = requestedModel;
+        renderModels();
+        assistantNode.textContent ||= chunk.error || "All model attempts failed.";
+        setStatus("error");
       }
     }
   }
@@ -392,7 +428,7 @@ function normalizeTraceTurn(turn) {
 }
 
 async function fetchJson(endpoint, init) {
-  const response = await fetch(endpoint, init);
+  const response = await apiFetch(endpoint, init);
   if (!response.ok) {
     throw new Error(`HTTP ${response.status}: ${await response.text()}`);
   }
@@ -400,10 +436,12 @@ async function fetchJson(endpoint, init) {
 }
 
 function escapeHtml(value) {
-  return value
+  return String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function formatTraceTime(value) {

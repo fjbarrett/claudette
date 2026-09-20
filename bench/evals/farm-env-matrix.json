@@ -1,0 +1,30 @@
+{
+  "id": "farm-env-matrix",
+  "title": "Builds an environment-driven Node configuration module and CLI",
+  "prompt": "Create only src/config.js and bin/show-config.js. Export readConfig(env = process.env) from src/config.js. It must return { port, mode, label }: port is a base-10 integer from PORT when it is between 1 and 65535, otherwise 3000; mode is MODE only when it is dev, test, or prod, otherwise dev; label is trimmed APP_LABEL when nonempty, otherwise Claudette. The CLI must print exactly label|mode|port plus one newline. Run node verify.mjs. Do not modify package.json or verify.mjs. When verification passes, reply with exactly ENV_MATRIX_OK.",
+  "maxTurns": 12,
+  "repeat": 1,
+  "files": {
+    "package.json": "{\n  \"type\": \"module\"\n}\n",
+    "verify.mjs": "import assert from 'node:assert/strict';\nimport { spawnSync } from 'node:child_process';\nimport { writeFile } from 'node:fs/promises';\nimport { readConfig } from './src/config.js';\n\nassert.deepEqual(readConfig({ PORT: '4317', MODE: 'test', APP_LABEL: '  Night Shift  ' }), {\n  port: 4317, mode: 'test', label: 'Night Shift',\n});\nassert.deepEqual(readConfig({ PORT: '0', MODE: 'stage', APP_LABEL: '   ' }), {\n  port: 3000, mode: 'dev', label: 'Claudette',\n});\nassert.deepEqual(readConfig({ PORT: '70000', MODE: 'prod', APP_LABEL: 'Release' }), {\n  port: 3000, mode: 'prod', label: 'Release',\n});\nconst cli = spawnSync(process.execPath, ['bin/show-config.js'], {\n  encoding: 'utf8',\n  env: { ...process.env, PORT: '4317', MODE: 'test', APP_LABEL: '  Night Shift  ' },\n});\nassert.equal(cli.status, 0, cli.stderr);\nassert.equal(cli.stdout, 'Night Shift|test|4317\\n');\nawait writeFile('.passed', 'ok\\n');\nconsole.log('ENV MATRIX PASS');\n"
+  },
+  "expect": {
+    "tools": [
+      { "name": "write_file", "args": { "path": "src/config.js" } },
+      { "name": "write_file", "args": { "path": "bin/show-config.js" } },
+      { "name": "bash", "args": { "command": "node verify.mjs" } }
+    ],
+    "forbid": ["fetch_url"],
+    "maxToolCalls": 10,
+    "unchangedFiles": ["package.json", "verify.mjs"],
+    "allowedFiles": ["package.json", "verify.mjs", "src/config.js", "bin/show-config.js", ".passed"],
+    "files": {
+      "package.json": { "equals": "{\n  \"type\": \"module\"\n}\n" },
+      "verify.mjs": { "includes": ["Night Shift|test|4317", "writeFile('.passed', 'ok\\n')"] },
+      "src/config.js": { "includes": ["export function readConfig", "PORT", "APP_LABEL"] },
+      "bin/show-config.js": { "includes": ["readConfig"] },
+      ".passed": { "equals": "ok\n" }
+    },
+    "answer": { "matches": "^\\s*ENV_MATRIX_OK\\s*$" }
+  }
+}

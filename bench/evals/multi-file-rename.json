@@ -1,0 +1,20 @@
+{
+  "id": "multi-file-rename",
+  "title": "Renames a symbol across every file that uses it, not just its definition",
+  "prompt": "The function computeTotal is defined in src/total.js and used elsewhere under src/. Rename it to calculateTotal everywhere it appears in src/ — the definition, the exports, the imports, and every call site. Do not change any other behaviour.",
+  "maxTurns": 14,
+  "repeat": 1,
+  "files": {
+    "src/total.js": "export function computeTotal(items) {\n  return items.reduce((sum, item) => sum + item.price * item.qty, 0);\n}\n",
+    "src/cart.js": "import { computeTotal } from './total.js';\n\nexport function cartSummary(cart) {\n  const total = computeTotal(cart.items);\n  return { count: cart.items.length, total };\n}\n",
+    "src/report.js": "import { computeTotal } from './total.js';\n\nexport function monthlyReport(orders) {\n  return orders.map(order => ({\n    id: order.id,\n    total: computeTotal(order.items),\n  }));\n}\n"
+  },
+  "expect": {
+    "files": {
+      "src/total.js": { "includes": "calculateTotal", "excludes": "computeTotal" },
+      "src/cart.js": { "includes": "calculateTotal", "excludes": "computeTotal" },
+      "src/report.js": { "includes": "calculateTotal", "excludes": "computeTotal" }
+    },
+    "maxToolCalls": 14
+  }
+}

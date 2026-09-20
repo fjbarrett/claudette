@@ -20,10 +20,21 @@
 //       "tools":  [ {"name": "read_file", "args": {"path": "src/config.js"}},
 //                   {"name": "str_replace"} ],      // ordered subsequence
 //       "forbid": ["write_file"],                   // must never be called
-//       "files":  { "src/config.js": {"includes": "90"} },
-//       "answer": { "matches": "done" }             // regex on final text
+//       "files":  { "src/config.js": {"includes": "90", "excludes": "30"},
+//                   "src/config.js.bak": {"absent": true} },
+//       "unchangedFiles": ["oracle_test.js"],       // exact seeded bytes
+//       "maxToolCalls": 6,                          // efficiency budget
+//       "answer": { "matches": "done", "notMatches": "unsupported claim" }
+//                                                     // positive/negative final-text regexes
 //     }
 //   }
+//
+// `includes`/`excludes` take a string or an array of them. `excludes` is how a
+// case catches collateral damage — the asked-for change landed, but the model
+// rewrote the file and lost the rest. `maxToolCalls` is how correctness ties
+// break: several models get the right answer, fewer get it without flailing.
+// `allowedFiles` entries are exact paths unless they end in `/**`, which allows
+// a generated directory tree such as `.venv/**` while keeping all siblings out.
 //
 // Arg matching: expected string values must be contained in the actual value
 // (substring), everything else compares strictly. Repeating a case N times
@@ -33,6 +44,7 @@
 // node bench/evals.js --list
 // node bench/evals.js --all --model anthropic/claude-opus-4-8 --repeat 3
 // node bench/evals.js --case edit-config --verbose
+// node bench/evals.js --case edit-config --cache    # replay recorded replies
 
 import '../src/env-autoload.js'; // load .env before anything reads process.env
 import fs from 'node:fs/promises';
@@ -40,10 +52,10 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { chatStream, defaultCloudModels } from '../src/provider.js';
-import { TOOL_DEFS, executeTool } from '../src/tools.js';
-import { parseTextToolCalls } from '../src/chat.js';
-import { trimToolOutputs } from '../src/context.js';
+import { chatStream, defaultCloudModels, getModels } from '../src/provider.js';
+import { TOOL_DEFS } from '../src/tools.js';
+import { runAgent } from '../src/agent-runner.js';
+import { EVIDENCE_GUIDANCE } from '../src/evidence.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -53,7 +65,8 @@ const REPORTS_DIR = path.join(__dirname, 'runs', 'evals');
 const SYSTEM_PROMPT = [
   'You are a coding agent operating inside a sandbox workspace.',
   'Use the provided tools to complete the task. All paths are relative to the workspace root.',
-  'Make minimal, targeted changes. When the task is complete, reply with a short final answer and no further tool calls.',
+  'Make minimal, targeted changes when changes are requested. When the task is complete, reply with a short final answer and no further tool calls.',
+  EVIDENCE_GUIDANCE,
 ].join(' ');
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
@@ -70,6 +83,8 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
     model,
     sandbox,
     trim,
+    status: 'running',
+    assistantResponses: [],
     toolCalls: [],
     finalText: '',
     turns: 0,
@@ -98,70 +113,54 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
     ];
     const maxTurns = caseDef.maxTurns ?? 8;
 
-    for (let turn = 1; turn <= maxTurns; turn++) {
-      record.turns = turn;
-      const result = await chatFn({
-        model,
-        // Mirror the interactive agent loop: collapse old tool outputs in the
-        // payload (not in stored `messages`) so a long tool loop stops re-sending
-        // every file read. `trim:false` measures the un-trimmed baseline.
-        messages: trim ? trimToolOutputs(messages) : messages,
-        tools: TOOL_DEFS,
-        onDelta: () => {},
-      });
-
-      const inTok = result.promptTokens ?? 0;
-      record.promptTokens += inTok;
-      record.completionTokens += result.completionTokens ?? 0;
-      if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
-
-      // Merge text-emitted tool calls the same way the interactive CLI does.
-      let toolCalls = result.toolCalls ?? [];
-      if (result.content) {
-        const textParsed = parseTextToolCalls(result.content);
-        if (textParsed.length) {
-          const apiKeys = new Set(toolCalls.map(c => JSON.stringify(c.function)));
-          const novel = textParsed.filter(c => !apiKeys.has(JSON.stringify(c.function)));
-          toolCalls = [...novel, ...toolCalls];
+    // The same loop the CLI runs — that is the point. This harness used to carry
+    // its own copy, so it silently measured an agent without the re-read guard,
+    // the action nudge, or the verification gate.
+    const run = await runAgent({
+      model,
+      messages,
+      tools: TOOL_DEFS,
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      chatFn: trim
+        ? chatFn
+        // `--no-trim` measures the un-trimmed baseline: undo the runner's
+        // payload trimming by handing the provider the full message list.
+        : (opts => chatFn({ ...opts, messages })),
+      maxIterations: maxTurns,
+      emit: (type, data) => {
+        if (type === 'iteration_start') record.turns = data.iteration;
+        else if (type === 'assistant_text') {
+          record.assistantResponses.push({
+            iteration: data.iteration,
+            content: truncate(data.content ?? '', 500),
+            toolCalls: (data.toolCalls ?? []).map(call => call.function?.name ?? '(missing)'),
+          });
         }
-      }
-
-      if (!toolCalls.length) {
-        record.finalText = result.content ?? '';
-        break;
-      }
-
-      messages.push({ role: 'assistant', content: result.content ?? '', tool_calls: toolCalls });
-
-      for (const call of toolCalls) {
-        const name = call.function?.name;
-        let args;
-        try {
-          args = typeof call.function?.arguments === 'string'
-            ? JSON.parse(call.function.arguments)
-            : (call.function?.arguments ?? {});
-        } catch {
-          args = { raw: call.function?.arguments };
+        else if (type === 'usage') {
+          const inTok = data.last?.promptTokens ?? 0;
+          if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
+        } else if (type === 'tool_result') {
+          record.toolCalls.push({ name: data.name, args: data.args, isError: data.isError, output: truncate(data.result, 2000) });
         }
+      },
+    });
 
-        let output;
-        let isError = false;
-        try {
-          output = String(await executeTool(name, args, { cwd: sandbox, workspace: sandbox }));
-        } catch (err) {
-          output = `Error: ${err.message}`;
-          isError = true;
-        }
-
-        record.toolCalls.push({ name, args, isError, output: truncate(output, 2000) });
-        messages.push({ role: 'tool', content: output, ...(call.id ? { tool_call_id: call.id } : {}) });
-      }
+    record.status = run.status;
+    record.finalText = run.status === 'completed' ? run.content : '';
+    record.promptTokens = run.usage.promptTokens;
+    record.completionTokens = run.usage.completionTokens;
+    if (run.status === 'failed') {
+      throw new Error(`agent run failed after ${run.iterations} iterations: ` +
+        `${run.error?.message ?? 'no error reported'}`);
     }
 
-    const { pass, failures } = await evaluateExpectations(record, caseDef.expect ?? {}, sandbox);
+    const { pass, failures } = await evaluateExpectations(
+      record, caseDef.expect ?? {}, sandbox, caseDef.files ?? {},
+    );
     record.pass = pass;
     record.failures = failures;
   } catch (err) {
+    if (record.status === 'running') record.status = 'failed';
     record.error = err.message;
     record.failures = [`run error: ${err.message}`];
   } finally {
@@ -212,7 +211,7 @@ export function matchToolCalls(actualCalls, expectedCalls) {
   return { ok: true, missing: null };
 }
 
-export async function evaluateExpectations(record, expect, sandbox) {
+export async function evaluateExpectations(record, expect, sandbox, fixtureFiles = {}) {
   const failures = [];
 
   const { ok, missing } = matchToolCalls(record.toolCalls, expect.tools);
@@ -227,17 +226,74 @@ export async function evaluateExpectations(record, expect, sandbox) {
     }
   }
 
+  if (expect.noToolErrors && record.toolCalls.some(call => call.isError)) {
+    const failed = record.toolCalls.filter(call => call.isError).map(call => call.name);
+    failures.push(`tool errors are forbidden; failed calls: ${failed.join(', ')}`);
+  }
+
   for (const [rel, check] of Object.entries(expect.files ?? {})) {
     let content = null;
     try {
       content = await fs.readFile(path.join(sandbox, rel), 'utf8');
     } catch {
-      failures.push(`expected file missing: ${rel}`);
+      // `absent: true` is the only expectation a missing file satisfies.
+      if (!check.absent) failures.push(`expected file missing: ${rel}`);
       continue;
     }
-    if (check.includes && !content.includes(check.includes)) {
-      failures.push(`file ${rel} does not include ${JSON.stringify(check.includes)}`);
+    if (check.absent) {
+      failures.push(`file ${rel} should not exist`);
+      continue;
     }
+    if (check.equals != null && content !== check.equals) {
+      failures.push(`file ${rel} does not exactly equal ${JSON.stringify(check.equals)}`);
+    }
+    for (const want of [].concat(check.includes ?? [])) {
+      if (!content.includes(want)) {
+        failures.push(`file ${rel} does not include ${JSON.stringify(want)}`);
+      }
+    }
+    // `excludes` is what catches collateral damage: the edit landed, but the
+    // model rewrote the file and dropped everything it was not asked to touch.
+    for (const unwanted of [].concat(check.excludes ?? [])) {
+      if (content.includes(unwanted)) {
+        failures.push(`file ${rel} still includes ${JSON.stringify(unwanted)}`);
+      }
+    }
+  }
+
+  for (const rel of expect.unchangedFiles ?? []) {
+    const original = fixtureFiles[rel];
+    if (typeof original !== 'string') {
+      failures.push(`unchanged file is not a seeded fixture: ${rel}`);
+      continue;
+    }
+    try {
+      const content = await fs.readFile(path.join(sandbox, rel), 'utf8');
+      if (content !== original) failures.push(`seeded file changed: ${rel}`);
+    } catch {
+      failures.push(`seeded file missing: ${rel}`);
+    }
+  }
+
+
+  if (expect.allowedFiles) {
+    const allowed = expect.allowedFiles.map(value => String(value).split(path.sep).join('/'));
+    const exact = new Set(allowed.filter(value => !value.endsWith('/**')));
+    const prefixes = allowed
+      .filter(value => value.endsWith('/**') && value.length > 3)
+      .map(value => value.slice(0, -2));
+    const actual = await listSandboxFiles(sandbox);
+    for (const rel of actual) {
+      if (!exact.has(rel) && !prefixes.some(prefix => rel.startsWith(prefix))) {
+        failures.push(`unexpected file created: ${rel}`);
+      }
+    }
+  }
+
+  // A budget, not a cap: the loop is not interrupted, the case just fails when a
+  // model brute-forces its way to a correct answer. Ties on correctness break here.
+  if (expect.maxToolCalls != null && record.toolCalls.length > expect.maxToolCalls) {
+    failures.push(`used ${record.toolCalls.length} tool calls, budget is ${expect.maxToolCalls}`);
   }
 
   if (expect.answer?.matches) {
@@ -248,24 +304,47 @@ export async function evaluateExpectations(record, expect, sandbox) {
     }
   }
 
+  if (expect.answer?.notMatches) {
+    const re = new RegExp(expect.answer.notMatches, 'i');
+    if (re.test(record.finalText)) failures.push('final answer contains a forbidden claim');
+  }
+
   return { pass: failures.length === 0, failures };
+}
+
+async function listSandboxFiles(root, current = root) {
+  const files = [];
+  const entries = await fs.readdir(current, { withFileTypes: true });
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const absolute = path.join(current, entry.name);
+    const relative = path.relative(root, absolute).split(path.sep).join('/');
+    if (entry.isDirectory()) files.push(...await listSandboxFiles(root, absolute));
+    else files.push(relative);
+  }
+  return files;
 }
 
 // ─── Case loading / CLI ───────────────────────────────────────────────────────
 
-export async function loadCases() {
-  const entries = await fs.readdir(CASES_DIR);
+export async function loadCases(casesDir = CASES_DIR) {
+  const entries = await fs.readdir(casesDir, { withFileTypes: true });
   const cases = [];
-  for (const entry of entries.sort()) {
-    if (!entry.endsWith('.json')) continue;
-    cases.push(JSON.parse(await fs.readFile(path.join(CASES_DIR, entry), 'utf8')));
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    // Finder/Archive Utility sidecars such as `._case.json` carry binary
+    // metadata, not benchmark definitions. Ignore all hidden and non-file
+    // entries before extension matching so cross-platform copies stay valid.
+    if (!entry.isFile() || entry.name.startsWith('.') || !entry.name.endsWith('.json')) continue;
+    cases.push(JSON.parse(await fs.readFile(path.join(casesDir, entry.name), 'utf8')));
   }
   return cases;
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  process.env.CLAUDETTE_BENCH_CACHE = args.noCache ? '0' : '1';
+  process.env.CLAUDETTE_BENCH_CACHE = args.cache ? '1' : '0';
+  // A model comparison must not silently finish on another route. Rotation is
+  // useful in production, but invalidates model identity, timings, and scores.
+  process.env.CLAUDETTE_MODEL_ROTATION = args.rotation ? '1' : '0';
   const cases = await loadCases();
 
 
@@ -283,7 +362,8 @@ async function main() {
       : 'Use --case <id>, --all, or --list');
   }
 
-  const model = args.model ?? defaultCloudModels()?.agent;
+  const available = args.model ? [] : await getModels().catch(() => []);
+  const model = args.model ?? available[0]?.name ?? defaultCloudModels()?.agent;
   if (!model) {
     throw new Error(
       'No --model given and no cloud API key in env: set one in .env ' +
@@ -291,18 +371,25 @@ async function main() {
     );
   }
 
-  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}`);
+  const startedAt = Date.now();
+  if (!args.json) {
+    console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}` +
+      `  |  response cache: ${args.cache ? 'ON (--cache; timings are not measurements)' : 'OFF (default)'}` +
+      `  |  model rotation: ${args.rotation ? 'ON (--rotation)' : 'OFF (comparison default)'}`);
+  }
   const results = [];
   for (const caseDef of selected) {
     const repeat = args.repeat ?? caseDef.repeat ?? 1;
     const iterations = [];
     for (let i = 1; i <= repeat; i++) {
-      process.stdout.write(`─ ${caseDef.id} (${i}/${repeat}) ... `);
+      if (!args.json) process.stdout.write(`─ ${caseDef.id} (${i}/${repeat}) ... `);
       const record = await runEvalIteration(caseDef, { model, keepSandbox: args.keep, trim: args.trim });
       iterations.push(record);
       const tok = `in=${record.promptTokens} peak=${record.peakInputTokens} out=${record.completionTokens}`;
-      console.log(`${record.pass ? 'pass' : `FAIL  [${record.failures.join(' | ')}]`}  (${record.toolCalls.length} tools, ${tok})`);
-      if (args.verbose) {
+      if (!args.json) {
+        console.log(`${record.pass ? 'pass' : `FAIL  [${record.failures.join(' | ')}]`}  (${record.toolCalls.length} tools, ${tok})`);
+      }
+      if (args.verbose && !args.json) {
         for (const call of record.toolCalls) {
           console.log(`    ${call.isError ? '✗' : '·'} ${call.name}(${truncate(JSON.stringify(call.args), 120)})`);
         }
@@ -326,6 +413,34 @@ async function main() {
     });
   }
 
+  const summary = {
+    model,
+    generatedAt: new Date().toISOString(),
+    trim: args.trim,
+    // Recorded so a report is interpretable later: with the cache on, the
+    // durations and token counts may belong to a run from another day.
+    cache: args.cache,
+    rotation: args.rotation,
+    totals: {
+      cases: results.length,
+      passed: results.filter(r => r.passAtK).length,
+      passedAll: results.filter(r => r.passAllK).length,
+      durationMs: Date.now() - startedAt,
+      promptTokens: results.reduce((a, r) => a + r.avgPromptTokens * r.repeat, 0),
+      completionTokens: results.reduce((a, r) => a + r.avgCompletionTokens * r.repeat, 0),
+      peakInputTokens: Math.max(0, ...results.map(r => r.avgPeakInputTokens)),
+    },
+    results,
+  };
+
+  if (args.json) {
+    // One JSON document on stdout and nothing else, so a caller can pipe it.
+    console.log(JSON.stringify(summary));
+    await writeReport(summary, model);
+    if (results.some(r => r.passes === 0)) process.exitCode = 1;
+    return;
+  }
+
   console.log('\n═══ Eval summary ═══');
   for (const r of results) {
     const rate = `${r.passes}/${r.repeat}`;
@@ -336,10 +451,7 @@ async function main() {
     );
   }
 
-  await fs.mkdir(REPORTS_DIR, { recursive: true });
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const file = path.join(REPORTS_DIR, `${stamp}-${model.replace(/[^a-zA-Z0-9._-]+/g, '-')}.json`);
-  await fs.writeFile(file, JSON.stringify({ model, generatedAt: new Date().toISOString(), results }, null, 2));
+  const file = await writeReport(summary, model);
   console.log(`\nreport: ${path.relative(process.cwd(), file)}`);
 
   if (results.some(r => r.passes === 0)) {
@@ -347,8 +459,16 @@ async function main() {
   }
 }
 
-function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, noCache: false, trim: true };
+async function writeReport(summary, model) {
+  await fs.mkdir(REPORTS_DIR, { recursive: true });
+  const stamp = summary.generatedAt.replace(/[:.]/g, '-');
+  const file = path.join(REPORTS_DIR, `${stamp}-${model.replace(/[^a-zA-Z0-9._-]+/g, '-')}.json`);
+  await fs.writeFile(file, JSON.stringify(summary, null, 2));
+  return file;
+}
+
+export function parseArgs(argv) {
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, cache: false, trim: true, json: false, rotation: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -358,7 +478,18 @@ function parseArgs(argv) {
     else if (arg === '--repeat') args.repeat = Number(argv[++i]);
     else if (arg === '--keep') args.keep = true;
     else if (arg === '--verbose') args.verbose = true;
-    else if (arg === '--no-cache') args.noCache = true;
+    // The response cache replays a recorded reply for an identical (model,
+    // messages) key. That is what you want while writing a case, and the wrong
+    // thing by default: a replayed run reports the tokens recorded whenever it
+    // was captured and a near-zero duration, so a cached model looks both cheap
+    // and instant next to one being measured for real. It cost an afternoon —
+    // an Anthropic run kept reporting 2 input tokens per request after the bug
+    // that caused it had already been fixed.
+    else if (arg === '--cache') args.cache = true;
+    else if (arg === '--no-cache') args.cache = false;   // now the default; kept so old commands still run
+    else if (arg === '--json') args.json = true;
+    else if (arg === '--rotation') args.rotation = true;
+    else if (arg === '--no-rotation') args.rotation = false;
     else if (arg === '--trim') args.trim = true;       // context trimming on (default)
     else if (arg === '--no-trim') args.trim = false;   // baseline: re-send everything
     else throw new Error(`Unknown flag: ${arg}`);

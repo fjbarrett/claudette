@@ -1,0 +1,21 @@
+{
+  "id": "cloud-tool-discipline",
+  "title": "Exact two-call file creation and read-back for cloud model comparison",
+  "prompt": "Use write_file exactly once to create t01-result.txt with the exact content CLOUD_TOOL_OK followed by one newline. Then use read_file exactly once to read the whole file back. Do not use Bash, do not create any other file, and do not call any other tool. After the read confirms the exact content, reply with CLOUD_TOOL_OK.",
+  "maxTurns": 4,
+  "repeat": 1,
+  "expect": {
+    "tools": [
+      { "name": "write_file", "args": { "path": "t01-result.txt", "content": "CLOUD_TOOL_OK" } },
+      { "name": "read_file", "args": { "path": "t01-result.txt" } }
+    ],
+    "forbid": ["bash", "patch_file", "str_replace", "glob", "list_dir", "search_code", "fetch_url"],
+    "noToolErrors": true,
+    "maxToolCalls": 2,
+    "allowedFiles": ["t01-result.txt"],
+    "files": {
+      "t01-result.txt": { "equals": "CLOUD_TOOL_OK\n" }
+    },
+    "answer": { "matches": "^\\s*CLOUD_TOOL_OK\\s*$" }
+  }
+}

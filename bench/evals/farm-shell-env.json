@@ -1,0 +1,26 @@
+{
+  "id": "farm-shell-env",
+  "title": "Builds a POSIX shell CLI with safe environment and argument quoting",
+  "prompt": "Create only bin/render-env.sh as a portable POSIX sh script. It must require exactly two positional arguments and exit 2 with a usage message otherwise. For valid input, print exactly [target] first :: second plus one newline, where target is DEPLOY_TARGET or local when unset. Preserve spaces and Unicode in every value. Run sh verify.sh; do not modify verify.sh. When it passes, reply with exactly SHELL_ENV_OK.",
+  "maxTurns": 8,
+  "repeat": 1,
+  "files": {
+    "verify.sh": "#!/bin/sh\nset -eu\nrm -f .passed\nactual=$(DEPLOY_TARGET='blue team' sh bin/render-env.sh 'alpha beta' 'Crème brûlée')\n[ \"$actual\" = '[blue team] alpha beta :: Crème brûlée' ] || { echo \"bad env output: $actual\" >&2; exit 1; }\nactual=$(unset DEPLOY_TARGET; sh bin/render-env.sh gamma delta)\n[ \"$actual\" = '[local] gamma :: delta' ] || { echo \"bad default output: $actual\" >&2; exit 1; }\nif sh bin/render-env.sh only-one >/dev/null 2>&1; then\n  echo 'missing-argument call unexpectedly passed' >&2\n  exit 1\nelse\n  code=$?\nfi\n[ \"$code\" -eq 2 ] || { echo \"wrong usage exit: $code\" >&2; exit 1; }\nprintf 'ok\\n' > .passed\necho 'SHELL ENV PASS'\n"
+  },
+  "expect": {
+    "tools": [
+      { "name": "write_file", "args": { "path": "bin/render-env.sh" } },
+      { "name": "bash", "args": { "command": "sh verify.sh" } }
+    ],
+    "forbid": ["fetch_url"],
+    "maxToolCalls": 8,
+    "unchangedFiles": ["verify.sh"],
+    "allowedFiles": ["verify.sh", "bin/render-env.sh", ".passed"],
+    "files": {
+      "verify.sh": { "includes": ["DEPLOY_TARGET='blue team'", "Crème brûlée", "wrong usage exit"] },
+      "bin/render-env.sh": { "includes": ["#!/bin/sh", "DEPLOY_TARGET", "printf"] },
+      ".passed": { "equals": "ok\n" }
+    },
+    "answer": { "matches": "^\\s*SHELL_ENV_OK\\s*$" }
+  }
+}

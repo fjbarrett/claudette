@@ -1,108 +1,87 @@
 # CONTINUE
 
-Use this file to resume an interrupted active task. Read `AGENTS.md`,
-`CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
-handoff for work in progress.
+## Commit checkpoint (2026-09-20, Muse Code session)
 
-## Active branch — `feature/context-management` (committed `2b9cb6b`, pushed)
+- Landed the dirty tree as 3 local commits on feature/review-hardening
+  (NOT pushed): 26d65f1 tooling/gates, e0ed6ec functional core, docs
+  commit. Each code commit was verified in an isolated worktree before
+  landing (C1: 334 pass/0 fail/2 skips; C2: 540 pass/0 fail/2 skips;
+  lint + typecheck clean, 20 bench tasks validate).
+- Full dirty-tree verification at session start: npm run lint 58 files
+  clean; npm test 542 total / 540 pass / 0 fail / 2 live skips.
+- Continuous stress loop is DEAD: no process matching stress-streams or
+  the recorded PID 80600; artifact root no longer lists. Decide whether
+  to restart it or close the continuous-testing goal.
+- SE3 app-identity question still unanswered; no app build/install done.
+- Next TODO in order: project-scale eval matrix (Kimi/DeepSeek first),
+  then MCP client, subagents Phase 2+, persisted permissions,
+  Terminal-Bench 10-20 task slice, benchmark rebaseline, verify-grep to
+  real tests, Windows port.
+- 2026-09-20: verify-grep TODO started (38dfb09, NOT pushed).
+  count-lines-tool + extract-print-help assert behavior; echo-cheats
+  fail the new checks and passed the old greps. Remaining grep tasks
+  (edit-two-timeouts, session-error-handling, add-status-endpoint,
+  health-check-script, project scaffolds) still to convert. Eval-matrix
+  TODO blocked: no local Ollama daemon; needs cloud auth + farm.
 
-**2026-07-05 repo repair:** `.git/objects` was lost in a ~Jun 29 copy of the repo.
-Restored from origin (origin/main = the branch point, 5e8072c). The branch's 5
-original commits were unrecoverable as history but their content survived in the
-working tree and is now recommitted as `2b9cb6b` and pushed to origin. Ref/reflog
-backups from before the repair: session scratchpad `git-backup/`. Bench harness
-re-validated end-to-end post-repair (eval bash-echo pass; bench targeted-edit
-overall 9.2 on openrouter/openai/gpt-5-nano).
+## Active objectives (2026-09-05)
 
-Log-driven hardening of context + input handling, all now in `2b9cb6b`.
-Full suite at last check: **200 pass / 14 fail**; all 14 are
-pre-existing env-dependent (live-provider Stress suite + `/api/models` + message
-stream). `git diff --check` clean.
+- Continue Claudette testing indefinitely across varied inputs/environments until the user stops or redirects; persistent goal remains active. Do not mark complete just for a testing checkpoint.
+- Latest user steering: updated build missing on SE3. App clarification is still unanswered. Connected iPhone SE3 device9BAAC8CE-F98B-5909-B57C-7AD036BE0CBD; Claudette is a Node CLI with no iOS project. Developer apps observed: Caption Crunch(build14), Command, Insight(build1), Keep(build1), Namespace(build1), tru|med. No app build/install performed. Await app identity, then build/install within existing authorization; don't install an arbitrary app.
+- Branch feature/review-hardening. Preserve all pre-existing dirty files and the user's running Scanner CLI/session/source. No commits made/requested.
 
-Grounded in `data/usage/usage.jsonl` (28 turns: 30:1 input:output, 4 turns >500k
-input, max 1.73M, 6 turns ≥50 tools, 3 failed):
+## Completed latest checkpoint: shell lifecycle
 
-- **Tool-output trimming** — `trimToolOutputs` (src/context.js) collapses old
-  large tool results in the model payload (keep most recent 6); stored history
-  untouched. Wired into `agentLoop`.
-- **Auto-compaction** — `maybeAutoCompact` summarises history past ~60k tokens
-  (`CLAUDETTE_COMPACT_TOKENS`; `CLAUDETTE_AUTO_COMPACT=0` to disable) before a turn.
-- **Iteration cap 50 → 150** (`resolveMaxIterations`) — logs showed 6 turns hitting
-  the old cap; safe now that trimming bounds per-iteration growth.
-- **Idle-prompt paste coalescing** — `createBurstReader` + `readCoalescedPrompt`
-  join readline's per-newline `line` burst so a pasted block is ONE prompt (the
-  in-turn path was already fixed; this closes the idle gap).
-- **Input sanitization** — `sanitizeUserInput` strips ANSI + cuts a single typed
-  line at leaked ⏺/⎿ render glyphs (multi-line pastes kept whole).
-- **Usage-log signals** — `iterations`, `hitToolCap`, `compacted` added to
-  `buildUsageRecord` (+ `turn.compacted` in trace.js) to measure the above.
-- **Clear model-error message** — `explainStreamError`: a turn failing on a bad
-  model id (logs: `gpt-54-mini`, tools=0/in=0) now points at the slug / `/models`.
-- **Re-read guard + anti-over-exploration prompt** — the "results not good" root
-  cause: a real turn made 128 tool calls, first edit at #109, **69% of reads were
-  redundant re-reads** (one file 23×). `read_file` now short-circuits an identical
-  unchanged re-read (per-turn `readCache` in agentLoop → executeTool; changed file
-  / new range still reads); system prompt tells the agent to explore only as needed
-  and act once it understands. (System prompt also renamed "Ollama Code"→"Claudette".)
-- **Action-forcing nudge** (`createActNudger`/`resolveActNudge`, default 15,
-  `CLAUDETTE_ACT_NUDGE`) — re-read guard alone didn't stop flailing (live: still
-  read same files ×dozens, 0 edits). After N read-only tool calls with no edit, a
-  steering line is appended to the last tool result. **Verified live on gpt-5-nano:
-  nudge fired at 3 reads → model immediately made the edit, typo fixed.**
-- **Piped-input EOF fixes (found via live testing):** `readCoalescedPrompt` flushes
-  a buffered line on stream close (was dropped when EOF raced the 40ms window);
-  main loop breaks on `rlClosed`; `rl.resume()` in agentLoop's finally is guarded
-  (was throwing "readline was closed" and crashing a turn when stdin closed
-  mid-turn). +regression test (`echo "/help" | claudette`).
+- Added src/bash-process.js, updated src/tools.js, added14 regressions in test/shell.test.js. Foreground execution now uses spawn because Node execFile does not forward detached. POSIX commands own a process group; abort, deadline and output overflow kill that group with SIGKILL. Stop reason persists independently of eventual exit status. Explicit successful background commands retain their lifecycle. Windows only terminates the direct child; native Windows/Linux still unverified.
+- Reproduced7 failures before fixes: orphaned children on abort/timeout, a SIGTERM-ignoring foreground command falsely succeeding after deadline, uncapped failed output250027chars, lost capture-limit reason, malformed truncated emoji, and fractional timeout0 disabling deadline.
+- Capture remains bounded at2MiB per stdout/stderr. Failed output now honors text cap; capture-limit errors identify their cause; truncation preserves surrogate pairs; timeout overrides clamp to1..2147483647ms.
+- Tests additionally cover byte-split UTF8,128 Unicode budgets,12 timeout values,8 simultaneous captures, unrelated sibling isolation, strict macOS broker cancellation, pre-abort no writes, intentional background survival, missing executable and external signal causes.
+- FINAL FULL: Node20.20.2 has533total/530pass/3skip; Node22.23.2 and Node24.18.0 have533total/531pass/2skip; all zero failures. Node20 extra skip is unsupported positive coverage in tooling tests. Native coverage79.79% lines/76.59% branches/78.20% functions. New helper97.22% lines/81.82% branches/100% functions.
+- Matrix36 configurations (Node20/22/24, heap64/128/256MiB, pool1/8, normal/zero-filled buffers, UTC/C or Asia-Tokyo/Japanese locale) passed all504 shell test executions. Three configurations at once.
+- Syntax57 modules, strict public type check and whitespace pass. Packed runtime modules byte-identical; isolated package public Bash API smoke passed. Docker read-only probe found daemon unavailable; no Docker/power settings changed.
+- Report docs/testing-shell-2026-09-05.md; Changelog and PERSIST updated, history50 rows. No commits. All one-shot sessions closed.
+- New evidence: shell-before.log, shell-after.log (execFile-detached attempt still leaked), shell-spawn-after.log, shell-expanded.log, shell-node20-full.log, shell-node22-full.log, shell-node24-coverage.log, shell-matrix.json and shell-matrix/, shell-package/. Baseline originals in shell-baseline/.
 
-## Live stress test (realistic Next.js "fix the CSS" task, gpt-5-nano)
-Built a sandbox mirroring the real flailing turn (rankings page + components +
-globals.css missing `.rankings-table`). Two kinks found & fixed: (1) a failed
-no-op `patch_file` reset the nudge streak → now a failed action counts toward the
-nudge (`record(name, isError)`); (2) `list_dir` threw on `path:""` → now defaults
-to root. Re-run after fixes: **clean success — 3 successful patches, table fully
-styled, no empty-path errors, no flailing.**
+## Previous verification tooling checkpoint
 
-## Verified working from the logs (post-change turns)
-The re-read guard fired 6× across 2 real sessions; 2 of 3 recent turns dropped
-redundant reads from the 69% baseline to **14–29%** with first-edit at call 13–24
-(was 109). One hard turn still flailed (40+ reads, 0 edits) → that's what the
-action-nudge (above) now forces. Token A/B (eval, gpt-5-nano): trim −35% peak.
-- **Eval harness instrumented** — `bench/evals.js` applies trimming (toggle
-  `--no-trim`), records `promptTokens/peakInputTokens/completionTokens`, reports
-  avgIn/avgPeakIn/avgOut; new `context-stress-reads` case (10 sizable files).
-- **/help test fix** — it asserted phantom `/feature`+`/publish` commands; now
-  asserts the real `/diff`+`/commit`.
+- scripts/run-tests.mjs handles portable discovery/environment, failure/cancellation status, Node22/24 coverage thresholds70%lines/60%branches. test:split aliases full suite; live clears inherited skip flag.
+- Pinned dev-only TypeScript7.0.2 + lockfile; tsconfig.types.json and test/types/api.ts check strict public declarations/consumer contract. Corrected maxTotalChars declaration. Runtime zero-dependency.
+- Both npm launcher and stress coordinator clear NODE_TEST_CONTEXT, which previously caused nested test files to be skipped with exit0. Seven tooling regressions cover failure/empty-suite/coverage/cancellation/environment and coordinator fail-fast.
+- Fresh dev/prod installs, injected invalid TypeScript exit1 and packed consumer compilation passed. Report docs/testing-tooling-2026-09-05.md. GitHub Actions/native Windows/Linux were not executed here.
 
-**Live validation (gpt-5-nano via OpenRouter — user constraint: gpt-5-nano only):**
-context-stress A/B → trim ON peak 7,459 / total 57,978; OFF peak 11,463 / total
-67,988 (**−35% peak, −15% total**), both PASS. Full eval suite (5 cases) all pass
-with trim on.
+## Continuous testing and retained failure
 
-## Docs-plan review (user asked: delete if fully implemented → KEEP both)
-- `docs/queued-followups-plan.md` — Phase 1 done (queue, /queue, live input);
-  Phase 2 partial (Ctrl+C aborts model, but `executeTool` takes no AbortSignal so
-  foreground Bash/fetch can't be interrupted; `'approval'` input mode defined but
-  never set in chat.js); Phases 3 (background Bash/Ctrl+B) & 4 (browser queue) not
-  started. **Keep.**
-- `docs/parallel-subagents-plan.md` — NOT STARTED (no agent-manager/agent-runner/
-  delegate_agents/`/agents`). **Keep.**
-- Both remain user-owned untracked planning docs — do NOT commit into this branch.
+- Original run exec68643/PID75702 is CLOSED, exit1. continuous/ contains1251 passing batches(2,502,000 generated cases) then failed batch1252, seed4228604849, heap128MiB, Europe/Berlin/de_DE.UTF-8. All2000 generated cases passed; separate HTTP cancellation test timed out after~130s against15s limit.
+- Host pmset log shows Sleep10:38:40 Arizona → DarkWake10:40:52 (132s), coinciding with failed batch. Strong evidence of suspension-associated timeout; no assertions/timeouts weakened. Exact seed/environment replay32/32 passed in1.17s.60 repeats across Node20/22/24 and pools1/4 passed360 cancellation scenarios. Preserve original failure and power log.
+- CURRENT LOOP: exec session18062, PID80600; continuous-02/ and continuous-02.log below artifact root. Last verified 712 batches / 1424000 generated cases, zero failures, process live. Starts seed4228604849,2000 cases/batch, heap128/256/512MiB and4 TZ/locales. Stop with SIGTERM only when appropriate; new script marker cleanup doesn't alter existing loop whose parent didn't inherit that marker.
+- All one-shot verification exec sessions are closed. Goal remains active.
 
-## Open follow-ups (next, all log-supported)
-- Queued-followups Phase 2: give `executeTool` an AbortSignal (interrupt foreground
-  Bash/fetch); wire `'approval'` input mode so typing during a permission prompt is
-  queued, not consumed.
-- Prose-pollution: the 04:00 failed turn's prompt had leaked assistant text
-  ("…Absolutely. If you're") with no glyph — sanitizeUserInput can't catch that;
-  root-cause the in-turn capture mixing streamed output into the follow-up buffer.
-- Branch is committed and pushed; decide whether to open a PR to main.
-- Bench with only OPENROUTER_API_KEY: pass `--model`/`--judge` explicitly
-  (OpenRouter catalog entry has no DEFAULT_MODELS, judge default falls back to a
-  local Ollama model that isn't running).
-- Harbor adapter (`bench/harbor/`, 2026-07-05) works end-to-end: first
-  Terminal-Bench 2.0 run scored reward 1.0 on `openssl-selfsigned-cert`
-  (gpt-5-nano). Next: run a wider task slice with a stronger model; consider
-  tuning the verify-gate for non-npm task dirs (it burned ~10 iterations
-  hunting for a build to run); terminal-bench@2.1 not in the public registry
-  yet — re-check later.
+## Prior checkpoints and evidence
+
+- Artifact root: /var/folders/xn/5987rxq95wjbb6mvn_m06l1c0000gn/T/claudette-ongoing-vf7haq54
+- Latest logs: tooling-node20-complete.log, tooling-node22-complete.log, tooling-coverage-complete.log, tooling-all-complete.log, tooling-install-results.json. Pre-fix: coverage-script-before.log, types-before.log, tooling-first.log, stress-context-before.log, stress-context-regression-before.log. Cancellation: continuous/batch-001252.log, continuous-failure-replay.log, continuous-failure-power.log, cancellation-repeats.json.
+- Prior filesystem: docs/testing-filesystem-2026-09-05.md; instruction-cache freshness, ordered session/transcript persistence, archive uniqueness, bounded atomic temp basenames.14 regressions,60 configurations/840 executions passed; prior full510pass/2skip all3 Nodes.
+- Prior streaming: docs/testing-streams-2026-09-05.md;32 tests for UTF8/framing/errors/EOF/cleanup/cancellation, deterministic and seeded cases. MiniMax2/3 and GLMFlash0/3 live Unicode strict cases retained as model-format failures.
+- Prior broad review: docs/testing-2026-09-05.md and /var/folders/xn/5987rxq95wjbb6mvn_m06l1c0000gn/T/claudette-stress-c15tc805. Scanner638pass/17skip/82.87%;139 source files preserved. Native /copy6cases passed with original clipboard restored. Do not repeat unchanged Scanner.
+
+## Tool-call log and next steps
+
+- This goal turn is progress: revalidated continuous process, inspected/snapshotted shell code, added real-process regressions and retained seven pre-fix failures.
+- Initial execFile detached attempt fixed6/8; inspected installed Node source proving detached was discarded. Replaced only foreground capture/lifecycle with spawn helper; all14 expanded regressions passed including strict broker isolation.
+- Full Node20/22/24 and36 runtime/heap/pool/buffer configurations passed. Verified packaged runtime, types, syntax and whitespace; updated reports/history. All one-shot sessions are closed.
+- Final call records fresh continuous PID/count evidence and current handoff. Goal remains active, stream loop continues. Next: revalidate loop, then expand remaining shell diagnostics/broker failure scenarios or native platform verification with concrete new cases. Do not rerun unchanged suites without a reason. SE3 remains pending app clarification; avoid repeating the same unanswered question.
+
+- New goal turn: previous turn made progress through shell lifecycle fixes and verified runtime/matrix/package results. Next: revalidate continuous process and inspect/test broker exception, disconnect, cancellation and concurrency paths with isolated IPC fixtures.
+- Continuous PID80600 verified live at741batches/1482000cases. Broker currently invokes execute before Promise.resolve can catch a synchronous throw, and client.close rejects callers without sending cancellations. Next: reproduce these with focused tests plus concurrent/disconnect/schema stress.
+- Added6 broker tests covering synchronous throws,32-command client close,96 mixed/reordered outcomes,48-command disconnect,40 malformed field variants and active duplicate IDs. Pre-fix session48212 active; next collect exact failures before targeted fixes.
+- Broker baseline4pass/2fail confirms uncaught synchronous executor exception and32 commands left active after client.close. Next: contain invocation failures without changing dispatch timing, normalize results inside rejection handling, and cancel pending command IDs on client close.
+- Both broker fixes pass all6 tests. Next: verify production IPC with forked processes, synchronous/async/conversion failures, client-close cancellation acknowledged before disconnect, and aborted handshakes.
+- Expanded broker suite to9 tests including72 mixed outcomes over real fork IPC,24 client-close cancellations while transport stays connected, and pre-handshake abort. Command exited0; next verify reported execution counts and ensure forked actors actually ran rather than inherited-test skipping.
+
+## Auths integration (separate task, 2026-09-09)
+
+- Auths will add an optional `execute` callback to the exported `runAgent` so its research tools use the existing loop with a scoped executor. Default Claudette tools remain unchanged. Existing dirty work and continuous testing are preserved. Next call applies that two-line extension; verification lives in `/Users/frank/Code/auths/tests/ai.test.ts`.
+
+- Auths executor hook is applied and its integration tests pass: custom tool dispatch, unoffered-shell rejection, URL/repository boundaries, cancellation and cloud-only routing. Local app completed a DO/VPN capture through Claudette. Next: commit only the two executor lines; all pre-existing dirty changes and the ongoing test task remain untouched.
+
+- Auths hook committed and pushed as b2607bf on feature/review-hardening. Only the optional executor parameter and dispatch line were staged; all earlier dirty changes remain. Auths stores its integration tests and independent model comparison in its own repo.

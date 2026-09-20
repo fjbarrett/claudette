@@ -8,6 +8,8 @@
 // Canonical addressing is `anthropic/<id>`; the legacy `anthropic:<id>` colon
 // form is still accepted as an input alias.
 import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
+import { providerHttpError } from './retry.js';
+import { readSSEData, parseStreamJSON } from './streaming.js';
 
 const PREFIX = 'anthropic/';
 const LEGACY_PREFIX = 'anthropic:';
@@ -116,10 +118,10 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
 
   if (!res.ok || !res.body) {
     const txt = await res.text().catch(() => '');
-    throw new Error(`Anthropic chat (${res.status}): ${txt}`);
+    throw providerHttpError('Anthropic', res, txt);
   }
 
-  const result = await parseSSE(res.body, onDelta);
+  const result = await parseSSE(res.body, onDelta, signal);
   result.toolMode = tools.length ? 'native' : 'none';
   return result;
 }
@@ -228,59 +230,62 @@ export function toAnthropicMessages(messages = []) {
 
 // ─── SSE stream assembly ─────────────────────────────────────────────────────
 
-async function parseSSE(stream, onDelta) {
-  const reader = stream.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
+async function parseSSE(stream, onDelta, signal) {
   let fullContent = '';
   const tools = [];               // ordered { id, name, jsonBuf }
   const toolByIndex = new Map();  // content-block index → tools[] entry
   let promptTokens = 0;
   let completionTokens = 0;
+  let cachedTokens = 0;
+  let cacheWriteTokens = 0;
+  let completed = false;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';
+  for await (const data of readSSEData(stream)) {
+    signal?.throwIfAborted();
+    if (data.trim() === '[DONE]') { completed = true; break; }
+    if (!data.trim()) continue;
+    const evt = parseStreamJSON(data, 'Anthropic');
+    if (evt.type === 'message_stop') { completed = true; break; }
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const data = trimmed.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
-      let evt;
-      try { evt = JSON.parse(data); } catch { continue; }
-
-      switch (evt.type) {
-        case 'message_start':
-          promptTokens = evt.message?.usage?.input_tokens ?? 0;
-          break;
-        case 'content_block_start':
-          if (evt.content_block?.type === 'tool_use') {
-            const entry = { id: evt.content_block.id, name: evt.content_block.name, jsonBuf: '' };
-            tools.push(entry);
-            toolByIndex.set(evt.index, entry);
-          }
-          break;
-        case 'content_block_delta':
-          if (evt.delta?.type === 'text_delta') {
-            const text = evt.delta.text ?? '';
-            if (text) { fullContent += text; onDelta?.(text); }
-          } else if (evt.delta?.type === 'input_json_delta') {
-            const entry = toolByIndex.get(evt.index);
-            if (entry) entry.jsonBuf += evt.delta.partial_json ?? '';
-          }
-          break;
-        case 'message_delta':
-          completionTokens = evt.usage?.output_tokens ?? completionTokens;
-          break;
-        default:
-          break;
+    switch (evt.type) {
+      case 'message_start': {
+        // Anthropic's `input_tokens` counts only what was NOT served from
+        // cache; OpenAI-compatible providers put the whole input in
+        // `prompt_tokens`. Reading input_tokens alone made a cached turn look
+        // like it had sent 2 tokens — an eval run billed 52 input tokens
+        // across five cases, and the cost meter was out by three orders of
+        // magnitude. Normalise to the total and keep the split for pricing.
+        const u = evt.message?.usage ?? {};
+        cachedTokens = u.cache_read_input_tokens ?? 0;
+        cacheWriteTokens = u.cache_creation_input_tokens ?? 0;
+        promptTokens = (u.input_tokens ?? 0) + cachedTokens + cacheWriteTokens;
+        break;
       }
+      case 'content_block_start':
+        if (evt.content_block?.type === 'tool_use') {
+          const entry = { id: evt.content_block.id, name: evt.content_block.name, jsonBuf: '' };
+          tools.push(entry);
+          toolByIndex.set(evt.index, entry);
+        }
+        break;
+      case 'content_block_delta':
+        if (evt.delta?.type === 'text_delta') {
+          const text = evt.delta.text ?? '';
+          if (text) { fullContent += text; onDelta?.(text); }
+        } else if (evt.delta?.type === 'input_json_delta') {
+          const entry = toolByIndex.get(evt.index);
+          if (entry) entry.jsonBuf += evt.delta.partial_json ?? '';
+        }
+        break;
+      case 'message_delta':
+        completionTokens = evt.usage?.output_tokens ?? completionTokens;
+        break;
+      default:
+        break;
     }
   }
+  signal?.throwIfAborted();
+  if (!completed) throw new Error('Anthropic: response ended before completion');
 
   const toolCalls = tools.map(t => {
     let args = {};
@@ -296,5 +301,7 @@ async function parseSSE(stream, onDelta) {
     hadApiToolCalls: toolCalls.length > 0,
     promptTokens,
     completionTokens,
+    cachedTokens,
+    cacheWriteTokens,
   };
 }

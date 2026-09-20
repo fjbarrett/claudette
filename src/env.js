@@ -1,14 +1,14 @@
 // Zero-dependency .env loader.
 //
-// Lets users drop provider keys in a gitignored `.env` instead of re-exporting
-// shell vars every session. Loaded as a side effect (src/env-autoload.js) as the
-// first import in each entry point, so values land before config.js/ollama.js
-// read process.env at module-load time.
+// Lets users keep provider keys in a trusted Claudette or user configuration
+// file instead of re-exporting shell vars every session. A workspace `.env` is
+// deliberately not loaded: the checkout being edited must not control approval,
+// provider endpoint, or model-tool environment policy.
 //
 // Precedence (first wins; a real process.env value always wins over any file):
-//   1. <package root>/.env   — the claudette checkout (the natural place)
-//   2. <cwd>/.env            — project-local, if different from the package root
-//   3. ~/.config/claudette/.env — global fallback
+//   1. $CLAUDETTE_ENV_FILE     — explicit trusted file, when configured
+//   2. <package root>/.env     — a Claudette development checkout
+//   3. ~/.config/claudette/.env — global user configuration
 //
 // This module imports nothing that reads env, so importing it first is safe.
 
@@ -54,11 +54,17 @@ export function parseEnv(text = '') {
   return out;
 }
 
-function candidateFiles() {
+export function candidateFiles({
+  env = process.env,
+  cwd = process.cwd(),
+  home = os.homedir(),
+  packageRoot = PACKAGE_ROOT,
+} = {}) {
+  const explicit = String(env.CLAUDETTE_ENV_FILE ?? '').trim();
   const files = [
-    path.join(PACKAGE_ROOT, '.env'),
-    path.join(process.cwd(), '.env'),
-    path.join(os.homedir(), '.config', 'claudette', '.env'),
+    ...(explicit ? [path.resolve(cwd, explicit)] : []),
+    path.join(packageRoot, '.env'),
+    path.join(home, '.config', 'claudette', '.env'),
   ];
   // De-dupe identical resolved paths (e.g. run from the package root) while
   // preserving order.

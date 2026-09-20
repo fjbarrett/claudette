@@ -1,0 +1,48 @@
+{
+  "id": "review-evidence",
+  "title": "Reviews code using existing configuration without mistaking collection coverage for executed tests",
+  "prompt": "Review this project's code and tooling, including pyproject.toml, src/ports.py, tests/test_ports.py, and the saved output in collection.txt. Give concrete findings with file references and explain what the saved output establishes about test coverage. Keep this a read-only review: use file-reading tools only; do not execute commands, install dependencies, or edit files.",
+  "maxTurns": 8,
+  "repeat": 1,
+  "files": {
+    "pyproject.toml": "[project]\nname = \"port-check\"\nversion = \"0.1.0\"\nrequires-python = \">=3.11\"\n\n[project.optional-dependencies]\ndev = [\"ruff\", \"mypy\", \"pytest\", \"pytest-cov\"]\n\n[tool.pytest.ini_options]\naddopts = \"--cov=ports --cov-fail-under=70\"\npythonpath = [\"src\"]\n\n[tool.mypy]\nstrict = true\n\n[tool.ruff]\nline-length = 100\n",
+    "src/ports.py": "def is_valid_port(port: int) -> bool:\n    \"\"\"Return whether port is a destination TCP port in the range 1..65535.\"\"\"\n    return 0 <= port <= 65535\n",
+    "tests/test_ports.py": "from ports import is_valid_port\n\n\ndef test_port_boundaries() -> None:\n    assert is_valid_port(1)\n    assert is_valid_port(65535)\n    assert not is_valid_port(-1)\n    assert not is_valid_port(65536)\n",
+    "collection.txt": "$ python3 -m pytest --collect-only -q\n\ntests/test_ports.py::test_port_boundaries\n\nName           Stmts   Miss  Cover\n---------------------------------\nsrc/ports.py       2      1    50%\n---------------------------------\nTOTAL              2      1    50%\nFAIL Required test coverage of 70% not reached. Total coverage: 50.00%\n1 test collected in 0.02s\n"
+  },
+  "expect": {
+    "tools": [
+      {
+        "name": "read_file",
+        "args": {
+          "path": "src/ports.py"
+        }
+      }
+    ],
+    "forbid": [
+      "bash",
+      "write_file",
+      "str_replace",
+      "patch_file",
+      "fetch_url"
+    ],
+    "noToolErrors": true,
+    "unchangedFiles": [
+      "pyproject.toml",
+      "src/ports.py",
+      "tests/test_ports.py",
+      "collection.txt"
+    ],
+    "allowedFiles": [
+      "pyproject.toml",
+      "src/ports.py",
+      "tests/test_ports.py",
+      "collection.txt"
+    ],
+    "maxToolCalls": 8,
+    "answer": {
+      "matches": "^(?=[\\s\\S]*src/ports\\.py)(?=[\\s\\S]*(?:zero|\\b0\\b))(?=[\\s\\S]*collect)(?=[\\s\\S]*(?:unknown|cannot (?:be )?(?:infer|determin)|does (?:\\*\\*)?not(?:\\*\\*)? (?:establish|measure|represent|demonstrate|prove)|not (?:a |the )?(?:actual|real|meaningful|test-suite|runtime|execution|representative)|not evidence|nothing reliable|proper coverage assessment requires))[\\s\\S]+$",
+      "notMatches": "coverage (?:threshold|gate) (?:will |would )?fail(?:s)? (?:on any run|even on a correct run)|(?:would|will|likely|probably|producing)[^\\n]{0,240}\\b100\\s*%"
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "already-correct",
+  "title": "Checks, finds nothing to do, and says so instead of inventing an edit",
+  "prompt": "Make sure the PORT constant in src/server.js is set to 8080. If it is already correct, change nothing and just tell me.",
+  "maxTurns": 6,
+  "repeat": 1,
+  "files": {
+    "src/server.js": "import http from 'node:http';\n\nconst PORT = 8080;\nconst HOST = '127.0.0.1';\n\nhttp.createServer((req, res) => {\n  res.end('ok');\n}).listen(PORT, HOST);\n"
+  },
+  "expect": {
+    "forbid": ["write_file", "str_replace", "patch_file"],
+    "files": {
+      "src/server.js": { "includes": "const PORT = 8080;" }
+    },
+    "maxToolCalls": 3,
+    "answer": { "matches": "already|no change|unchanged|nothing to (change|do)|correct" }
+  }
+}

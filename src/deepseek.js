@@ -13,13 +13,13 @@ export const KEY_ENV = 'DEEPSEEK_API_KEY';
 export const LABEL = 'DeepSeek';
 export const id = 'deepseek';
 
-const KNOWN_MODELS = ['deepseek-chat', 'deepseek-reasoner'];
+const KNOWN_MODELS = ['deepseek-v4-flash', 'deepseek-v4-pro'];
 
 function apiBase() {
   return (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com/v1').replace(/\/+$/, '');
 }
 function apiKey() {
-  return process.env.DEEPSEEK_API_KEY ?? '';
+  return process.env.DEEPSEEK_API_KEY ?? process.env.DEEPSEEK_KEY ?? '';
 }
 
 export function handles(model) {
@@ -40,6 +40,8 @@ export async function getModels() {
     family: 'deepseek',
     paramSize: 'cloud',
     modified: null,
+    capabilities: ['tools'],
+    access: { free: false, kind: 'paid', provider: 'deepseek' },
   }));
 }
 

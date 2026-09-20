@@ -1,8 +1,15 @@
 // ANSI-based terminal rendering — no external dependencies
 import process from 'node:process';
-import { formatUsd } from './cost.js';
+import { formatExplorationSummary, isRoutineExplorationTool } from './tool-activity.js';
 
 const jsonIpc = process.argv.includes('--json-ipc');
+
+// Headless (`-p "…"`) shares IPC's "no terminal chrome" rule: a spinner repainting
+// a line 12×/second is unreadable once stdout is a pipe, and the trailing model /
+// token footer is not part of the answer a script asked for. Chat output itself
+// still prints, so `claudette -p "…" > out.txt` gives you exactly the reply.
+const headless = process.argv.includes('-p') || process.argv.includes('--print');
+const quiet = jsonIpc || headless;
 
 // Palette: VS Code Default Dark+ (24-bit truecolor). Honors NO_COLOR.
 const NO_COLOR = process.env.NO_COLOR != null && process.env.NO_COLOR !== '';
@@ -38,65 +45,262 @@ export const s = {
   bc:         t => `${B}${C}${t}${R}`,
 };
 
-// Spinner
+// ─── Managed turn status ─────────────────────────────────────────────────────
+// The bottom of the terminal is one small, owned display. Model identity gets a
+// dedicated row (and is never truncated); activity/progress lives below it. A
+// typed follow-up temporarily replaces only the progress row, so the selected
+// model stays visible and spinner, streamed output, and input cannot race for
+// the same cursor position.
 const FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
-let _spinTimer = null, _spinIdx = 0;
+let _spinTimer = null, _spinIdx = 0, _spinLabel = 'Thinking';
+let _managedRows = 0;
+let _toolSectionOpen = false;
+let _routineToolCalls = [];
 
-// Live usage shown on the spinner row while the agent works (realtime token/cost
-// readout, à la Claude Code). Set from the agent loop after each model request;
-// read fresh on every frame so it updates in place during the "Working…" wait.
-let _usageStatus = '';
-export function setUsageStatus(text) { _usageStatus = String(text ?? ''); }
+const emptyTurnStatus = () => ({
+  activeModel: '', resolvedModel: '', resolvedProvider: '',
+  phase: 'Thinking', iteration: 0, maxIterations: 0, toolCount: 0,
+  promptTokens: 0, completionTokens: 0, cost: '', queueCount: 0,
+  startedAt: 0,
+});
+let _turnStatus = emptyTurnStatus();
+
+function statusTokens(value) {
+  const n = Number(value) || 0;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1).replace(/\.0$/, '')}m`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1).replace(/\.0$/, '')}k`;
+  return String(n);
+}
+
+function elapsedLabel(startedAt, now = Date.now()) {
+  const seconds = Math.max(0, Math.floor((now - (Number(startedAt) || now)) / 1000));
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h${String(Math.floor((seconds % 3600) / 60)).padStart(2, '0')}m`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
+  return `${seconds}s`;
+}
+
+const ROUTER_LABELS = {
+  openrouter: 'OpenRouter',
+  ollama: 'Ollama',
+  hf: 'Hugging Face',
+  xai: 'xAI',
+};
+
+export function buildRouteLabel({ model, resolvedProvider } = {}) {
+  const modelId = String(model ?? '').trim();
+  const rawRouter = modelId.includes('/') ? modelId.split('/')[0].trim() : 'ollama';
+  const router = ROUTER_LABELS[rawRouter.toLowerCase()]
+    ?? `${rawRouter.charAt(0).toUpperCase()}${rawRouter.slice(1)}`;
+  const provider = String(resolvedProvider ?? '').trim();
+  return provider && provider.toLowerCase() !== router.toLowerCase()
+    ? `${router} / ${provider}`
+    : router;
+}
+
+export function buildAssistantFooter({ model, resolvedProvider, tokens } = {}) {
+  const route = buildRouteLabel({ model, resolvedProvider });
+  return [route, tokens ? `~${tokens} tokens` : null].filter(Boolean).join(' · ');
+}
+
+function wrapIdentity(label, value, width) {
+  const prefix = `  ${String(label).padEnd(7)}`;
+  const continuation = ' '.repeat(prefix.length);
+  const available = Math.max(1, width - prefix.length);
+  const text = String(value || '–');
+  const rows = [];
+  for (let offset = 0; offset < text.length; offset += available) {
+    rows.push(`${offset ? continuation : prefix}${text.slice(offset, offset + available)}`);
+  }
+  return rows.length ? rows : [`${prefix}–`];
+}
+
+// Pure formatter exported for focused tests. Keep one compact router/provider
+// identity row; the activity row below already owns progress and token counts.
+export function buildTurnStatusLines(state = {}, width = cols(), frame = FRAMES[0], now = Date.now()) {
+  const maxWidth = Math.max(24, Number(width) || 80);
+  const route = buildRouteLabel({ model: state.activeModel, resolvedProvider: state.resolvedProvider });
+  const rows = wrapIdentity('route', route, maxWidth);
+
+  const rawPhase = String(state.phase || 'Working').replace(/…+$/, '');
+  const phase = truncate(rawPhase, Math.max(12, Math.floor(maxWidth * 0.34)));
+  const details = [
+    state.iteration ? `step ${state.iteration}/${state.maxIterations || '?'}` : null,
+    state.queueCount ? `${state.queueCount} queued` : null,
+    elapsedLabel(state.startedAt, now),
+    `${Number(state.toolCount) || 0} tools`,
+    `in ${statusTokens(state.promptTokens)}`,
+    `out ${statusTokens(state.completionTokens)}`,
+    state.cost || null,
+  ].filter(Boolean);
+  let progress = `  ${frame} ${phase}`;
+  for (const detail of details) {
+    const candidate = `${progress} · ${detail}`;
+    if (candidate.length <= maxWidth) progress = candidate;
+  }
+  rows.push(progress);
+  return rows;
+}
+
+function colorStatusLine(line) {
+  const identity = line.match(/^(\s*)(model|route)(\s+)(.*)$/);
+  if (identity) return `${identity[1]}${GR}${identity[2]}${R}${identity[3]}${C}${identity[4]}${R}`;
+  const activity = line.match(/^(\s*)([⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏])(\s+)(.*)$/u);
+  if (activity) return `${activity[1]}${P}${activity[2]}${R}${activity[3]}${GR}${activity[4]}${R}`;
+  if (line.startsWith('  ❯ ')) return `${GR}  ❯ ${R}${W}${line.slice(4)}${R}`;
+  return `${C}${line}${R}`; // wrapped continuation of a compact route label
+}
+
+function clearManagedRows() {
+  if (!_managedRows) return;
+  for (let row = 0; row < _managedRows; row++) {
+    process.stdout.write('\r\x1b[2K');
+    if (row < _managedRows - 1) process.stdout.write('\x1b[1A');
+  }
+  _managedRows = 0;
+}
+
+function managedLines() {
+  const showStatus = Boolean(_spinTimer && _turnStatus.activeModel);
+  const showInput = Boolean(_liveOn && _liveText);
+  if (!showStatus && !showInput) return [];
+  if (!showStatus) return [`  ❯ ${_liveText}`];
+  const rows = buildTurnStatusLines(_turnStatus, cols() - 1, FRAMES[_spinIdx++ % FRAMES.length]);
+  if (showInput) rows[rows.length - 1] = `  ❯ ${_liveText}`;
+  return rows;
+}
+
+function renderManagedRows() {
+  if (quiet) return;
+  clearManagedRows();
+  const rows = managedLines();
+  if (!rows.length) return;
+  process.stdout.write(rows.map(colorStatusLine).join('\n'));
+  _managedRows = rows.length;
+}
+
+function writeAboveManaged(text) {
+  const redraw = Boolean(_spinTimer || (_liveOn && _liveText));
+  clearManagedRows();
+  process.stdout.write(String(text));
+  if (redraw) renderManagedRows();
+}
+
+function ensureToolSection() {
+  if (quiet || _toolSectionOpen) return;
+  writeAboveManaged(`\n  ${B}${C}Tools${R}\n`);
+  _toolSectionOpen = true;
+}
+
+function writeToolLine(text) {
+  if (quiet) return;
+  ensureToolSection();
+  writeAboveManaged(`  ${GR}│${R} ${text}\n`);
+}
+
+function toolCallPrimary(args = {}) {
+  return args.command
+    ?? args.path
+    ?? args.pattern
+    ?? (args.content ? `${String(args.content).split('\n').length} lines` : JSON.stringify(args));
+}
+
+function writeToolCallLine(name, args = {}, color = G) {
+  const displayName = toolDisplayName(name);
+  const primary = truncate(String(toolCallPrimary(args) ?? ''), cols() - displayName.length - 12);
+  writeToolLine(`${B}${color}⏺ ${displayName}${R}${GR}(${primary})${R}`);
+}
+
+function flushRoutineToolSummary() {
+  const completed = _routineToolCalls.filter(call => call.completed);
+  if (!completed.length) return;
+  _routineToolCalls = _routineToolCalls.filter(call => !call.completed);
+  writeToolLine(`${G}⏺ ${formatExplorationSummary(completed.map(call => call.summaryName ?? call.name))}${R}`);
+}
+
+export function finishToolSection() {
+  if (quiet) {
+    _routineToolCalls = [];
+    _toolSectionOpen = false;
+    return;
+  }
+  flushRoutineToolSummary();
+  if (_routineToolCalls.length) {
+    for (const call of _routineToolCalls) writeToolCallLine(call.name, call.args);
+    _routineToolCalls = [];
+  }
+  if (_toolSectionOpen) {
+    writeAboveManaged('\n');
+    _toolSectionOpen = false;
+  }
+}
+
+export function beginTurnStatus({ model = '', maxIterations = 0 } = {}) {
+  stopSpinner();
+  finishToolSection();
+  _turnStatus = { ...emptyTurnStatus(), activeModel: String(model), maxIterations, startedAt: Date.now() };
+}
+
+export function updateTurnStatus(patch = {}) {
+  _turnStatus = { ..._turnStatus, ...patch };
+  if (_spinTimer) renderManagedRows();
+}
+
+export function setQueueCount(count) {
+  updateTurnStatus({ queueCount: Math.max(0, Number(count) || 0) });
+}
+
+export function noteToolCall() {
+  updateTurnStatus({ toolCount: _turnStatus.toolCount + 1 });
+}
 
 export function startSpinner(label = 'Thinking') {
-  if (jsonIpc) return;
-  if (_spinTimer) return;
-  process.stdout.write('\n');
-  _spinTimer = setInterval(() => {
-    const suffix = _usageStatus ? `   ${GR}${_usageStatus}${R}` : '';
-    process.stdout.write(`\r\x1b[2K  ${P}${FRAMES[_spinIdx++ % FRAMES.length]}${R} ${D}${label}…${R}${suffix}`);
-  }, 80);
+  if (quiet) return;
+  _spinLabel = String(label || 'Working');
+  _turnStatus.phase = _spinLabel;
+  if (!_spinTimer) { _spinTimer = setInterval(renderManagedRows, 120); _spinTimer.unref?.(); }
+  renderManagedRows(); // immediate acknowledgement; do not wait for frame one
 }
 
 export function stopSpinner() {
-  if (jsonIpc) return;
-  if (!_spinTimer) return;
-  clearInterval(_spinTimer);
+  if (quiet) return;
+  if (_spinTimer) clearInterval(_spinTimer);
   _spinTimer = null;
-  process.stdout.write('\r\x1b[2K');
+  clearManagedRows();
+}
+
+export function endTurnStatus() {
+  stopSpinner();
+  finishToolSection();
+  _turnStatus = emptyTurnStatus();
 }
 
 // ─── Live input line (see your follow-ups while the agent works) ─────────────
-// A single managed bottom row that shows what you're typing during a turn.
-// `updateLiveInput` redraws it in place; `printAboveLive` (the markdown-stream
-// writer during capture) erases it before output so the two never collide.
-// Typing stops the spinner so they don't fight for the bottom row.
 let _liveOn = false;
 let _liveText = '';
 
 export function setLiveInputActive(on) {
   _liveOn = Boolean(on);
-  if (!_liveOn) _liveText = '';
+  if (!_liveOn) {
+    _liveText = '';
+    renderManagedRows();
+  }
 }
 
 export function updateLiveInput(text) {
   if (jsonIpc || !_liveOn) return;
   _liveText = String(text ?? '');
-  if (_liveText) stopSpinner();          // the input line takes the bottom row
-  process.stdout.write('\r\x1b[2K');     // clear the row
-  if (_liveText) process.stdout.write(`${GR}❯ ${R}${W}${_liveText}${R}`);
+  renderManagedRows();
 }
 
 // Write turn output above the live input line: erase it first so output never
 // lands on the same row. The next keystroke redraws the input.
 export function printAboveLive(s) {
   if (jsonIpc) { process.stdout.write(s); return; }
-  if (_liveOn && _liveText) process.stdout.write('\r\x1b[2K');
-  process.stdout.write(s);
+  writeAboveManaged(s);
 }
 
 export function cols() {
-  return Math.min(process.stdout.columns || 80, 88);
+  return Math.max(40, process.stdout.columns || 80);
 }
 
 export function printBanner({ model, cwd, sessionId, effort, autoApprove }) {
@@ -116,7 +320,8 @@ export function printBanner({ model, cwd, sessionId, effort, autoApprove }) {
 }
 
 export function printAssistantStart() {
-  if (jsonIpc) return;
+  if (quiet) return; // headless emits the answer text alone, with no ◆ gutter
+  finishToolSection();
   process.stdout.write(`\n${B}${P}◆${R} `);
 }
 
@@ -127,86 +332,158 @@ export function printAssistantMessage(text) {
   process.stdout.write(rendered);
 }
 
-export function printAssistantEnd({ model: m, tokens, costUsd, sessionCostUsd } = {}) {
-  if (jsonIpc) return;
-  const turnCost = formatUsd(costUsd);
-  const sessCost = formatUsd(sessionCostUsd);
-  const info = [
-    m,
-    tokens ? `~${tokens} tokens` : null,
-    turnCost ? `~${turnCost}` : null,
-    sessCost ? `session ~${sessCost}` : null,
-  ].filter(Boolean).join(' · ');
+export function printAssistantEnd({ model, resolvedProvider, tokens } = {}) {
+  if (quiet) { if (headless) process.stdout.write('\n'); return; }
+  finishToolSection();
+  const info = buildAssistantFooter({ model, resolvedProvider, tokens });
   process.stdout.write(info ? `\n\n${GR}  ↳ ${info}${R}\n` : '\n');
 }
 
 const TOOL_DISPLAY = {
   bash: 'Bash', read_file: 'Read', write_file: 'Write',
-  str_replace: 'Edit', glob: 'Glob', grep: 'Grep',
+  str_replace: 'Edit', patch_file: 'Patch', glob: 'Glob', grep: 'Search',
+  search_code: 'Search', list_dir: 'List', fetch_url: 'Fetch',
 };
 
 export function toolDisplayName(name) {
   return TOOL_DISPLAY[name] ?? name;
 }
 
-export function printToolCall(name, args) {
+export function printToolCall(name, args = {}) {
   if (jsonIpc) return;
+  stopSpinner();
+  if (isRoutineExplorationTool(name)) {
+    _routineToolCalls.push({ name, args, completed: false });
+    return;
+  }
+  flushRoutineToolSummary();
+  writeToolCallLine(name, args);
+}
+
+function toolPrimary(args = {}) {
+  return args.command ?? args.path ?? args.pattern ?? '';
+}
+
+export function toolActivityLabel(name, args = {}) {
   const displayName = toolDisplayName(name);
-  const primary =
-    args.command   ? truncate(args.command, cols() - 20) :
-    args.path      ? args.path :
-    args.pattern   ? args.pattern :
-    args.content   ? `${String(args.content).split('\n').length} lines` :
-    truncate(JSON.stringify(args), cols() - 20);
-  // One clean label per call — the friendly name only (no redundant `[read_file]`).
-  process.stdout.write(`\n${B}${G}⏺ ${displayName}${R}${GR}(${truncate(primary, cols() - displayName.length - 8)})${R}\n`);
+  const primary = String(toolPrimary(args)).split('\n')[0].trim();
+  return primary
+    ? `Running ${displayName}: ${truncate(primary, Math.max(12, cols() - displayName.length - 16))}`
+    : `Running ${displayName}`;
+}
+
+export function startToolActivity(name, args = {}) {
+  if (isRoutineExplorationTool(name)) {
+    const names = _routineToolCalls.map(call => call.summaryName ?? call.name);
+    startSpinner(formatExplorationSummary(names.length ? names : [name], 'Exploring'));
+    return;
+  }
+  startSpinner(toolActivityLabel(name, args));
+}
+
+export function printApprovalAccepted(name, args = {}, always = false) {
+  if (jsonIpc) return;
+  stopSpinner();
+  const answer = always ? 'a (always)' : 'y';
+  const activity = toolActivityLabel(name, args);
+  flushRoutineToolSummary();
+  writeToolLine(`${G}✓ Accepted ${answer}${R}${GR} — ${activity}${R}`);
+  startSpinner(activity);
+}
+
+export function printApprovalDenied(name) {
+  if (jsonIpc) return;
+  stopSpinner();
+  const pending = _routineToolCalls.findIndex(call => call.name === name && !call.completed);
+  if (pending !== -1) _routineToolCalls.splice(pending, 1);
+  flushRoutineToolSummary();
+  writeToolLine(`${Y}✓ Accepted n${R}${GR} — skipped ${toolDisplayName(name)}${R}`);
+}
+
+export function printInterruptRequested(item) {
+  if (jsonIpc) return;
+  stopSpinner();
+  finishToolSection();
+  const summary = truncate(String(item?.content ?? ''), Math.max(20, cols() - 20));
+  console.log(`\n  ${Y}↳ Interrupt accepted${R}${GR} — stopping the current operation${R}`);
+  console.log(`  ${GR}Next prompt: ${W}${summary}${R}`);
+  startSpinner('Interrupting current operation');
+}
+
+export function printRedirectStarted(prompt) {
+  if (jsonIpc) return;
+  stopSpinner();
+  finishToolSection();
+  const summary = truncate(String(prompt ?? ''), Math.max(20, cols() - 18));
+  console.log(`\n  ${G}✓ Interrupted${R}${GR} — applying: ${W}${summary}${R}`);
 }
 
 export function printToolResult(name, output, isError = false) {
   if (jsonIpc) return;
+  stopSpinner();
   const str   = String(output).trimEnd();
   const lines = str.split('\n');
   const col   = isError ? RE : GR;
 
+  if (isRoutineExplorationTool(name)) {
+    const index = _routineToolCalls.findIndex(call => call.name === name && !call.completed);
+    const call = index === -1 ? { name, args: {} } : _routineToolCalls[index];
+    if (!isError) {
+      call.completed = true;
+      if (name === 'read_file' && lines[0]?.startsWith('Directory:')) call.summaryName = 'list_dir';
+      if (index === -1) _routineToolCalls.push(call);
+      return;
+    }
+    if (index !== -1) _routineToolCalls.splice(index, 1);
+    flushRoutineToolSummary();
+    writeToolCallLine(name, call.args, RE);
+    lines.slice(0, 6).forEach(line => writeToolLine(`${RE}⎿ ${line}${R}`));
+    if (lines.length > 6) writeToolLine(`${GR}⎿ … (${lines.length - 6} more lines)${R}`);
+    return;
+  }
+
+  flushRoutineToolSummary();
+  ensureToolSection();
+
   if (isError) {
-    lines.slice(0, 6).forEach(l => console.log(`${col}  ⎿ ${l}${R}`));
-    if (lines.length > 6) console.log(`${GR}  ⎿ … (${lines.length - 6} more lines)${R}`);
+    lines.slice(0, 6).forEach(line => writeToolLine(`${col}⎿ ${line}${R}`));
+    if (lines.length > 6) writeToolLine(`${GR}⎿ … (${lines.length - 6} more lines)${R}`);
     return;
   }
 
   switch (name) {
     case 'read_file':
       if (lines[0]?.startsWith('Directory:')) {
-        console.log(`${GR}  ⎿ Listed ${lines.length - 1} entries${R}`);
+        writeToolLine(`${GR}⎿ Listed ${lines.length - 1} entries${R}`);
       } else {
-        console.log(`${GR}  ⎿ Read ${lines.length} line${lines.length === 1 ? '' : 's'}${R}`);
+        writeToolLine(`${GR}⎿ Read ${lines.length} line${lines.length === 1 ? '' : 's'}${R}`);
       }
       break;
     case 'write_file':
-      console.log(`${GR}  ⎿ ${str}${R}`);
+      writeToolLine(`${GR}⎿ ${str}${R}`);
       break;
     case 'str_replace':
-      console.log(`${GR}  ⎿ ${str}${R}`);
+      writeToolLine(`${GR}⎿ ${str}${R}`);
       break;
     case 'glob': {
       const count = str === '(no matches)' ? 0 : lines.filter(Boolean).length;
-      console.log(`${GR}  ⎿ ${count ? `Found ${count} file${count === 1 ? '' : 's'}` : 'No matches'}${R}`);
+      writeToolLine(`${GR}⎿ ${count ? `Found ${count} file${count === 1 ? '' : 's'}` : 'No matches'}${R}`);
       break;
     }
     case 'grep': {
       if (str === '(no matches)') {
-        console.log(`${GR}  ⎿ No matches${R}`);
+        writeToolLine(`${GR}⎿ No matches${R}`);
       } else {
         const count = lines.filter(Boolean).length;
-        console.log(`${GR}  ⎿ ${count} match${count === 1 ? '' : 'es'}${R}`);
+        writeToolLine(`${GR}⎿ ${count} match${count === 1 ? '' : 'es'}${R}`);
       }
       break;
     }
     case 'bash':
     default: {
       const SHOW = 6;
-      lines.slice(0, SHOW).forEach(l => console.log(`${GR}  ⎿ ${l}${R}`));
-      if (lines.length > SHOW) console.log(`${GR}  ⎿ … (${lines.length - SHOW} more lines)${R}`);
+      lines.slice(0, SHOW).forEach(line => writeToolLine(`${GR}⎿ ${line}${R}`));
+      if (lines.length > SHOW) writeToolLine(`${GR}⎿ … (${lines.length - SHOW} more lines)${R}`);
       break;
     }
   }
@@ -218,24 +495,26 @@ function truncate(s, max) {
 
 export function printPermissionPrompt(toolName, detail) {
   if (jsonIpc) return;
+  stopSpinner();
   const displayName = toolDisplayName(toolName);
   const detailLines = detail.split('\n');
   const preview = detailLines.slice(0, 8);
   const truncated = detailLines.length > 8;
   // Show the call like a tool call line, then the detail block
   const primary = truncate(detail.split('\n')[0], cols() - displayName.length - 4);
-  console.log(`\n${B}${Y}⏺ ${displayName}${R}${GR}(${primary})${R}`);
+  flushRoutineToolSummary();
+  writeToolLine(`${B}${Y}⏺ ${displayName}${R}${GR}(${primary})${R}`);
   if (detailLines.length > 1) {
-    preview.slice(1).forEach(l => console.log(`   ${GR}${l}${R}`));
-    if (truncated) console.log(`   ${GR}… (truncated)${R}`);
+    preview.slice(1).forEach(line => writeToolLine(`  ${GR}${line}${R}`));
+    if (truncated) writeToolLine(`  ${GR}… (truncated)${R}`);
   }
-  console.log(`\n  ${Y}Allow this tool call?${R}`);
+  writeToolLine(`${Y}Allow this tool call?${R}`);
 }
 
-export function printError(msg)   { if (jsonIpc) return; console.error(`\n  ${RE}✗ ${msg}${R}\n`); }
-export function printInfo(msg)    { if (jsonIpc) return; console.log(`\n  ${C}ℹ ${msg}${R}`); }
-export function printSuccess(msg) { if (jsonIpc) return; console.log(`\n  ${G}✓ ${msg}${R}`); }
-export function printWarning(msg) { if (jsonIpc) return; console.log(`\n  ${Y}⚠ ${msg}${R}`); }
+export function printError(msg)   { if (jsonIpc) return; stopSpinner(); finishToolSection(); console.error(`  ${RE}✗ ${msg}${R}\n`); }
+export function printInfo(msg)    { if (jsonIpc) return; finishToolSection(); writeAboveManaged(`  ${C}ℹ ${msg}${R}\n`); }
+export function printSuccess(msg) { if (jsonIpc) return; finishToolSection(); writeAboveManaged(`  ${G}✓ ${msg}${R}\n`); }
+export function printWarning(msg) { if (jsonIpc) return; finishToolSection(); writeAboveManaged(`  ${Y}⚠ ${msg}${R}\n`); }
 
 export function table(title, rows) {
   if (jsonIpc) return;
@@ -247,7 +526,9 @@ export function table(title, rows) {
       console.log(`\n  ${D}${row[0]}${R}`);
     } else {
       const [k, v] = row;
-      console.log(`  ${C}${String(k).padEnd(20)}${R}${W}${v}${R}`);
+      // Keep a visible delimiter even when a key is longer than the nominal
+      // column width (model IDs commonly are).
+      console.log(`  ${C}${String(k).padEnd(20)}${R}  ${W}${v}${R}`);
     }
   }
   console.log();
@@ -257,24 +538,26 @@ export function table(title, rows) {
 
 export function printQueued(item, count) {
   if (jsonIpc || !item) return;
+  setQueueCount(count);
   const preview = truncate(item.content.replace(/\s+/g, ' '), cols() - 24);
-  process.stdout.write(`\n  ${C}⊕ Queued (${count})${R} ${GR}${preview}${R}\n`);
+  writeAboveManaged(`  ${C}⊕ Queued (${count})${R} ${GR}${preview}${R}\n`);
 }
 
 export function printQueue(items) {
   if (jsonIpc) return;
-  if (!items.length) { console.log(`\n  ${GR}Queue empty.${R}`); return; }
-  console.log(`\n  ${B}Queued follow-ups (${items.length})${R}`);
-  items.forEach((it, i) => {
-    console.log(`  ${C}${String(i + 1).padStart(2)}.${R} ${GR}${truncate(it.content.replace(/\s+/g, ' '), cols() - 8)}${R}`);
-  });
-  console.log();
+  if (!items.length) { writeAboveManaged(`  ${GR}Queue empty.${R}\n`); return; }
+  const rows = [`  ${B}Queued follow-ups (${items.length})${R}`];
+  items.forEach((it, i) => rows.push(
+    `  ${C}${String(i + 1).padStart(2)}.${R} ${GR}${truncate(it.content.replace(/\s+/g, ' '), cols() - 8)}${R}`
+  ));
+  writeAboveManaged(`${rows.join('\n')}\n`);
 }
 
 export function printFollowUpDelivery(items) {
   if (jsonIpc || !items.length) return;
   const label = items.length === 1 ? 'follow-up' : `${items.length} follow-ups`;
-  process.stdout.write(`\n  ${P}↳ delivering your ${label}…${R}\n`);
+  setQueueCount(0);
+  writeAboveManaged(`  ${P}↳ delivering your ${label}…${R}\n`);
 }
 
 

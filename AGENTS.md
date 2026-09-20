@@ -1,5 +1,10 @@
 # agent-starter
 
+> **This file is the single source of truth for how agents work in this repo.**
+> `CLAUDE.md` and `GEMINI.md` point here. They used to be near-identical copies
+> and had already drifted — one said trim history to 50 rows, the other 20, and
+> GEMINI.md never learned the commit-attribution rule.
+
 Drop-in configuration for CLI AI agent sessions. Gives agents a single persistent file for history, context, commands, and tasks — loaded automatically at session start.
 
 ## Approach
@@ -39,7 +44,7 @@ Before responding to the user:
 After completing any request that meaningfully changes the project:
 
 - Append a row to the **History** section of `PERSIST.md` in this format: `| YYYY-MM-DD | <AgentName> | <one-line description> |`
-  Only log significant actions — skip trivial queries or repeated lookups. **Trim to the 20 most recent rows** after appending.
+  Only log significant actions — skip trivial queries or repeated lookups. **Trim to the 50 most recent rows** after appending.
 - Update the **Context** section only if project structure or purpose changed. Overwrite stale lines rather than appending.
 
 ## Git Commits
@@ -65,7 +70,7 @@ Add new feature ideas or plans to the **TODO** section of `PERSIST.md` with enou
 
 ## New File Template
 
-When creating `PERSIST.md` for the first time, initialize it with the following structure:
+When creating `PERSIST.md` for the first time, initialize it with the following sections:
 
 ```markdown
 # PERSIST
@@ -85,22 +90,22 @@ When creating `PERSIST.md` for the first time, initialize it with the following 
 ## History
 
 | Date | Agent | Action |
-|------|-------|--------|
+| ---- | ----- | ------ |
 
 ---
 
 ## Commands
 
 | Command | Description |
-|---------|-------------|
+| ------- | ----------- |
 
 ---
 
 ## TODO
 
-### Outstanding Tasks
+**Outstanding Tasks:**
 
-### Feature Ideas
+**Feature Ideas:**
 ```
 
 ## Token Efficiency

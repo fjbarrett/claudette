@@ -18,16 +18,43 @@
 
 import { makeOpenAICompatibleProvider } from './openai.js';
 
+function outputLimit(envName, fallback) {
+  const configured = Number(process.env[envName]);
+  return Number.isFinite(configured) && configured > 0 ? Math.floor(configured) : fallback;
+}
+
 export const CATALOG = [
   // ── Aggregator / hosting platforms (best fit for no-local-GPU setups) ──────
   {
     id: 'openrouter', label: 'OpenRouter', prefixes: ['openrouter/'],
     keyEnv: 'OPENROUTER_API_KEY', baseUrl: 'https://openrouter.ai/api/v1',
     baseUrlEnv: 'OPENROUTER_BASE_URL', family: 'aggregator',
-    models: [
-      'openai/gpt-4o', 'anthropic/claude-3.7-sonnet', 'google/gemini-2.5-pro',
-      'meta-llama/llama-3.3-70b-instruct', 'deepseek/deepseek-chat',
-    ],
+    modelsPath: '/models?supported_parameters=tools',
+    selectModels: payload => {
+      const freeTools = (payload.data ?? [])
+        .filter(model => model.supported_parameters?.includes('tools'))
+        .filter(model => Number(model.pricing?.prompt) === 0 && Number(model.pricing?.completion) === 0)
+        .map(model => ({
+          id: model.id,
+          family: model.id.split('/')[0] || 'openrouter',
+          paramSize: 'free',
+          capabilities: ['tools'],
+          access: { free: true, kind: 'recurring', provider: 'openrouter' },
+          contextLength: model.context_length ?? null,
+        }));
+      // The free router selects a zero-cost route that supports the features
+      // present in the request, including tools. `openrouter/free` is the API
+      // id; Claudette's prefix stripping turns our friendly alias into `free`,
+      // so transformModel restores the official id below.
+      return [{
+        id: 'free', family: 'openrouter', paramSize: 'free', capabilities: ['tools'],
+        access: { free: true, kind: 'recurring', provider: 'openrouter' },
+      }, ...freeTools];
+    },
+    defaultModels: { agent: 'openrouter/free', judge: 'openrouter/free' },
+    freeTierDefaults: true,
+    transformModel: id => id === 'free' ? 'openrouter/free' : id,
+    maxTokens: () => outputLimit('OPENROUTER_MAX_TOKENS', 1_024),
   },
   {
     id: 'together', label: 'Together', prefixes: ['together/'],
@@ -54,7 +81,14 @@ export const CATALOG = [
     keyEnv: 'GEMINI_API_KEY', altKeyEnvs: ['GOOGLE_API_KEY'],
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     baseUrlEnv: 'GEMINI_BASE_URL', family: 'gemini',
-    models: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.0-flash'],
+    models: [{
+      id: 'gemini-3.7-flash', family: 'gemini', paramSize: 'free',
+      capabilities: ['tools'],
+      access: { free: true, kind: 'recurring', provider: 'google' },
+    }],
+    defaultModels: { agent: 'google/gemini-3.7-flash', judge: 'google/gemini-3.7-flash' },
+    freeTierDefaults: true,
+    maxTokens: () => outputLimit('GEMINI_MAX_TOKENS', 1_024),
   },
   {
     id: 'xai', label: 'xAI Grok', prefixes: ['xai/', 'grok/'],
