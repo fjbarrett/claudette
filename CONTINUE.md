@@ -1,215 +1,81 @@
 # CONTINUE
 
-Use this file to resume an interrupted active task. Read `AGENTS.md`,
-`CLAUDE.md`, and `PERSIST.md` as usual, then treat this file as the most current
-handoff for work in progress.
+## Commit checkpoint (2026-09-20, Muse Code session)
 
-## State: review + hardening + cleanup + library API + Terminal-Bench (2026-08-10)
+- Landed the dirty tree as 3 local commits on feature/review-hardening
+  (NOT pushed): 26d65f1 tooling/gates, e0ed6ec functional core, docs
+  commit. Each code commit was verified in an isolated worktree before
+  landing (C1: 334 pass/0 fail/2 skips; C2: 540 pass/0 fail/2 skips;
+  lint + typecheck clean, 20 bench tasks validate).
+- Full dirty-tree verification at session start: npm run lint 58 files
+  clean; npm test 542 total / 540 pass / 0 fail / 2 live skips.
+- Continuous stress loop is DEAD: no process matching stress-streams or
+  the recorded PID 80600; artifact root no longer lists. Decide whether
+  to restart it or close the continuous-testing goal.
+- SE3 app-identity question still unanswered; no app build/install done.
+- Next TODO in order: project-scale eval matrix (Kimi/DeepSeek first),
+  then MCP client, subagents Phase 2+, persisted permissions,
+  Terminal-Bench 10-20 task slice, benchmark rebaseline, verify-grep to
+  real tests, Windows port.
 
-All committed and pushed on `feature/review-hardening`. **318 tests, 316 pass, 0 fail.**
+## Active objectives (2026-09-05)
 
-### The three things that now work
-1. **CLI** — `npm link` puts `claudette` on PATH. `-p` headless, `--json-ipc`,
-   `--continue`/`--resume`, Tab completion.
-2. **Library** — `import { run, stream, createAgent } from 'claudette'`
-   (`index.js` + `index.d.ts`, `main`/`exports`/`files` in package.json).
-   Verified as a linked consumer, against both Ollama and OpenRouter.
-3. **Terminal-Bench** — Harbor adapter runs claudette in the task container
-   against **host Ollama** (loopback rewritten to `host.docker.internal`), so runs
-   are free. `openssl-selfsigned-cert`: 5/6 grader tests, reward 0.0.
+- Continue Claudette testing indefinitely across varied inputs/environments until the user stops or redirects; persistent goal remains active. Do not mark complete just for a testing checkpoint.
+- Latest user steering: updated build missing on SE3. App clarification is still unanswered. Connected iPhone SE3 device9BAAC8CE-F98B-5909-B57C-7AD036BE0CBD; Claudette is a Node CLI with no iOS project. Developer apps observed: Caption Crunch(build14), Command, Insight(build1), Keep(build1), Namespace(build1), tru|med. No app build/install performed. Await app identity, then build/install within existing authorization; don't install an arbitrary app.
+- Branch feature/review-hardening. Preserve all pre-existing dirty files and the user's running Scanner CLI/session/source. No commits made/requested.
 
-### Local performance — the machine is fine, the config was not
-M1 Max / 32GB. Two fixes worth ~100x combined:
-- `think:false` by default — these are reasoning models burning ~1k tokens per
-  step before answering. 27b 17.2s→0.8s; 35b-a3b 11.6s→0.4s.
-- Use the **a3b MoE** (52.8 tok/s), never the dense 27B (9.2 tok/s).
-Full agentic turn: 49s. Suite: 60s offline / 102s live. Cloud nano: 2.0s.
-RAM is the real limit — one 24GB model resident leaves little room, and swapping
-models costs 20-120s. Pick one and stay on it.
+## Completed latest checkpoint: shell lifecycle
 
+- Added src/bash-process.js, updated src/tools.js, added14 regressions in test/shell.test.js. Foreground execution now uses spawn because Node execFile does not forward detached. POSIX commands own a process group; abort, deadline and output overflow kill that group with SIGKILL. Stop reason persists independently of eventual exit status. Explicit successful background commands retain their lifecycle. Windows only terminates the direct child; native Windows/Linux still unverified.
+- Reproduced7 failures before fixes: orphaned children on abort/timeout, a SIGTERM-ignoring foreground command falsely succeeding after deadline, uncapped failed output250027chars, lost capture-limit reason, malformed truncated emoji, and fractional timeout0 disabling deadline.
+- Capture remains bounded at2MiB per stdout/stderr. Failed output now honors text cap; capture-limit errors identify their cause; truncation preserves surrogate pairs; timeout overrides clamp to1..2147483647ms.
+- Tests additionally cover byte-split UTF8,128 Unicode budgets,12 timeout values,8 simultaneous captures, unrelated sibling isolation, strict macOS broker cancellation, pre-abort no writes, intentional background survival, missing executable and external signal causes.
+- FINAL FULL: Node20.20.2 has533total/530pass/3skip; Node22.23.2 and Node24.18.0 have533total/531pass/2skip; all zero failures. Node20 extra skip is unsupported positive coverage in tooling tests. Native coverage79.79% lines/76.59% branches/78.20% functions. New helper97.22% lines/81.82% branches/100% functions.
+- Matrix36 configurations (Node20/22/24, heap64/128/256MiB, pool1/8, normal/zero-filled buffers, UTC/C or Asia-Tokyo/Japanese locale) passed all504 shell test executions. Three configurations at once.
+- Syntax57 modules, strict public type check and whitespace pass. Packed runtime modules byte-identical; isolated package public Bash API smoke passed. Docker read-only probe found daemon unavailable; no Docker/power settings changed.
+- Report docs/testing-shell-2026-09-05.md; Changelog and PERSIST updated, history50 rows. No commits. All one-shot sessions closed.
+- New evidence: shell-before.log, shell-after.log (execFile-detached attempt still leaked), shell-spawn-after.log, shell-expanded.log, shell-node20-full.log, shell-node22-full.log, shell-node24-coverage.log, shell-matrix.json and shell-matrix/, shell-package/. Baseline originals in shell-baseline/.
 
-A full program review found four defects (three reproduced live) plus a set of
-structural gaps; a second pass then finished the "before 1.0" security items and
-cleaned the repo. All committed on `feature/review-hardening`. Details in
-`Changelog.md` under `[Unreleased]`.
+## Previous verification tooling checkpoint
 
-**Suite: 306/306, live model tests included.**
+- scripts/run-tests.mjs handles portable discovery/environment, failure/cancellation status, Node22/24 coverage thresholds70%lines/60%branches. test:split aliases full suite; live clears inherited skip flag.
+- Pinned dev-only TypeScript7.0.2 + lockfile; tsconfig.types.json and test/types/api.ts check strict public declarations/consumer contract. Corrected maxTotalChars declaration. Runtime zero-dependency.
+- Both npm launcher and stress coordinator clear NODE_TEST_CONTEXT, which previously caused nested test files to be skipped with exit0. Seven tooling regressions cover failure/empty-suite/coverage/cancellation/environment and coordinator fail-fast.
+- Fresh dev/prod installs, injected invalid TypeScript exit1 and packed consumer compilation passed. Report docs/testing-tooling-2026-09-05.md. GitHub Actions/native Windows/Linux were not executed here.
 
-### What changed, and why it mattered
+## Continuous testing and retained failure
 
-**Security**
-- Removed the exact-bash shortcut. It scanned the *@file-expanded* prompt for
-  "Call bash with EXACTLY this command…" and ran the rest through `executeTool`
-  with no `checkPermission`. Verified exploitable: a `notes.md` carrying that
-  sentence plus `please summarize @notes.md` executed a command before any model
-  request. The two bench tasks that used it (`count-lines-tool`,
-  `extract-print-help`) are rewritten as genuine task descriptions.
-- Bash "always" approval is scoped to the exact command (`permissionKey`). It
-  used to authorise every later command in the session.
+- Original run exec68643/PID75702 is CLOSED, exit1. continuous/ contains1251 passing batches(2,502,000 generated cases) then failed batch1252, seed4228604849, heap128MiB, Europe/Berlin/de_DE.UTF-8. All2000 generated cases passed; separate HTTP cancellation test timed out after~130s against15s limit.
+- Host pmset log shows Sleep10:38:40 Arizona → DarkWake10:40:52 (132s), coinciding with failed batch. Strong evidence of suspension-associated timeout; no assertions/timeouts weakened. Exact seed/environment replay32/32 passed in1.17s.60 repeats across Node20/22/24 and pools1/4 passed360 cancellation scenarios. Preserve original failure and power log.
+- CURRENT LOOP: exec session18062, PID80600; continuous-02/ and continuous-02.log below artifact root. Last verified 712 batches / 1424000 generated cases, zero failures, process live. Starts seed4228604849,2000 cases/batch, heap128/256/512MiB and4 TZ/locales. Stop with SIGTERM only when appropriate; new script marker cleanup doesn't alter existing loop whose parent didn't inherit that marker.
+- All one-shot verification exec sessions are closed. Goal remains active.
 
-**Correctness**
-- `dropOrphanToolMessages` strips `role:'tool'` messages with no preceding
-  `tool_calls` from outbound payloads. The shortcut wrote those, and OpenAI/Azure
-  reject the whole request — poisoning the session for every later prompt.
-- `--json-ipc` no longer drops prompts 2..N (`createLineQueue` in `src/input.js`).
-- Compaction archives to `data/sessions/archive/` before summarising.
-- Session writes go through `writeFileAtomic`.
+## Prior checkpoints and evidence
 
-**Structure — the important one**
-- `src/agent-runner.js` now owns the loop. `chat.js` is a terminal/permission/
-  session shell around `runAgent()`, and `bench/evals.js` runs the same loop
-  instead of its own simpler copy. Hooks: `emit(type,data)`, `onDelta`, `approve`,
-  `takeFollowUps`, `onMaxIterations`. Every appended message is emitted **by
-  reference**, so mirroring into `session.messages` picks up in-place edits (the
-  act nudge appends to the last tool result).
-- Text tool-call parsing moved to `src/tool-call-parser.js`.
-- `chat.js` re-exports the moved helpers, so existing importers are unaffected.
+- Artifact root: /var/folders/xn/5987rxq95wjbb6mvn_m06l1c0000gn/T/claudette-ongoing-vf7haq54
+- Latest logs: tooling-node20-complete.log, tooling-node22-complete.log, tooling-coverage-complete.log, tooling-all-complete.log, tooling-install-results.json. Pre-fix: coverage-script-before.log, types-before.log, tooling-first.log, stress-context-before.log, stress-context-regression-before.log. Cancellation: continuous/batch-001252.log, continuous-failure-replay.log, continuous-failure-power.log, cancellation-repeats.json.
+- Prior filesystem: docs/testing-filesystem-2026-09-05.md; instruction-cache freshness, ordered session/transcript persistence, archive uniqueness, bounded atomic temp basenames.14 regressions,60 configurations/840 executions passed; prior full510pass/2skip all3 Nodes.
+- Prior streaming: docs/testing-streams-2026-09-05.md;32 tests for UTF8/framing/errors/EOF/cleanup/cancellation, deterministic and seeded cases. MiniMax2/3 and GLMFlash0/3 live Unicode strict cases retained as model-format failures.
+- Prior broad review: docs/testing-2026-09-05.md and /var/folders/xn/5987rxq95wjbb6mvn_m06l1c0000gn/T/claudette-stress-c15tc805. Scanner638pass/17skip/82.87%;139 source files preserved. Native /copy6cases passed with original clipboard restored. Do not repeat unchanged Scanner.
 
-**Reliability** — `src/retry.js`: backoff + jitter, `Retry-After`, no retry once
-bytes have streamed, stall watchdog that reports a plain Error (never an
-`AbortError`, which the loop reads as user-cancel).
+## Tool-call log and next steps
 
-**Added** — `-p` headless, `--continue`/`--resume`, Tab completion, `npm test` (offline) /
-`npm run test:live`, GitHub Actions CI on Node 20/22/24.
+- This goal turn is progress: revalidated continuous process, inspected/snapshotted shell code, added real-process regressions and retained seven pre-fix failures.
+- Initial execFile detached attempt fixed6/8; inspected installed Node source proving detached was discarded. Replaced only foreground capture/lifecycle with spawn helper; all14 expanded regressions passed including strict broker isolation.
+- Full Node20/22/24 and36 runtime/heap/pool/buffer configurations passed. Verified packaged runtime, types, syntax and whitespace; updated reports/history. All one-shot sessions are closed.
+- Final call records fresh continuous PID/count evidence and current handoff. Goal remains active, stream loop continues. Next: revalidate loop, then expand remaining shell diagnostics/broker failure scenarios or native platform verification with concrete new cases. Do not rerun unchanged suites without a reason. SE3 remains pending app clarification; avoid repeating the same unanswered question.
 
-### Tests
-**318 total: 316 passing, 0 failing** (2 live-model tests skip without `CLAUDETTE_SKIP_LIVE`; `npm run test:live` runs them).
-Those 12 live tests used to hardcode `llama3.2:latest`, which was not installed, so
-they failed on every machine and were miscategorised in PERSIST as
-"env-dependent". They now discover an installed Ollama model (smallest that
-advertises `tools`) and skip with a reason when Ollama is absent. `llama3.2:3b`,
-`qwen3:4b` and `qwen2.5-coder:7b` were pulled for this; discovery picks
-`llama3.2:3b`, which runs each Stress prompt in 2-9s instead of the 118-240s a 27B
-model took. The `normalizeArgs` tests asserted against an inlined copy of the alias
-tables in a subprocess; they import the real function now.
+- New goal turn: previous turn made progress through shell lifecycle fixes and verified runtime/matrix/package results. Next: revalidate continuous process and inspect/test broker exception, disconnect, cancellation and concurrency paths with isolated IPC fixtures.
+- Continuous PID80600 verified live at741batches/1482000cases. Broker currently invokes execute before Promise.resolve can catch a synchronous throw, and client.close rejects callers without sending cancellations. Next: reproduce these with focused tests plus concurrent/disconnect/schema stress.
+- Added6 broker tests covering synchronous throws,32-command client close,96 mixed/reordered outcomes,48-command disconnect,40 malformed field variants and active duplicate IDs. Pre-fix session48212 active; next collect exact failures before targeted fixes.
+- Broker baseline4pass/2fail confirms uncaught synchronous executor exception and32 commands left active after client.close. Next: contain invocation failures without changing dispatch timing, normalize results inside rejection handling, and cancel pending command IDs on client close.
+- Both broker fixes pass all6 tests. Next: verify production IPC with forked processes, synchronous/async/conversion failures, client-close cancellation acknowledged before disconnect, and aborted handshakes.
+- Expanded broker suite to9 tests including72 mixed outcomes over real fork IPC,24 client-close cancellations while transport stays connected, and pre-handshake abort. Command exited0; next verify reported execution counts and ensure forked actors actually ran rather than inherited-test skipping.
 
-Verified live against local Ollama: headless `-p` returns a clean, pipeable answer
-and exits 0.
+## Auths integration (separate task, 2026-09-09)
 
-### Mid-turn steering (done 2026-08-11)
-Typing while the agent works now queues a follow-up in **any TTY session**; it
-previously required `--yolo`. The blocker was stdin ownership — `checkPermission`
-wanted readline's `question()` while the raw-mode reader held stdin — so both now
-share one reader: `InputController.awaitApproval()` parks the prompt, `submit()`
-sends `y`/`n`/`a` to it and queues everything else. Ctrl+C denies a parked
-approval before aborting; `runTurn`'s finally settles one if the turn dies.
+- Auths will add an optional `execute` callback to the exported `runAgent` so its research tools use the existing loop with a scoped executor. Default Claudette tools remain unchanged. Existing dirty work and continuous testing are preserved. Next call applies that two-line extension; verification lives in `/Users/frank/Code/auths/tests/ai.test.ts`.
 
-Verified in a real pty with `expect` (`scratchpad/steer.exp`) — blind
-timing cannot test this, because a `y` sent before the prompt appears correctly
-becomes a follow-up. Observed: prose queued at the `[y/n/a]` gate, prompt still
-waiting, `y` then ran the tool, queue drained at the safe boundary, model acted
-on the steer.
+- Auths executor hook is applied and its integration tests pass: custom tool dispatch, unoffered-shell rejection, URL/repository boundaries, cancellation and cloud-only routing. Local app completed a DO/VPN capture through Claudette. Next: commit only the two executor lines; all pre-existing dirty changes and the ongoing test task remain untouched.
 
-**Known edge, not fixed:** slash commands other than `/queue` typed mid-turn are
-queued as prose and sent to the model — so `/exit` during a turn steers rather
-than exits. Ctrl+C is the documented interrupt. Decide the intended behaviour
-before changing it.
-
-### Repetition guard (done 2026-08-11)
-Built after a live session on `24p.mov` re-issued the same five curl commands 30
-times running, for 37 minutes. `createRepeatDetector` compares each response by
-`responseSignature(calls)` — tool names + normalised arguments, prose excluded —
-and nudges when the same signature repeats 3× (`CLAUDETTE_REPEAT_GUARD`, 0
-disables). Two ignored nudges end the turn with status `'repeating'`.
-
-Why nothing caught it before: the act nudge counts read-only streaks and a
-**successful** `bash` resets that streak, so a loop of successful identical
-commands looked like progress every iteration. `maxIterations` (150) was the only
-backstop, ~2h away at 75s/iteration. The guard stops it in ~9.
-
-Checked *after* the batch executes (keeps tool_call/tool_result pairing valid)
-and in the else-branch of the follow-up drain, so an automated nudge never stacks
-a second adjacent user message on a delivered follow-up.
-
-### Model bake-off — RESUMED (2026-08-11 evening)
-
-The paused run's table was in a session scratchpad and was gone by the next
-session. It has been **recovered and made durable**: the JSON reports it was
-derived from were in `bench/runs/evals/` the whole time, so
-`node bench/eval-summary.js --since 2026-08-11 --write` now rebuilds
-**`bench/BAKEOFF.md`** (tracked; the reports stay gitignored). Keyed on the
-latest result per model *and* case, because a bake-off gets run in pieces.
-
-The 3 lost "harder" cases were not recovered — four new ones were written
-instead, aimed at what actually separates models here rather than at whether a
-model can call a tool at all:
-`multi-file-rename`, `fix-failing-test`, `already-correct`, `ambiguous-anchor`.
-They needed assertions the harness lacked: `files.excludes` (the change landed
-but the rewrite dropped everything else), `files.absent`, and a `maxToolCalls`
-budget — which is how correctness ties break.
-
-**Do not compare a cached run against a live one.** `bench/evals.js` used to
-turn the response cache ON by default; it is now opt-in (`--cache`).
-
-#### Result so far — winner on this machine: `qwen3.6:35b-a3b-q4_K_M`
-**9/9 in 161s.** The only other clean sweep, `qwen3.6:27b-opencode`, takes
-**698s for the same work** — 4.3x, and the dense/MoE split is the whole gap.
-Full table in `bench/BAKEOFF.md` (regenerate with `bench/eval-summary.js --write`).
-
-Read the table with two caveats:
-- `qwen3.6:35b-a3b-opencode`'s (the previous incumbent's) `multi-file-rename`
-  failure is **infrastructure, not the model** — Ollama auto-updated mid-run and
-  killed the request. Re-run that one case to settle it.
-- `qwen3-coder:30b`'s 6/9 predates the XML tool-call fix; its
-  `write-then-verify` failure was claudette failing to parse a correct call.
-  Re-run it for an honest number.
-
-**STOPPED at the user's request (needed the GPU/CPU) partway through
-`gpt-oss:20b`.** Not yet benchmarked: `gpt-oss:20b`, `devstral:24b`,
-`qwen3.6:27b-q4_K_M`. Skip `qwen3.6:latest` — same blob id (07d35212591f) as
-`qwen3.6:35b-a3b-q4_K_M`, so it is that model under a second tag.
-
-To resume (one pass per model — a swap costs 12-120s of load, so revisiting a
-model is the expensive mistake):
-```sh
-export CLAUDETTE_MAX_RETRIES=4
-for m in gpt-oss:20b devstral:24b qwen3.6:27b-q4_K_M; do
-  node bench/evals.js --model "$m" --all; ollama stop "$m"
-done
-node bench/evals.js --model qwen3-coder:30b --all            # re-run: XML parser fix
-node bench/evals.js --model qwen3.6:35b-a3b-opencode --case multi-file-rename
-node bench/eval-summary.js --since 2026-08-11 --write
-```
-
-**RAM is the binding constraint, not compute.** `qwen3.6:35b-a3b-coding-nvfp4`
-sat at 27GB resident on a 32GB machine: 31G used, 298MB free, 4.1GB swapped, and
-the machine unusable for anything else. It was still fast (8/9, 132s), but it is
-not a model to keep loaded while working. The q4_K_M winner is 23GB and leaves
-room.
-
-### Four bugs found by trying to read the bake-off numbers (2026-08-11 evening)
-1. **Retry backoff could be ~0.** Full jitter draws from `[0, exponential]`, so
-   three attempts fit inside a second. Now half jitter, and a *connection*
-   failure (nothing answering the socket, as against a 429 that answered) starts
-   from a 3s base. Found when Ollama **auto-updated itself mid-run**, SIGTERMed
-   its server, and took 8.4s to return — the run died with the case's context
-   thrown away. For unattended runs also set `CLAUDETTE_MAX_RETRIES=4`.
-2. **Anthropic cached input was not counted.** `input_tokens` is the *uncached*
-   remainder; OpenAI-compatible providers put the whole input in
-   `prompt_tokens`. A five-case eval billed 52 input tokens. `promptTokens` is
-   now the true total, with the cache split carried so `estimateCost` prices a
-   read at 0.1x and a write at 1.25x.
-3. **The bench cache replayed stale results.** Fixing (2) changed nothing
-   because the harness kept replaying a reply recorded before the fix — and a
-   replay also reports a near-zero duration, so a cached model looks instant.
-4. **A failed run threw away the provider error.** `runAgent`'s failed result
-   now carries it; that is why `openrouter/anthropic/claude-opus-5` scored 2/5
-   with no explanation (three runs died on a provider error, not on quality).
-
-### Next steps
-1. **Open a PR to main** (branch is pushed).
-2. **Rebaseline the benchmark.** `count-lines-tool` and `extract-print-help` were
-   4-5/10 *with* a shortcut that did the work; they will score lower now, honestly.
-   `npm run bench -- --task <id> --model <m> --judge <m>` (OpenRouter declares no
-   `DEFAULT_MODELS`, so pass both explicitly), then `npm run bench:leaderboard`.
-3. **MCP client** — the biggest remaining capability gap (9 hardcoded tools).
-4. **Browser parity** — `server.js` still has no tools and duplicates session
-   storage / @file expansion / the system prompt. The extraction unblocks it.
-5. **Subagents** — `docs/parallel-subagents-plan.md`; its Phase 1 (reusable runner)
-   is now done.
-6. **Queued follow-ups, Phase 3+** — phases 1-2 are done (see above). Next is
-   `Ctrl+B` to background a long-running Bash command, which shares a task
-   registry with `docs/parallel-subagents-plan.md`, then browser parity (a
-   server-side per-session queue).
-
-Both `docs/*-plan.md` remain user-owned and untracked — do NOT commit them.
+- Auths hook committed and pushed as b2607bf on feature/review-hardening. Only the optional executor parameter and dispatch line were staged; all earlier dirty changes remain. Auths stores its integration tests and independent model comparison in its own repo.
