@@ -15,6 +15,5 @@ prompt: |-
   5. Verify with `node --check src/chat.js`.
 verify:
   - "node --check src/chat.js"
-  - "grep -q 'function printHelp' src/chat.js"
-  - "grep -q 'printHelp()' src/chat.js"
+  - "node -e \"const fs = require('node:fs'); const s = fs.readFileSync('src/chat.js', 'utf8'); if (/^function printHelp\\(\\)/m.test(s) === false) throw new Error('no top-level function printHelp'); const start = s.indexOf('case \\'/help\\':'); if (start === -1) throw new Error('no /help case'); const tail = s.slice(start); const rel = tail.slice(20).search(/\\n\\s*case '/); const body = rel === -1 ? tail : tail.slice(0, 20 + rel); if (body.indexOf('printHelp()') === -1) throw new Error('/help case does not call printHelp()'); if (body.indexOf('ui.table(\\'Commands\\'') !== -1) throw new Error('inline help table still in /help case'); const tableCount = s.split('ui.table(\\'Commands\\'').length - 1; if (tableCount !== 1) throw new Error('help table must appear exactly once (moved, not copied): found ' + tableCount); console.log('printHelp extraction ok');\""
 judgeFocus: "Did the agent read chat.js, locate the /help handler, extract it into a named function, replace the inline code with a call site, and verify both the function definition and call exist? Penalise for rewriting unrelated code, defining the function in the wrong scope, or forgetting the call site."
