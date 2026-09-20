@@ -4,6 +4,28 @@
 
 ### Security
 
+- **macOS CLI sessions are now confined to their launch directory by default.**
+  Claudette re-executes under a Seatbelt workspace profile before loading
+  application code; persistent state, temp files, and dev-server logs move below
+  `.claudette/` in that workspace. A minimal trusted launcher brokers Bash over a
+  private authenticated Node IPC channel and applies exactly one stricter Bash
+  profile per command. It independently validates workspace/cwd, denies outside
+  file access, signals outside the command's own process tree, Apple Events, and non-loopback
+  networking, strips credential-like variables, and enforces wrappers, timeout,
+  cancellation, and output caps. These protections remain active under `--yolo`.
+  `CLAUDETTE_TOOL_ENV_ALLOW` names deliberate environment exceptions, while
+  `CLAUDETTE_WORKSPACE_SANDBOX=0` is an explicit unsafe opt-out.
+- **Outbound model Bash networking now has an explicit scoped opt-in.** The
+  macOS default remains loopback-only, including under `--yolo`. Launching with
+  `--network` (or `CLAUDETTE_BASH_NETWORK=1`) removes only the Bash egress denial;
+  workspace filesystem confinement, cwd validation, signal/AppleEvent denial,
+  credential scrubbing, timeouts, and the authenticated broker remain enforced.
+  Exact macOS resolver socket/config reads make DNS work without exposing a host
+  directory. Startup and `/config` make the elevated network mode visible.
+- **Remote web access now requires an explicit security boundary.** A non-loopback
+  bind is rejected without a bearer token and exact Host allowlist. API requests
+  enforce the token plus Host/Origin checks, responses use a restrictive CSP, and
+  request/report/session inputs are bounded and schema-validated.
 - **A symlink inside the workspace could read and write outside it.** `guardPath`
   compared relative paths, which catches `../etc/passwd` but not
   `ln -s /etc/passwd notes.txt` — that link is lexically innocent, and
@@ -35,7 +57,151 @@
   approved every command for the rest of the session. Bash approvals are now
   scoped to the exact command (`permissionKey`), and the prompt says which.
 
+### Changed
+
+- **Foreground Bash cancellation and deadlines stop the POSIX command group.**
+  A spawn-based helper fixes orphaned children and commands that ignored SIGTERM
+  then falsely reported success after their deadline. Successful intentional
+  background commands keep their lifecycle. Failed output is now capped,
+  capture-limit errors identify their cause, Unicode truncation preserves emoji,
+  and timeout overrides cannot round down to a disabled deadline.
+
+- **Verification commands now enforce their results.** Type checking uses a
+  locked development-only compiler and strict public API consumer checks;
+  declarations now include the supported `maxTotalChars` trimming option.
+  Native Node 22/24 coverage enforces 70% lines and 60% branches, including in
+  Node 24 CI. Test discovery avoids shell globs, clears inherited nested-run
+  state, and propagates failures and interruption. CI no longer masks compiler
+  or dependency-audit failures.
+
+- **Persistence now preserves newer state under concurrent saves.** Direct saves
+  supersede older debounced snapshots; session and transcript publications run
+  in order per session, and flushes wait for in-flight work. Archive names remain
+  unique when timestamps collide. Transcript queue eviction publishes its latest
+  view, instruction caching detects ancestor/file/boundary changes, and atomic
+  writes support long legal filenames. Fourteen regressions passed across three
+  full runtime suites and 60 filesystem stress configurations.
+- **Provider streams now handle framing, interruption and failures consistently.**
+  Ollama, Anthropic and OpenAI-compatible adapters share UTF-8/SSE framing,
+  release response readers, surface streamed errors and malformed records,
+  reject premature EOF, and stop processing buffered text after cancellation.
+  A separate streaming suite covers packet boundaries, Unicode, tool arguments,
+  large replies and concurrency. `scripts/stress-streams.mjs` runs reproducible
+  finite or continuous batches across seeds, memory limits and environments.
+- **Tool activity is quieter and separate from conversation text.** Interactive
+  prompts and assistant replies no longer interleave with a permanent row for
+  every routine inspection. A dedicated `Tools` block combines consecutive
+  successful reads, listings, globs, and searches into one counted summary,
+  while Bash, writes, edits, approvals, and failures remain explicit. Derived
+  transcripts use the same separation and omit successful routine result bodies;
+  exact provider message history remains in session JSON for safe resumes.
+  Persisted traces compact completed exploration lifecycles without changing
+  usage call counts.
+- **Automatic model selection now starts with the cross-platform benchmark
+  winners.** When installed and live, Ollama Cloud Kimi K2.7 Code and DeepSeek
+  V4 Pro lead the shared CLI/library/browser/eval/rotation order, followed by
+  the other models that scored at least 8/11. Existing provider fallbacks remain
+  available, explicit model choices still win, and missing tags are never pulled.
+
 ### Fixed
+
+- **Stress testing closed more verification and sandbox gaps.** Discovery through
+  package wrappers, pytest addopts/environment settings, and Make dry runs no
+  longer verifies an edit; redirecting output to `/dev/null` no longer creates a
+  false edit. Metadata-only access to the `/etc` alias lets nested macOS login
+  shells load already-readable system profiles without contaminating worker logs.
+  Added generated edge cases, clipboard failure tests, and an opt-in native
+  clipboard/CLI harness that preserves the original clipboard in memory.
+- **Reviews distinguish test discovery from verification.** Bash results label
+  pytest collection coverage and masked checker exit statuses as inconclusive;
+  collection, help, version, and dry-run commands cannot satisfy the verification
+  gate. Shared CLI/library/eval instructions require findings grounded in inspected
+  code and existing configuration, distinguish statement counts from file lengths,
+  and discourage lowering quality gates to accommodate incomplete checks. A new
+  read-only review eval checks these mistakes against a seeded boundary defect.
+- **Disk SQLite and mypy caches work in macOS home-directory workspaces.**
+  Strict Bash now permits metadata reads of `/Users`, which SQLite needs while
+  resolving workspace paths. Directory listings, outside reads/writes, and
+  network restrictions remain unchanged.
+- **Repeated failures cannot evade the guard by changing arguments.** Three
+  matching terminal Bash exceptions now request a final evidence-based answer;
+  successful edits/checks and user steering reset the counter. This prevents
+  dozens of ineffective variations of the same SQLite or tooling failure.
+- **Blocker explanations no longer trigger impossible verification loops.**
+  Once tools are disabled, the verification gate accepts the final explanation.
+  Removing only known Python/tool caches no longer counts as a source edit.
+- **Bash pipelines preserve failing exit statuses.** `pipefail` is enabled for
+  direct and brokered Bash so filtering test output through `head` or `tail`
+  cannot silently turn a failing check into a successful tool result.
+- **Library streams stop their work when callers stop reading.** Streams start
+  on first iteration, abort on early exit, and wait for provider/tool cleanup.
+  Reusable agents remain busy through cancellation and honor their default
+  AbortSignal; abandoned streams leave conversation history unchanged.
+- **Verification follows edits within compound Bash commands.** A passing check
+  after an edit in the same command now satisfies the gate; a later edit, even
+  in a command that exits with an error, invalidates previous checks. Environment
+  prefixes, Python `compileall`, and dependency audits are recognized without
+  treating ordinary generated artifacts as source edits.
+- **Syntax checks no longer silently pass on broken JavaScript.** `npm run lint`
+  and CI check every tracked or new, non-ignored JS/MJS/CJS file, preserve errors
+  across files, and handle paths with spaces and deleted tracked files.
+- **Tab completion no longer crashes on Node 24.** The promise-based readline
+  interface now receives an async completer that returns its tuple instead of a
+  callback-style function that returned `undefined` and triggered an internal
+  destructuring `TypeError` on Tab.
+- **Sandboxed builds can manage their own worker processes.** The signal rule
+  now allows a command to terminate children in its inherited sandbox while
+  continuing to deny the launcher parent and unrelated processes. This fixes
+  Next.js production builds that crashed with `kill EPERM` during worker cleanup.
+- **Background-server logs now use a canonical private control path.** A launch
+  from macOS's `/tmp` spelling could serve traffic while Seatbelt rejected log
+  creation under the canonical `/private/tmp` workspace, leaving the returned
+  path absent and output attached to `/dev/null`. Claudette validates the
+  non-symlink control directory, creates/redirection-checks the log inside the
+  strict profile, and fails closed if logging cannot be established.
+- **Model-issued Bash now uses an existing workspace Python virtualenv.** A
+  canonical, non-symlink `.venv` or `venv` is placed on `PATH` and exposed as
+  `VIRTUAL_ENV` before commands run, including inside the strict macOS sandbox.
+  PEP 668 `externally-managed-environment` failures now explicitly explain that
+  system-Python protection is not evidence of a read-only workspace and direct
+  the agent to the project virtualenv. The loopback-only network boundary is
+  unchanged.
+- **Xcode-backed tools now work inside the strict macOS Bash sandbox.** The
+  launcher resolves and canonicalizes the system-selected developer root before
+  Seatbelt starts, grants read-only access to that one Xcode/Command Line Tools
+  tree (never all of `/Applications`), and removes inherited `DEVELOPER_DIR`.
+  Sandboxed tools use private workspace-local `HOME`/`TMPDIR` directories and
+  can read system entropy devices, while outside writes, host-temp writes,
+  external networking, unrelated signals, and Apple Events remain denied.
+- **Cross-platform benchmark copies no longer parse macOS metadata as data.**
+  Eval cases, YAML/JSON tasks, eval summaries, and leaderboard reports accept
+  only visible regular files with supported extensions, ignoring AppleDouble
+  `._*` sidecars and extension-shaped directories. CLI table tests also strip
+  terminal control codes instead of depending on ambient `NO_COLOR`.
+- **Model Bash no longer fails before execution under the macOS workspace
+  sandbox.** Applying a restrictive `sandbox-exec` inside the already sandboxed
+  CLI failed with status 71 (`sandbox_apply: Operation not permitted`), and a
+  first broker revision placed its socket under inaccessible `/tmp`. Direct
+  parent/child IPC removes the filesystem socket and nested Seatbelt composition.
+  Real sandboxed CLI coverage now exercises local `wc`, `cat`, Python, Node, npm,
+  loopback, outside access, external network, process signaling, Apple Events,
+  secret scrubbing, cancellation, broker death, and all CLI modes.
+- **The agent now stops after the second identical failed tool call.** Required
+  tool arguments throw consistently, unoffered tools are paired with an error
+  without execution, remaining calls are paired/cancelled at the failure limit,
+  and the next response must explain the blocker with tools disabled. The prompt
+  carries the same continuation rule across `/model` switches.
+- **Pipelines and masked commands no longer satisfy the verification gate.** A
+  failing test followed by `|| true`, piped through another command, run in the
+  background, or hidden before `; echo done` cannot be recorded as verification.
+- **Harbor benchmark installs are reproducible.** The adapter pins Harbor 0.22.0,
+  NVM v0.40.2 (with a checked installer hash), and Node 22.23.2; it requires a
+  full Claudette commit SHA and rejects unknown provider prefixes instead of
+  silently treating them as local Ollama models.
+- **Browser chat no longer maintains a second agent and session engine.** Web
+  turns run through the shared `runAgent()` with an empty tool list, while CRUD,
+  transcripts, and context expansion use the shared private persistence and
+  workspace guards. Tool-shaped browser output remains inert text.
 
 - **Cached input tokens were not counted, so a long session under-reported its
   cost by orders of magnitude.** Anthropic's `input_tokens` is the *uncached*
@@ -114,6 +280,11 @@
   end and on exit (`CLAUDETTE_TRANSCRIPT_THROTTLE`).
 
 ### Added
+
+- **`/copy` copies the last assistant message to the clipboard.** Preserves raw
+  Markdown, Unicode, and line breaks; supports macOS, Windows, and Linux desktop
+  clipboard utilities, with clear empty-history and unavailable-clipboard messages.
+  Listed in `/help` and Tab completion.
 
 - `bench/eval-summary.js` — rebuilds `bench/BAKEOFF.md` (a ranked model table
   plus a per-case coverage matrix) from the eval reports on disk, keyed on the
