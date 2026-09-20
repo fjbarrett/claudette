@@ -5,7 +5,7 @@
  * consumers get completion and checking without a build step.
  */
 
-export type RunStatus = 'completed' | 'cancelled' | 'failed' | 'max_iterations';
+export type RunStatus = 'completed' | 'cancelled' | 'failed' | 'max_iterations' | 'repeating';
 
 export interface Message {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -34,9 +34,10 @@ export interface ToolCallRecord {
 export interface AgentEvent {
   type:
     | 'iteration_start' | 'request_start' | 'stream_started' | 'request_end'
-    | 'usage' | 'message' | 'assistant_text' | 'tool_call' | 'tool_denied'
-    | 'tool_result' | 'act_nudge' | 'verify_nudge' | 'iteration_end'
-    | 'cancelled' | 'failed' | 'completed' | 'max_iterations'
+    | 'usage' | 'message' | 'assistant_text' | 'tool_call' | 'tool_start' | 'tool_denied'
+    | 'tool_result' | 'act_nudge' | 'verify_nudge' | 'post_verify_nudge'
+    | 'repeat_nudge' | 'tool_failure_limit' | 'iteration_end'
+    | 'model_switch' | 'cancelled' | 'failed' | 'completed' | 'max_iterations' | 'repeating'
     | 'text' | 'result';
   [key: string]: unknown;
 }
@@ -44,10 +45,12 @@ export interface AgentEvent {
 export interface RunOptions {
   /** `provider/model`, e.g. "openrouter/openai/gpt-5-nano" or a bare Ollama id. */
   model?: string;
-  /** Workspace root. The agent cannot read or write outside it. */
+  /** Workspace root for structured file tools. */
   cwd?: string;
-  /** Enable tool use. Default true; false makes this a plain completion. */
+  /** Enable structured tool use. Default false. */
   tools?: boolean;
+  /** Include the unsandboxed Bash tool. Default false and only applies with tools:true. */
+  allowShell?: boolean;
   /** Permission gate. Default allows everything — a script has nobody to ask. */
   approve?: (name: string, args: Record<string, unknown>) => boolean | Promise<boolean>;
   maxIterations?: number;
@@ -58,9 +61,9 @@ export interface RunOptions {
   system?: string;
   /** Append to the base system prompt. */
   append?: string;
-  /** Load CLAUDE.md / CLAUDETTE.md by walking up from cwd. Default true. */
+  /** Load CLAUDE.md / CLAUDETTE.md by walking up from cwd. Default false. */
   projectInstructions?: boolean;
-  /** Expand `@path` tokens in the prompt into file contents. Default true. */
+  /** Expand `@path` tokens in the prompt into file contents. Default false. */
   expandAtFiles?: boolean;
   /** Prior conversation to continue. */
   messages?: Message[];
@@ -84,6 +87,8 @@ export interface RunResult {
   /** `@paths` expanded into the prompt. */
   files: string[];
   model: string;
+  /** Models attempted in order, including automatic free-model fallbacks. */
+  attemptedModels: string[];
 }
 
 /** Run one agent turn to completion. */
@@ -118,6 +123,8 @@ export function runAgent(options: Record<string, unknown>): Promise<{
   usage: Usage;
   iterations: number;
   toolCalls: ToolCallRecord[];
+  model: string;
+  attemptedModels: string[];
   /** The provider error behind a `failed` run; null otherwise. */
   error: Error | null;
 }>;
@@ -139,6 +146,6 @@ export function getModels(): Promise<Array<{ name: string; family: string; param
 export function providerFor(model: string): unknown;
 export function missingCredential(models: string[]): { model: string; env: string; label: string } | null;
 export function parseTextToolCalls(text: string): unknown[];
-export function trimToolOutputs(messages: Message[], options?: { keep?: number; minChars?: number }): Message[];
+export function trimToolOutputs(messages: Message[], options?: { keep?: number; minChars?: number; maxTotalChars?: number }): Message[];
 export function estimateCost(model: string, usage: Partial<Usage>): number | null;
 export function formatUsd(value: number | null): string;

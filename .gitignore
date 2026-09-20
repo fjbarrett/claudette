@@ -5,6 +5,7 @@ node_modules/
 # Generated agent state. Sessions, transcripts, usage logs and prompt history
 # are per-machine records, not sources, and they grow without bound.
 data/
+.claudette/
 
 # Benchmark output: worktree runs, reports, the request cache, and the sandbox
 # tasks write into.

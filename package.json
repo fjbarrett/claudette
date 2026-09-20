@@ -29,9 +29,11 @@
   "scripts": {
     "start": "node server.js",
     "cli": "node claudette.js",
+    "groq": "node claudette.js --model groq/openai/gpt-oss-120b",
+    "groq:web": "CLAUDETTE_MODEL=groq/openai/gpt-oss-120b node server.js",
     "dev": "node claudette.js",
-    "test": "NODE_ENV=test CLAUDETTE_SKIP_LIVE=1 node --test test/test.js",
-    "test:live": "NODE_ENV=test node --test test/test.js",
+    "test": "node scripts/run-tests.mjs",
+    "test:live": "node scripts/run-tests.mjs --live",
     "bench": "node bench/run.js",
     "bench:leaderboard": "node bench/leaderboard.js --write",
     "bench:list": "node bench/run.js --list",
@@ -40,6 +42,14 @@
     "eval:all": "node bench/evals.js --all",
     "eval:list": "node bench/evals.js --list",
     "bench:all": "node bench/run.js --all --model gemma4:latest",
-    "bench:gemma": "node bench/run.js --all --model gemma4:latest --verbose"
+    "bench:gemma": "node bench/run.js --all --model gemma4:latest --verbose",
+    "lint": "node scripts/check-syntax.js",
+    "format": "echo format via prettier/biome not configured; run manually",
+    "typecheck": "tsc --project tsconfig.types.json",
+    "coverage": "node scripts/run-tests.mjs --coverage",
+    "test:split": "node scripts/run-tests.mjs"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
   }
 }
