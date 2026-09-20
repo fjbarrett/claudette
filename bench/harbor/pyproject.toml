@@ -3,7 +3,7 @@ name = "claudette-harbor"
 version = "0.1.0"
 description = "Harbor adapter: run claudette on Terminal-Bench and other Harbor datasets"
 requires-python = ">=3.12"
-dependencies = ["harbor>=0.17"]
+dependencies = ["harbor==0.22.0"]
 
 [build-system]
 requires = ["hatchling"]

@@ -4,16 +4,17 @@
 // can build datasets to study and improve token efficiency. On by default;
 // disable with CLAUDETTE_USAGE_LOG=0, relocate with CLAUDETTE_USAGE_DIR. Skipped
 // under NODE_ENV=test so the suite doesn't write logs.
-import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { estimateCost } from './cost.js';
+import { alwaysTrack } from './model-policy.js';
+import { DATA_DIR } from './state-paths.js';
+import { appendPrivateFileSync } from './fs-atomic.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_DIR = path.join(__dirname, '..', 'data', 'usage');
+const DEFAULT_DIR = path.join(DATA_DIR, 'usage');
 
 export function usageEnabled() {
-  return process.env.NODE_ENV !== 'test' && process.env.CLAUDETTE_USAGE_LOG !== '0';
+  return process.env.NODE_ENV !== 'test'
+    && (alwaysTrack() || process.env.CLAUDETTE_USAGE_LOG !== '0');
 }
 
 export function usageDir() {
@@ -26,18 +27,34 @@ export function usageDir() {
 export function buildUsageRecord(turn, session) {
   const m = turn.metrics ?? {};
   const events = turn.events ?? [];
+  const switches = events
+    .filter(event => event.type === 'model_switch')
+    .map(event => event.data ?? {});
+  const resolved = events
+    .filter(event => event.type === 'model_resolved')
+    .map(event => event.data ?? {});
   return {
     ts: turn.completedAt ?? new Date().toISOString(),
     sessionId: session?.id ?? null,
     turnId: turn.id,
     model: turn.model ?? null,
+    finalModel: turn.finalModel ?? switches.at(-1)?.to ?? turn.model ?? null,
+    attemptedModels: [...new Set([
+      turn.model,
+      ...switches.flatMap(item => [item.from, item.to]),
+    ].filter(Boolean))],
+    modelSwitches: switches.length,
+    resolvedModels: [...new Set(resolved.map(item => item.model).filter(Boolean))],
+    resolvedProviders: [...new Set(resolved.map(item => item.provider).filter(Boolean))],
     status: turn.status ?? null,
     promptTokens: m.promptTokens ?? 0,
     completionTokens: m.completionTokens ?? 0,
     totalTokens: m.totalTokens ?? 0,
-    estCostUsd: estimateCost(turn.model, m),
+    estCostUsd: estimateCost(turn.finalModel ?? turn.model, m),
     durationMs: m.durationMs ?? null,
-    toolCalls: events.filter(e => e.type === 'tool_call').length,
+    toolCalls: events.reduce((count, event) => count
+      + (event.type === 'tool_call' ? 1 : 0)
+      + (event.type === 'tool_activity_summary' ? Number(event.data?.calls) || 0 : 0), 0),
     // Context-management signal: lets the dataset show whether the runaway guard
     // fired and whether history was auto-compacted, so per-turn input-token growth
     // can be tracked before/after the context fixes.
@@ -51,8 +68,7 @@ export function buildUsageRecord(turn, session) {
 
 export function appendUsage(record, { dir = usageDir() } = {}) {
   try {
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(path.join(dir, 'usage.jsonl'), JSON.stringify(record) + '\n', 'utf8');
+    appendPrivateFileSync(path.join(dir, 'usage.jsonl'), JSON.stringify(record) + '\n');
   } catch { /* never break a turn on a logging failure */ }
 }
 

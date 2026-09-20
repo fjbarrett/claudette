@@ -13,19 +13,25 @@ import { promisify } from 'node:util';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
-import { getModels, chatStream, missingCredential } from './provider.js';
-import { TOOL_DEFS } from './tools.js';
+import {
+  getModels, chatStream, missingCredential, assertModelAvailable,
+  modelRotationEnabled, resolveGroqRotationTokenLimit, resolveModelRotationMax,
+} from './provider.js';
+import { freeCodingModelRank, modelPolicyDescription, rankFreeCodingModels } from './model-policy.js';
+import { bashNetworkEnabled, bashSandboxEnabled, resolveListDirMaxEntries, TOOL_DEFS } from './tools.js';
 import { createSession, loadSession, saveSession, scheduleSessionSave, flushSessionSave, listSessions, archiveMessages } from './session.js';
 import { flushTranscripts } from './transcript.js';
 import { loadClaudeMd, expandFiles } from './context.js';
 import { parseTextToolCalls } from './tool-call-parser.js';
-import { runAgent, resolveMaxIterations } from './agent-runner.js';
+import { resolvePostVerifyGuard, runAgent, resolveMaxIterations } from './agent-runner.js';
 import { createTurnTrace, truncateLine } from './trace.js';
-import { estimateCost, formatUsd, formatTokens } from './cost.js';
-import { InputController, buildFollowUpMessage, classifyApprovalAnswer, createInputAssembler, sanitizeUserInput, createBurstReader, createLineQueue } from './input.js';
+import { estimateCost, formatUsd } from './cost.js';
+import { InputController, buildFollowUpMessage, classifyApprovalAnswer, classifyApprovalKeystroke, createInputAssembler, parseInterruptCommand, sanitizeUserInput, createBurstReader, createLineQueue } from './input.js';
 import { recordTurnUsage } from './usage.js';
 import { loadHistory, appendHistory } from './history.js';
 import { createCompleter } from './completion.js';
+import { copyLastAssistantMessage } from './clipboard.js';
+import { EVIDENCE_GUIDANCE } from './evidence.js';
 import * as ui from './ui.js';
 
 const execFile = promisify(_execFile);
@@ -67,6 +73,10 @@ export {
 // point at the fix (the slug / /models) instead.
 export function explainStreamError(err, model) {
   const msg = err?.message ? String(err.message) : String(err);
+  const attempted = Array.isArray(err?.attemptedModels) ? err.attemptedModels : [];
+  if (attempted.length > 1) {
+    return `All eligible free models failed. Tried: ${attempted.join(', ')}.\n  Last error: ${msg}`;
+  }
   const low = msg.toLowerCase();
   const badModel =
     /not a valid model|no endpoints found|model_not_found|unknown model|no such model|does not exist/.test(low) ||
@@ -86,6 +96,23 @@ let autoApprove = resolveAutoApprove();
 let effort     = null;  // reasoning effort, or null when unset
 let currentAC  = null;  // AbortController for active stream
 let sessionInput = new InputController(); // follow-up queue for mid-run steering
+const sandboxRoot = process.env.CLAUDETTE_SANDBOX_ROOT
+  ? path.resolve(process.env.CLAUDETTE_SANDBOX_ROOT)
+  : null;
+
+export async function confineWorkspacePath(candidate, root = sandboxRoot) {
+  const absolute = path.resolve(candidate);
+  try { await fsp.mkdir(absolute, { recursive: true }); } catch {}
+  const resolved = await fsp.realpath(absolute);
+  if (root) {
+    const realRoot = await fsp.realpath(root);
+    const rel = path.relative(realRoot, resolved);
+    if (rel.startsWith('..') || path.isAbsolute(rel)) {
+      throw new Error(`Sandbox boundary: ${resolved} is outside the launch workspace ${realRoot}.`);
+    }
+  }
+  return resolved;
+}
 
 // Permission memory: set of tool names or "bash:<cmd>" the user said "always" to
 const alwaysAllow = new Set();
@@ -133,6 +160,8 @@ function readCoalescedPrompt(rl, promptStr, { flushMs = 40 } = {}) {
  */
 export function pickDefaultModel(models = []) {
   if (!models.length) return null;
+  const ranked = rankFreeCodingModels(models);
+  if (freeCodingModelRank(ranked[0]) != null) return ranked[0].name;
   const score = (m) => {
     const name = String(m.name).toLowerCase();
     const caps = m.capabilities ?? [];
@@ -148,7 +177,7 @@ export function pickDefaultModel(models = []) {
     if (m.size) s -= m.size / 1e9;
     return s;
   };
-  return [...models].sort((a, b) => score(b) - score(a))[0].name;
+  return ranked.sort((a, b) => score(b) - score(a))[0].name;
 }
 
 /** Value following a flag on argv, or null when the flag is absent/bare. */
@@ -185,6 +214,7 @@ export async function start() {
   if (cwdIdx !== -1 && process.argv[cwdIdx + 1]) {
     workspace = path.resolve(process.argv[cwdIdx + 1]);
   }
+  workspace = await confineWorkspacePath(workspace);
 
   // --model flag
   const modelIdx = process.argv.indexOf('--model');
@@ -211,8 +241,8 @@ export async function start() {
     ui.printError(
       `No models available — add a provider key to get started:\n` +
       `  1. cp .env.example .env\n` +
-      `  2. put one key in .env  (OPENROUTER_API_KEY is easiest — one key, every provider)\n` +
-      `  3. claudette --model openrouter/anthropic/claude-3.7-sonnet\n` +
+      `  2. put one key in .env  (GROQ_API_KEY or OPENROUTER_API_KEY)\n` +
+      `  3. claudette --model openrouter/free\n` +
       `Or run a local model with Ollama (${process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434'}).\n` +
       `  ${err.message}`
     );
@@ -221,7 +251,10 @@ export async function start() {
   // CLAUDETTE_MODEL sets the default for ANY provider. OLLAMA_MODEL did the same
   // job under a misleading name — it happily defaulted you to a cloud model —
   // so it stays supported but is no longer the one to reach for.
-  model = modelArg ?? process.env.CLAUDETTE_MODEL ?? process.env.OLLAMA_MODEL ?? pickDefaultModel(models);
+  model = modelArg
+    ?? process.env.CLAUDETTE_MODEL
+    ?? process.env.OLLAMA_MODEL
+    ?? pickDefaultModel(models);
 
   // Fail fast on an explicit --model whose provider has no key, instead of
   // showing the banner and only erroring at the first message. Auto-selected
@@ -244,12 +277,18 @@ export async function start() {
     try {
       session = resumeArg ? await loadSession(resumeArg) : await loadLatestSession();
       model = modelArg ?? session.model ?? model;
-      workspace = session.cwd ?? workspace;
+      workspace = await confineWorkspacePath(session.cwd ?? workspace);
       if (!jsonIpc) ui.printInfo(`Resumed ${session.id.slice(0, 8)} — ${session.title} (${session.messages.length} messages)`);
     } catch (err) {
       ui.printError(`Could not resume: ${err.message}`);
       exit(1);
     }
+  }
+  try {
+    await assertModelAvailable(model, { models });
+  } catch (err) {
+    ui.printError(err.message);
+    exit(1);
   }
   session ??= await createSession({ model, cwd: workspace });
 
@@ -268,6 +307,9 @@ export async function start() {
   }
 
   if (!jsonIpc) ui.printBanner({ model, cwd: workspace, sessionId: session.id, effort, autoApprove });
+  if (!jsonIpc && bashNetworkEnabled()) {
+    ui.printWarning('Outbound model Bash network is enabled for this session.');
+  }
 
   // Handle Ctrl+C: cancel stream if running, else exit
   process.on('SIGINT', () => {
@@ -405,7 +447,26 @@ async function maybeAutoCompact() {
 }
 
 // ─── User message handler ─────────────────────────────────────────────────────
+// Redirects are strictly sequential: the interrupted runner fully unwinds and
+// releases terminal/session state before the injected prompt starts.
+export async function runRedirectSequence(initialPrompt, runOne, onRedirect = null) {
+  let prompt = String(initialPrompt ?? '').trim();
+  while (prompt) {
+    const redirect = await runOne(prompt);
+    prompt = String(redirect?.content ?? '').trim();
+    if (prompt && onRedirect) await onRedirect(prompt);
+  }
+}
+
 async function handleMessage(text, rl) {
+  await runRedirectSequence(
+    text,
+    prompt => handleMessageOnce(prompt, rl),
+    prompt => ui.printRedirectStarted(prompt),
+  );
+}
+
+async function handleMessageOnce(text, rl) {
   // Compress prior history before this turn if it has grown large, so a long
   // session doesn't keep re-sending everything. (Within a turn, trimToolOutputs
   // handles tool-output growth.)
@@ -429,7 +490,9 @@ async function handleMessage(text, rl) {
   trace.event('input_received', { promptChars: text.length });
   trace.event('files_expanded', { count: files.length, files });
 
-  void scheduleSessionSave(session);
+  scheduleSessionSave(session).catch(err => {
+    ui.printWarning(`Session save failed: ${err.message}`);
+  });
 
   // Warn when context is getting large (below the auto-compact threshold).
   const approxTokens = estimateHistoryTokens(session.messages);
@@ -448,7 +511,8 @@ async function handleMessage(text, rl) {
   ];
   trace.event('system_prompt_built', { systemChars: systemPrompt.length, historyMessages: messages.length });
 
-  await runTurn(messages, rl, trace);
+  const { redirect } = await runTurn(messages, rl, trace);
+  return redirect;
 }
 
 // Run one agent turn, capturing typed follow-ups into the session queue while it
@@ -459,8 +523,8 @@ async function handleMessage(text, rl) {
 async function runTurn(messages, rl, trace) {
   const capture = !jsonIpc && process.stdin.isTTY;
   if (!capture) {
-    await agentLoop(messages, rl, trace, null);
-    return;
+    const result = await agentLoop(messages, rl, trace, null);
+    return { result, redirect: null };
   }
   sessionInput.setMode('working');
   try { rl.pause(); } catch { /* readline already closed (EOF) */ }
@@ -469,8 +533,9 @@ async function runTurn(messages, rl, trace) {
   ui.setLiveInputActive(true); // show what the user types while the turn runs
   const handler = makeTurnInputHandler(sessionInput);
   process.stdin.on('data', handler);
+  let result;
   try {
-    await agentLoop(messages, rl, trace, sessionInput);
+    result = await agentLoop(messages, rl, trace, sessionInput);
   } finally {
     process.stdin.removeListener('data', handler);
     // If the turn died (a throw, a stall abort) while a permission prompt was
@@ -482,6 +547,7 @@ async function runTurn(messages, rl, trace) {
     sessionInput.setMode('idle');
     try { rl.resume(); } catch { /* readline already closed */ }
   }
+  return { result, redirect: sessionInput.takeRedirect() };
 }
 
 // Minimal raw-mode line reader used only while a turn is running. Raw mode does
@@ -504,19 +570,49 @@ function makeTurnInputHandler(input) {
       }
     },
   });
-  return (chunk) => feed(chunk.toString('utf8'));
+  return (chunk) => {
+    const text = chunk.toString('utf8');
+    if (input.awaitingApproval) {
+      const answer = classifyApprovalKeystroke(text);
+      if (answer) {
+        ui.updateLiveInput('');
+        input.resolveApproval(answer);
+        return;
+      }
+    }
+    feed(text);
+  };
 }
 
 function handleTurnInputLine(line, input) {
+  const interruptPrompt = parseInterruptCommand(line);
+  if (interruptPrompt !== null) {
+    if (!interruptPrompt) {
+      ui.printWarning('Usage while the agent works: /interrupt <new prompt>');
+      return;
+    }
+    const item = input.requestRedirect(interruptPrompt);
+    // Release a parked approval before aborting; otherwise the runner cannot
+    // observe the signal until a permission promise that nobody will answer.
+    input.resolveApproval('n');
+    ui.printInterruptRequested(item);
+    if (currentAC && !currentAC.signal.aborted) currentAC.abort();
+    return;
+  }
   if (line === '/queue') { ui.printQueue(input.list()); return; }
   if (line === '/queue clear') {
     const n = input.clear();
     ui.printInfo(`Cleared ${n} queued follow-up${n === 1 ? '' : 's'}.`);
     return;
   }
-  // submit() answers a parked permission prompt when the line is y/n/a, and
-  // queues anything else — including text typed at that prompt.
+  // submit() answers y/n/a, turns prose at a parked approval into an immediate
+  // deny+redirect, and safely queues ordinary text during running work.
   const routed = input.submit(line);
+  if (routed.kind === 'redirect') {
+    ui.printInterruptRequested(routed.item);
+    if (currentAC && !currentAC.signal.aborted) currentAC.abort();
+    return;
+  }
   if (routed.kind === 'queued') ui.printQueued(routed.item, input.size);
 }
 
@@ -536,7 +632,7 @@ async function takeQueuedFollowUps(input, trace) {
 // here is terminal, permission, and session wiring hung off its hooks.
 async function agentLoop(messages, rl, trace = null, input = null) {
   const maxIterations = resolveMaxIterations();
-  if (!jsonIpc) ui.setUsageStatus(''); // reset the live token/cost readout for this turn
+  if (!jsonIpc) ui.beginTurnStatus({ model, maxIterations });
 
   // One controller for the whole turn, so Ctrl+C reaches a running tool and not
   // just the model request. It used to be set at request_start and cleared at
@@ -549,12 +645,21 @@ async function agentLoop(messages, rl, trace = null, input = null) {
   let ctrlCHandler = null;
   let streamStarted = false;
   let mdStream = null;
+  let resolvedModel = null;
+  let resolvedProvider = null;
 
   const emit = async (type, data) => {
     switch (type) {
       case 'iteration_start': {
         if (jsonIpc) console.log(JSON.stringify({ type: 'turn', iteration: data.iteration }));
-        else ui.startSpinner(data.iteration === 1 ? 'Thinking' : 'Working');
+        else {
+          ui.updateTurnStatus({
+            activeModel: data.model ?? model,
+            iteration: data.iteration,
+            maxIterations: data.maxIterations ?? maxIterations,
+          });
+          ui.startSpinner(data.iteration === 1 ? 'Thinking' : 'Working');
+        }
         streamStarted = false;
         mdStream = null;
         break;
@@ -581,7 +686,47 @@ async function agentLoop(messages, rl, trace = null, input = null) {
           process.stdin.resume();
           process.stdin.on('data', ctrlCHandler);
         }
-        trace?.event('model_request_started', { model, iteration: data.iteration });
+        if (!jsonIpc) ui.updateTurnStatus({ activeModel: data.model ?? model });
+        trace?.event('model_request_started', { model: data.model ?? model, iteration: data.iteration });
+        break;
+      }
+
+      case 'model_switch': {
+        if (trace) {
+          trace.turn.finalModel = data.to;
+          trace.event('model_switch', {
+            from: data.from,
+            to: data.to,
+            reason: data.reason,
+            status: data.status,
+            switch: data.switch,
+            iteration: data.iteration,
+            requestTokens: data.requestTokens,
+            skippedModels: data.skippedModels,
+          });
+          trace.event('model_request_started', {
+            model: data.to,
+            iteration: data.iteration,
+            failover: true,
+          });
+        }
+        if (jsonIpc) {
+          console.log(JSON.stringify({
+            type: 'model_switch', from: data.from, to: data.to,
+            reason: data.reason, status: data.status,
+            requestTokens: data.requestTokens, skippedModels: data.skippedModels,
+          }));
+        } else {
+          ui.stopSpinner();
+          resolvedModel = null;
+          resolvedProvider = null;
+          ui.updateTurnStatus({ activeModel: data.to, resolvedModel: '', resolvedProvider: '' });
+          const skipped = data.skippedModels?.length
+            ? `; skipped ${data.skippedModels.join(', ')} for this ~${data.requestTokens ?? '?'}-token request`
+            : '';
+          ui.printWarning(`${data.from} failed (${data.reason})${skipped}; switching to ${data.to}`);
+          ui.startSpinner('Switching model');
+        }
         break;
       }
 
@@ -608,14 +753,32 @@ async function agentLoop(messages, rl, trace = null, input = null) {
 
       case 'usage': {
         trace?.addUsage({ promptTokens: data.last?.promptTokens, completionTokens: data.last?.completionTokens });
-        // Live token/cost readout on the next spinner frame.
-        if (!jsonIpc && trace) {
-          const m = trace.turn.metrics;
-          const cost = formatUsd(estimateCost(model, m));
-          ui.setUsageStatus(
-            `↑${formatTokens(m.promptTokens)} ↓${formatTokens(m.completionTokens)}` +
-            (cost ? ` · ${cost}` : '') + ` · iter ${data.iteration}/${maxIterations}`
-          );
+        if (data.last?.resolvedModel) resolvedModel = data.last.resolvedModel;
+        if (data.last?.resolvedProvider) resolvedProvider = data.last.resolvedProvider;
+        if (trace && (data.last?.resolvedModel || data.last?.resolvedProvider)) {
+          trace.event('model_resolved', {
+            iteration: data.iteration,
+            requestedModel: data.model ?? model,
+            model: data.last.resolvedModel ?? null,
+            provider: data.last.resolvedProvider ?? null,
+          });
+        }
+        if (trace && data.last?.rateLimit) trace.turn.rateLimit = data.last.rateLimit;
+        if (!jsonIpc) {
+          const m = trace?.turn.metrics ?? {
+            promptTokens: data.promptTokens ?? 0,
+            completionTokens: data.completionTokens ?? 0,
+          };
+          ui.updateTurnStatus({
+            activeModel: data.model ?? model,
+            resolvedModel: resolvedModel ?? '',
+            resolvedProvider: resolvedProvider ?? '',
+            promptTokens: m.promptTokens ?? 0,
+            completionTokens: m.completionTokens ?? 0,
+            cost: formatUsd(estimateCost(data.model ?? model, m)) ?? '',
+            iteration: data.iteration,
+            maxIterations,
+          });
         }
         break;
       }
@@ -649,19 +812,28 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       case 'tool_call': {
         trace?.event('tool_call', { name: data.name, preview: truncateLine(JSON.stringify(data.args ?? {}), 200) });
         if (jsonIpc) { console.log(JSON.stringify({ type: 'tool_call', name: data.name, arguments: data.args })); break; }
+        ui.noteToolCall();
         // The permission prompt renders the call itself — printing the normal
         // tool-call line too showed the same call twice.
         if (!needsApproval(data.name, data.args)) ui.printToolCall(data.name, data.args);
         break;
       }
 
+      case 'tool_start': {
+        trace?.event('tool_started', { name: data.name, preview: truncateLine(JSON.stringify(data.args ?? {}), 200) });
+        if (jsonIpc) console.log(JSON.stringify({ type: 'tool_start', name: data.name, arguments: data.args }));
+        else ui.startToolActivity(data.name, data.args);
+        break;
+      }
+
       case 'tool_denied': {
-        ui.printWarning('User denied permission for this operation.');
+        if (!jsonIpc) ui.printApprovalDenied(data.name);
         trace?.event('tool_denied', { name: data.name });
         break;
       }
 
       case 'tool_result': {
+        if (!jsonIpc) ui.stopSpinner();
         if (jsonIpc) console.log(JSON.stringify({ type: 'tool_result', name: data.name, result: data.result, isError: data.isError }));
         else ui.printToolResult(data.name, data.result, data.isError);
         trace?.event('tool_result', { name: data.name, isError: data.isError, chars: data.result.length });
@@ -670,7 +842,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
 
       case 'act_nudge': {
         trace?.event('act_nudge', { streak: data.streak });
-        if (!jsonIpc) ui.printInfo(`Nudging the model to act (${data.streak} reads without an edit).`);
+        if (!jsonIpc) ui.printInfo(`Nudging the model to act (${data.streak} tool calls without a successful edit or command).`);
         break;
       }
 
@@ -688,8 +860,22 @@ async function agentLoop(messages, rl, trace = null, input = null) {
         break;
       }
 
+      case 'tool_failure_limit': {
+        trace?.event('tool_failure_limit', { name: data.name, attempts: data.attempts, diagnostic: data.diagnostic });
+        if (jsonIpc) {
+          console.log(JSON.stringify({ type: 'tool_failure_limit', name: data.name, attempts: data.attempts, diagnostic: data.diagnostic }));
+        } else {
+          const reason = data.diagnostic ? `returned the same error ${data.attempts} times` : 'failed identically twice';
+          ui.printInfo(`${data.name || 'Tool'} ${reason} — asking the model to explain the blocker without more tools.`);
+        }
+        await flushSessionSave(session);
+        break;
+      }
+
       case 'repeating': {
         trace?.event('repeating', { iterations: data.iterations });
+        trace?.repeat();
+        await flushSessionSave(session);
         if (!jsonIpc) ui.printInfo(`Stopped after ${data.iterations} iterations: the model kept repeating the same tool calls. Give it a new instruction.`);
         break;
       }
@@ -697,6 +883,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       case 'iteration_end': await flushSessionSave(session); break;
 
       case 'cancelled': {
+        if (!jsonIpc) ui.endTurnStatus();
         trace?.event('assistant_aborted', { iteration: data.iteration });
         trace?.cancel(); // 'cancelled', not 'failed' — keeps the dataset clean
         await flushSessionSave(session);
@@ -704,6 +891,7 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       }
 
       case 'failed': {
+        if (!jsonIpc) ui.endTurnStatus();
         trace?.event('assistant_failed', { error: data.error.message, iteration: data.iteration });
         trace?.fail();
         await flushSessionSave(session);
@@ -714,15 +902,19 @@ async function agentLoop(messages, rl, trace = null, input = null) {
 
       case 'completed': {
         if (!jsonIpc) {
+          ui.endTurnStatus();
           // Footer goes here, not on the last assistant_text: a turn held open by
           // the verify gate or a queued follow-up produces several assistant
           // messages, and only the last one ends the turn.
           const u = trace ? trace.turn.metrics : { promptTokens: 0, completionTokens: 0 };
           ui.printAssistantEnd({
             model,
-            tokens: (u.promptTokens ?? 0) + (u.completionTokens ?? 0) || null,
+            resolvedModel,
+            resolvedProvider,
+            tokens: (u.completionTokens ?? 0) || null,
             costUsd: estimateCost(model, u),
             sessionCostUsd: sessionCostUsd(),
+            rateLimit: trace?.turn.rateLimit,
           });
         }
         if (trace) {
@@ -765,6 +957,12 @@ async function agentLoop(messages, rl, trace = null, input = null) {
       },
       approve: (name, args) => checkPermission(name, args, rl, input),
       takeFollowUps: () => takeQueuedFollowUps(input, trace),
+      onModelChange: async (nextModel) => {
+        model = nextModel;
+        session.model = nextModel;
+        if (trace) trace.turn.finalModel = nextModel;
+        await flushSessionSave(session);
+      },
       // Don't silently die mid-task. In an interactive terminal, offer to keep
       // going; a fresh iteration budget continues the same turn (and trace).
       onMaxIterations: async ({ iterations }) => {
@@ -780,10 +978,11 @@ async function agentLoop(messages, rl, trace = null, input = null) {
     // Release the turn controller, so Ctrl+C at the idle prompt exits rather
     // than aborting a turn that already finished.
     if (currentAC === turnAC) currentAC = null;
+    if (!jsonIpc) ui.endTurnStatus();
   }
 
   if (result.status === 'max_iterations') {
-    if (trace) { trace.complete(); await flushSessionSave(session); }
+    if (trace) { trace.maxIterations(); await flushSessionSave(session); }
     ui.printWarning(`Reached ${result.iterations} tool iterations — stopping (runaway guard). Type a message to continue where it left off, or raise the limit with --max-iterations N (or CLAUDETTE_MAX_ITERATIONS).`);
   }
   return result;
@@ -827,7 +1026,7 @@ export function permissionKey(toolName, args = {}) {
 // tool-call header, so the caller must not print one too).
 function needsApproval(toolName, args) {
   // Read-only ops always allowed
-  if (['read_file', 'list_dir', 'glob', 'grep', 'search_code', 'fetch_url'].includes(toolName)) return false;
+  if (['read_file', 'list_dir', 'glob', 'search_code', 'fetch_url'].includes(toolName)) return false;
   if (autoApprove) return false;
   return !alwaysAllow.has(permissionKey(toolName, args));
 }
@@ -843,8 +1042,8 @@ async function checkPermission(toolName, args, rl, input = null) {
 
   // While a turn captures input, the raw-mode reader owns stdin and readline is
   // paused — question() would wait forever. Park on the controller instead: the
-  // same reader answers it, and text that isn't y/n/a becomes a follow-up rather
-  // than an accidental approval. The hint gets its own row because the live input
+  // same reader answers it, and text that isn't y/n/a denies this tool and becomes
+  // an immediate redirect rather than an accidental approval. The hint gets its own row because the live input
   // line redraws by clearing the row it sits on.
   let answer;
   if (input) {
@@ -856,9 +1055,14 @@ async function checkPermission(toolName, args, rl, input = null) {
 
   if (answer === 'a') {
     alwaysAllow.add(permissionKey(toolName, args));
+    ui.printApprovalAccepted(toolName, args, true);
     return true;
   }
-  return answer === 'y';
+  if (answer === 'y') {
+    ui.printApprovalAccepted(toolName, args, false);
+    return true;
+  }
+  return false;
 }
 
 // ─── Slash command handler ────────────────────────────────────────────────────
@@ -888,6 +1092,7 @@ async function handleCommand(line, rl) {
         ['/resume <id>',     'Resume a saved session (short ID ok)'],
         ['/clear',           'Start a new session with the same model'],
         ['/compact',         'Summarize + compress conversation history'],
+        ['/copy',            'Copy the last assistant message to the clipboard'],
 
         ['Files & Workspace'],
         ['/files [dir]',     'List files in workspace (or subdir)'],
@@ -903,6 +1108,7 @@ async function handleCommand(line, rl) {
         ['Tab',              'Complete slash commands and @paths'],
         ['/cost',            'Estimate token usage for this session'],
         ['/queue',           'List follow-ups queued while the agent works (type while it runs); /queue clear'],
+        ['/interrupt <text>','While working: stop the current operation and immediately steer with text'],
         ['/vim',             'Toggle vim mode indicator'],
         ['/exit',            'Quit'],
       ]);
@@ -911,18 +1117,33 @@ async function handleCommand(line, rl) {
     // ── Model ────────────────────────────────────────────────────────────────
     case '/model': {
       if (arg) {
-        model = arg;
-        session.model = model;
-        await saveSession(session);
-        ui.printSuccess(`Model → ${model}`);
+        const list = await getModels().catch(err => { ui.printError(err.message); return []; });
+        try {
+          await assertModelAvailable(arg, { models: list });
+          model = arg;
+          session.model = model;
+          await saveSession(session);
+          ui.printSuccess(`Model → ${model}`);
+        } catch (err) {
+          ui.printError(err.message);
+        }
         return true;
       }
       // fall through to /models display
     }
     // eslint-disable-next-line no-fallthrough
     case '/models': {
+      if (arg) {
+        ui.printWarning('Usage: /models  |  To switch: /model <provider/model>');
+        return true;
+      }
       const list = await getModels().catch(err => { ui.printError(err.message); return []; });
-      ui.table('Available Models', list.map(m => [m.name, `${m.paramSize.padEnd(8)} ${m.family}`]));
+      ui.table('Available Models', list.map(m => [
+        m.name,
+        `${String(m.paramSize).padEnd(8)} ${m.family}` +
+          (m.access?.free ? '  free' : '') +
+          (m.capabilities?.includes('tools') ? '  tools' : ''),
+      ]));
       if (cmd === '/model') ui.printInfo(`Current: ${model}  |  /model <name> to switch`);
       return true;
     }
@@ -935,6 +1156,15 @@ async function handleCommand(line, rl) {
         ['workspace',   workspace],
         ['session',     session.id.slice(0, 8)],
         ['tools',       toolsOn ? 'enabled' : 'disabled'],
+        ['model policy', modelPolicyDescription()],
+        ['rotation',    modelRotationEnabled() ? `enabled (max ${resolveModelRotationMax()} switches)` : 'disabled'],
+        ['groq preflight', `${resolveGroqRotationTokenLimit()} tokens/request`],
+        ['directory cap', `${resolveListDirMaxEntries()} entries`],
+        ['post-verify',  resolvePostVerifyGuard() ? `nudge after ${resolvePostVerifyGuard()} extra tools` : 'disabled'],
+        ['sandbox',      sandboxRoot ? `confined to ${sandboxRoot}` : 'not active'],
+        ['bash network', bashSandboxEnabled()
+          ? (bashNetworkEnabled() ? 'outbound enabled' : 'loopback-only')
+          : 'host policy (Bash sandbox inactive)'],
         ['auto-approve', String(autoApprove)],
         ['ollama',      process.env.OLLAMA_BASE_URL ?? 'http://127.0.0.1:11434'],
       ]);
@@ -997,10 +1227,12 @@ async function handleCommand(line, rl) {
     case '/use': {
       if (!arg) { ui.printWarning(`Usage: ${cmd} <session-id>`); return true; }
       try {
-        session = await loadSession(arg);
-        model = session.model ?? model;
-        workspace = session.cwd ?? workspace;
-        ui.printSuccess(`Resumed: ${session.id.slice(0, 8)} — ${session.title}`);
+        const candidate = await loadSession(arg);
+        const candidateWorkspace = await confineWorkspacePath(candidate.cwd ?? workspace);
+        session = candidate;
+        model = candidate.model ?? model;
+        workspace = candidateWorkspace;
+        ui.printSuccess(`Resumed: ${candidate.id.slice(0, 8)} — ${candidate.title}`);
       } catch (err) {
         ui.printError(err.message);
       }
@@ -1011,6 +1243,20 @@ async function handleCommand(line, rl) {
     case '/clear': {
       session = await createSession({ model, cwd: workspace });
       ui.printSuccess(`New session: ${session.id.slice(0, 8)}`);
+      return true;
+    }
+
+    case '/copy': {
+      if (arg) { ui.printWarning('Usage: /copy'); return true; }
+      try {
+        if (await copyLastAssistantMessage(session.messages)) {
+          ui.printSuccess('Copied the last assistant message to the clipboard.');
+        } else {
+          ui.printInfo('No assistant message to copy yet.');
+        }
+      } catch (err) {
+        ui.printError(err.message);
+      }
       return true;
     }
 
@@ -1034,8 +1280,8 @@ async function handleCommand(line, rl) {
 
     // ── Files ────────────────────────────────────────────────────────────────
     case '/files': {
-      const dir = arg ? path.resolve(workspace, arg) : workspace;
       try {
+        const dir = await confineWorkspacePath(arg ? path.resolve(workspace, arg) : workspace);
         const entries = await fsp.readdir(dir, { withFileTypes: true });
         const rows = entries
           .filter(e => !e.name.startsWith('.') || e.name === '.persist' || e.name === '.claude')
@@ -1050,8 +1296,8 @@ async function handleCommand(line, rl) {
 
     case '/add-dir': {
       if (!arg) { ui.printWarning('Usage: /add-dir <path>'); return true; }
-      const target = path.resolve(workspace, arg);
       try {
+        const target = await confineWorkspacePath(path.resolve(workspace, arg));
         const stat = await fsp.stat(target);
         if (!stat.isDirectory()) throw new Error('Not a directory');
         workspace = target;
@@ -1096,6 +1342,19 @@ async function handleCommand(line, rl) {
       return true;
 
     // ── Info ─────────────────────────────────────────────────────────────────
+    case '/interrupt': {
+      if (!arg) {
+        ui.printWarning('Usage: /interrupt <new prompt> (while the agent is working)');
+      } else {
+        // At the idle prompt there is nothing to abort; treating the payload as
+        // a normal prompt keeps the command predictable if the turn finished
+        // just before the user pressed Enter.
+        ui.printInfo('No operation is running — applying the prompt now.');
+        await handleMessage(arg, rl);
+      }
+      return true;
+    }
+
     case '/queue': {
       if (arg === 'clear') {
         const n = sessionInput.clear();
@@ -1150,13 +1409,13 @@ async function handleCommand(line, rl) {
 function buildSystemPrompt(claudeMd, effort) {
   const lines = [
     'You are Claudette, an AI coding assistant running in the terminal.',
-    'You have access to tools: bash, read_file, write_file, str_replace, patch_file, list_dir, glob, grep, search_code, fetch_url.',
+    'You have access to tools: bash, read_file, write_file, str_replace, patch_file, list_dir, glob, search_code, fetch_url.',
     'Guidelines:',
     '- Always read files before editing them.',
     '- Prefer patch_file or str_replace for targeted edits over rewriting whole files.',
     '- Be concise. When writing code, provide complete working implementations.',
     '- Explore only as much as the task needs, then act. Do NOT re-read a file you already read this turn — its contents are still above; re-reading the same file wastes context and stalls progress (a changed file or a new line range is fine).',
-    '- Once you understand the relevant code, make the edit. Favor a concrete change you can verify over continued reading; you do not need to read the whole project before acting.',
+    '- When implementation is requested and you understand the relevant code, make the edit. Favor a concrete change you can verify over continued reading; you do not need to read the whole project before acting.',
     '- VERIFY before claiming done: after editing, run the project\'s build, typecheck, or tests (e.g. `npm run build`, `npx tsc --noEmit`, `pytest`) and fix any errors. Never report a task complete without evidence it works — a clean edit is not proof. If a check fails, fix it and re-run until it passes.',
     '- All file paths must be relative to the workspace root — never use /tmp or absolute paths outside the workspace.',
     '- To run a file, use bash with e.g. {"command": "python3 fizzbuzz.py"} — run it in the workspace, not a copy.',
@@ -1167,6 +1426,8 @@ function buildSystemPrompt(claudeMd, effort) {
     '- Do not read or edit CLAUDE.md, PERSIST.md, or docs unless the prompt explicitly asks for those files.',
     '- Do not run git add, git commit, git push, or create branches unless the prompt explicitly asks for git actions.',
     '- If a tool call fails because a file is missing, use the filenames named in the prompt before trying unrelated files.',
+    '- Never repeat an identical failed tool call. If the same call fails twice, stop using tools and explain the exact blocker.',
+    EVIDENCE_GUIDANCE,
   ];
   // Let the model answer "what effort am I on?" — it has no other introspection.
   if (effort) {

@@ -12,8 +12,8 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 
 export const SLASH_COMMANDS = [
-  '/add-dir', '/clear', '/commit', '/compact', '/config', '/cost', '/diff', '/effort',
-  '/exit', '/files', '/help', '/model', '/models', '/queue', '/quit', '/resume',
+  '/add-dir', '/clear', '/commit', '/compact', '/config', '/copy', '/cost', '/diff', '/effort',
+  '/exit', '/files', '/help', '/interrupt', '/model', '/models', '/queue', '/quit', '/resume',
   '/review', '/session', '/sessions', '/status', '/tools', '/vim', '/yolo',
 ];
 
@@ -65,11 +65,16 @@ export async function completeAtPath(line, workspace, readdir = fsp.readdir) {
  * the completer follows /add-dir without being rebuilt.
  */
 export function createCompleter(getWorkspace) {
-  return function completer(line, callback) {
+  // `node:readline/promises` expects the completion tuple (or a Promise for
+  // it). A callback-style completer returns undefined, which Node 24 then tries
+  // to destructure when Tab is pressed.
+  return async function completer(line) {
     const slash = completeSlashCommand(line);
-    if (slash) { callback(null, slash); return; }
-    completeAtPath(line, getWorkspace())
-      .then(result => callback(null, result ?? [[], line]))
-      .catch(() => callback(null, [[], line]));
+    if (slash) return slash;
+    try {
+      return await completeAtPath(line, getWorkspace()) ?? [[], line];
+    } catch {
+      return [[], line];
+    }
   };
 }

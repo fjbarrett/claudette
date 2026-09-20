@@ -5,9 +5,8 @@
  *
  *   const { text } = await run('summarise src/index.js', { cwd: './my-project' });
  *
- * Everything here is the same agent the CLI runs — same tools, same loop, same
- * re-read guard and verification gate. The CLI is one caller of it; your script
- * is another.
+ * The same agent loop powers the CLI and library. Library callers explicitly
+ * opt into filesystem tools, shell execution, and @file prompt expansion.
  *
  * Nothing in this module touches the terminal, so it is safe inside a server, a
  * test, or a CI job. Load `.env` yourself (or `import 'claudette/env'`) if you
@@ -16,10 +15,11 @@
 
 import { runAgent } from './src/agent-runner.js';
 import { TOOL_DEFS, executeTool } from './src/tools.js';
-import { chatStream, getModels, providerFor, missingCredential, defaultCloudModels } from './src/provider.js';
+import { chatStream, getModels, providerFor, missingCredential } from './src/provider.js';
 import { loadClaudeMd, expandFiles, trimToolOutputs } from './src/context.js';
 import { parseTextToolCalls } from './src/tool-call-parser.js';
 import { estimateCost, formatUsd } from './src/cost.js';
+import { EVIDENCE_GUIDANCE } from './src/evidence.js';
 
 const DEFAULT_SYSTEM_PROMPT = [
   'You are Claudette, an AI coding assistant.',
@@ -30,6 +30,7 @@ const DEFAULT_SYSTEM_PROMPT = [
   '- All file paths must be relative to the workspace root.',
   '- VERIFY before claiming done: after editing, run the build, typecheck, or tests and fix any errors.',
   '- Be concise. When writing code, provide complete working implementations.',
+  EVIDENCE_GUIDANCE,
 ].join('\n');
 
 /**
@@ -52,8 +53,9 @@ export async function buildSystemPrompt({ cwd = process.cwd(), projectInstructio
  * @param {string} prompt
  * @param {object} [options]
  * @param {string} [options.model]      provider/model; defaults to the first credentialed cloud model, else the first local one
- * @param {string} [options.cwd]        workspace root — the agent cannot read or write outside it
- * @param {boolean} [options.tools]     enable tool use (default true); false makes it a plain completion
+ * @param {string} [options.cwd]        workspace root for structured file tools
+ * @param {boolean} [options.tools]     enable structured tool use (default false)
+ * @param {boolean} [options.allowShell] include the unsandboxed Bash tool (default false; requires tools:true)
  * @param {(name, args) => boolean|Promise<boolean>} [options.approve]
  *                                      permission gate. Default allows everything, because a script
  *                                      has nobody to ask; pass one to restrict.
@@ -63,8 +65,8 @@ export async function buildSystemPrompt({ cwd = process.cwd(), projectInstructio
  * @param {(text) => void} [options.onText]    streamed assistant text
  * @param {string} [options.system]     replace the base system prompt
  * @param {string} [options.append]     append to it (project rules, output format…)
- * @param {boolean} [options.projectInstructions] load CLAUDE.md/CLAUDETTE.md (default true)
- * @param {boolean} [options.expandAtFiles] expand `@path` tokens in the prompt (default true)
+ * @param {boolean} [options.projectInstructions] load CLAUDE.md/CLAUDETTE.md (default false)
+ * @param {boolean} [options.expandAtFiles] expand `@path` tokens in the prompt (default false)
  * @param {Array} [options.messages]    prior conversation to continue
  *
  * @returns {Promise<{text, status, messages, usage, costUsd, iterations, toolCalls, files}>}
@@ -73,7 +75,8 @@ export async function run(prompt, options = {}) {
   const {
     model: requestedModel,
     cwd = process.cwd(),
-    tools = true,
+    tools = false,
+    allowShell = false,
     approve,
     maxIterations,
     signal,
@@ -81,8 +84,8 @@ export async function run(prompt, options = {}) {
     onText,
     system,
     append,
-    projectInstructions = true,
-    expandAtFiles = true,
+    projectInstructions = false,
+    expandAtFiles = false,
     messages: prior = [],
     effort = null,
     chatFn,
@@ -116,7 +119,9 @@ export async function run(prompt, options = {}) {
   const result = await runAgent({
     model,
     messages,
-    tools: tools ? TOOL_DEFS : [],
+    tools: tools
+      ? TOOL_DEFS.filter(tool => allowShell || tool.function.name !== 'bash')
+      : [],
     toolContext: { cwd, workspace: cwd },
     effort,
     signal,
@@ -131,14 +136,15 @@ export async function run(prompt, options = {}) {
 
   return {
     text: result.content,
-    status: result.status,          // 'completed' | 'cancelled' | 'failed' | 'max_iterations'
+    status: result.status,          // 'completed' | 'cancelled' | 'failed' | 'max_iterations' | 'repeating'
     messages: result.messages,      // full history — pass back in as `messages` to continue
     usage: result.usage,
-    costUsd: estimateCost(model, result.usage),
+    costUsd: estimateCost(result.model ?? model, result.usage),
     iterations: result.iterations,
     toolCalls: result.toolCalls,    // [{ name, args, isError }]
     files,                          // @paths that were expanded into the prompt
-    model,
+    model: result.model ?? model,
+    attemptedModels: result.attemptedModels ?? [result.model ?? model],
   };
 }
 
@@ -152,19 +158,26 @@ export async function run(prompt, options = {}) {
  *
  * The final event is `{ type: 'result', ... }` carrying what run() returns.
  */
-export function stream(prompt, options = {}) {
+export async function* stream(prompt, options = {}) {
+  const controller = new AbortController();
+  const signal = options.signal
+    ? AbortSignal.any([options.signal, controller.signal])
+    : controller.signal;
   const queue = [];
   let notify = null;
   let done = false;
   let failure = null;
+  let closed = false;
 
   const push = (event) => {
+    if (closed) return;
     queue.push(event);
     if (notify) { const n = notify; notify = null; n(); }
   };
 
-  run(prompt, {
+  const task = run(prompt, {
     ...options,
+    signal,
     onText: (text) => { push({ type: 'text', text }); options.onText?.(text); },
     onEvent: (event) => { push(event); options.onEvent?.(event); },
   }).then(
@@ -172,16 +185,22 @@ export function stream(prompt, options = {}) {
     (err) => { failure = err; done = true; if (notify) notify(); },
   );
 
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (;;) {
-        while (queue.length) yield queue.shift();
-        if (failure) throw failure;
-        if (done) return;
-        await new Promise((resolve) => { notify = resolve; });
-      }
-    },
-  };
+  try {
+    for (;;) {
+      while (queue.length) yield queue.shift();
+      if (failure) throw failure;
+      if (done) return;
+      await new Promise((resolve) => { notify = resolve; });
+    }
+  } finally {
+    closed = true;
+    if (!done) controller.abort();
+    // Returning from the iterator also ends the turn. In particular, a reusable
+    // agent must stay busy until the old provider/tool has finished cancelling.
+    await task;
+    queue.length = 0;
+    notify = null;
+  }
 }
 
 /**
@@ -194,25 +213,68 @@ export function stream(prompt, options = {}) {
  */
 export function createAgent(defaults = {}) {
   let history = [];
+  let activeModel = defaults.model;
+  let busy = false;
+
+  const commit = (result) => {
+    history = result.messages.filter(message => message.role !== 'system');
+    activeModel = result.model;
+  };
+  const enter = () => {
+    if (busy) throw new Error('This agent already has a turn in progress. Wait for it to finish before starting another.');
+    busy = true;
+  };
+
   return {
     async send(prompt, options = {}) {
-      const result = await run(prompt, { ...defaults, ...options, messages: history });
-      // Drop the system message; run() rebuilds it each time.
-      history = result.messages.filter(m => m.role !== 'system');
-      return result;
+      enter();
+      try {
+        const result = await run(prompt, {
+          ...defaults,
+          ...(activeModel ? { model: activeModel } : {}),
+          ...options,
+          messages: history,
+        });
+        commit(result);
+        return result;
+      } finally {
+        busy = false;
+      }
     },
     stream(prompt, options = {}) {
-      return stream(prompt, { ...defaults, ...options, messages: history });
+      return {
+        async *[Symbol.asyncIterator]() {
+          enter();
+          try {
+            const events = stream(prompt, {
+              ...defaults,
+              ...(activeModel ? { model: activeModel } : {}),
+              ...options,
+              messages: history,
+            });
+            for await (const event of events) {
+              if (event.type === 'result') {
+                commit(event);
+              }
+              yield event;
+            }
+          } finally {
+            busy = false;
+          }
+        },
+      };
     },
     get messages() { return [...history]; },
-    reset() { history = []; return this; },
+    reset() {
+      if (busy) throw new Error('Cannot reset an agent while a turn is in progress.');
+      history = [];
+      return this;
+    },
   };
 }
 
 /** First credentialed cloud model, else the first model any provider offers. */
 async function pickDefaultModel() {
-  const cloud = defaultCloudModels();
-  if (cloud?.agent) return cloud.agent;
   const all = await getModels().catch(() => []);
   return all[0]?.name ?? null;
 }

@@ -1,0 +1,27 @@
+{
+  "id": "farm-unicode-path",
+  "title": "Makes a targeted JSON edit through a Unicode fixture and spaced path",
+  "prompt": "Read content/menu data.json. In the item whose id is dessert-01, change only priceCents from 725 to 775 and add the boolean field seasonal with value true. Preserve its exact displayName Crème brûlée ☕, preserve the other item and top-level currency, and keep the file valid JSON. Make a targeted edit; do not use write_file and do not modify verify.mjs. Run node verify.mjs, then reply with exactly UNICODE_PATH_OK.",
+  "maxTurns": 10,
+  "repeat": 1,
+  "files": {
+    "content/menu data.json": "{\n  \"currency\": \"USD\",\n  \"items\": [\n    {\n      \"id\": \"dessert-01\",\n      \"displayName\": \"Crème brûlée ☕\",\n      \"priceCents\": 725\n    },\n    {\n      \"id\": \"tea-02\",\n      \"displayName\": \"Jasmine tea 茉莉花茶\",\n      \"priceCents\": 450\n    }\n  ]\n}\n",
+    "verify.mjs": "import assert from 'node:assert/strict';\nimport { readFile, writeFile } from 'node:fs/promises';\n\nconst menu = JSON.parse(await readFile('content/menu data.json', 'utf8'));\nassert.deepEqual(menu, {\n  currency: 'USD',\n  items: [\n    { id: 'dessert-01', displayName: 'Crème brûlée ☕', priceCents: 775, seasonal: true },\n    { id: 'tea-02', displayName: 'Jasmine tea 茉莉花茶', priceCents: 450 },\n  ],\n});\nawait writeFile('.passed', 'ok\\n');\nconsole.log('UNICODE PATH PASS');\n"
+  },
+  "expect": {
+    "tools": [
+      { "name": "read_file", "args": { "path": "content/menu data.json" } },
+      { "name": "bash", "args": { "command": "node verify.mjs" } }
+    ],
+    "forbid": ["write_file", "fetch_url"],
+    "maxToolCalls": 8,
+    "unchangedFiles": ["verify.mjs"],
+    "allowedFiles": ["content/menu data.json", "verify.mjs", ".passed"],
+    "files": {
+      "content/menu data.json": { "includes": ["Crème brûlée ☕", "Jasmine tea 茉莉花茶", "\"priceCents\": 775", "\"seasonal\": true"], "excludes": "\"priceCents\": 725" },
+      "verify.mjs": { "includes": ["assert.deepEqual", "UNICODE PATH PASS"] },
+      ".passed": { "equals": "ok\n" }
+    },
+    "answer": { "matches": "^\\s*UNICODE_PATH_OK\\s*$" }
+  }
+}

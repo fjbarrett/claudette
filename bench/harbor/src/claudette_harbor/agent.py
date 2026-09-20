@@ -10,12 +10,13 @@ Usage:
         -a claudette_harbor:Claudette \
         -m openrouter/openai/gpt-5-nano
 
-Pin the claudette revision with --agent-kwarg version=<git ref> (branch,
-tag, or SHA of github.com/fjbarrett/claudette). Defaults to main.
+Pin the claudette revision with --agent-kwarg version=<40-char commit SHA>
+from github.com/fjbarrett/claudette. Mutable branches/tags are rejected.
 """
 
 import json
 import os
+import re
 import shlex
 from typing import override
 
@@ -28,20 +29,28 @@ from harbor.models.agent.context import AgentContext
 _PROVIDER_KEYS: dict[str, list[str]] = {
     "anthropic": ["ANTHROPIC_API_KEY"],
     "openai": ["OPENAI_API_KEY"],
-    "deepseek": ["DEEPSEEK_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY", "DEEPSEEK_KEY"],
     "groq": ["GROQ_API_KEY"],
-    "hf": ["HF_TOKEN"],
+    "hf": ["HF_TOKEN", "HF_KEY", "HUGGINGFACE_API_KEY"],
+    "huggingface": ["HF_TOKEN", "HF_KEY", "HUGGINGFACE_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY"],
     "together": ["TOGETHER_API_KEY"],
     "fireworks": ["FIREWORKS_API_KEY"],
     "google": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    "gemini": ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     "xai": ["XAI_API_KEY"],
+    "grok": ["XAI_API_KEY"],
     "mistral": ["MISTRAL_API_KEY"],
     "cohere": ["COHERE_API_KEY"],
     "perplexity": ["PERPLEXITY_API_KEY"],
+    "pplx": ["PERPLEXITY_API_KEY"],
 }
 
 _REPO = "fjbarrett/claudette"
+_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+_NVM_VERSION = "v0.40.2"
+_NVM_INSTALL_SHA256 = "a909fdd01765379ebc5983674adafb8bc9de6d928bfa188761309d4a0c36be0f"
+_NODE_VERSION = "22.23.2"
 
 
 class Claudette(BaseInstalledAgent):
@@ -67,16 +76,26 @@ class Claudette(BaseInstalledAgent):
             command="apt-get update && apt-get install -y curl ca-certificates",
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
-        ref = self._version or "main"
+        ref = self._version or ""
+        if not _COMMIT_SHA.fullmatch(ref):
+            raise ValueError(
+                "Claudette Harbor installs require --agent-kwarg "
+                "version=<40-character commit SHA>; mutable branches and tags are rejected"
+            )
+        ref = ref.lower()
         tarball = f"https://github.com/{_REPO}/archive/{ref}.tar.gz"
+        nvm_installer = f"https://raw.githubusercontent.com/nvm-sh/nvm/{_NVM_VERSION}/install.sh"
         await self.exec_as_agent(
             environment,
             command=(
                 "set -euo pipefail; "
-                "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | bash && "
+                'installer="$(mktemp)"; trap \'rm -f "$installer"\' EXIT; '
+                f"curl -fsSL {shlex.quote(nvm_installer)} -o \"$installer\" && "
+                f"printf '%s  %s\\n' {shlex.quote(_NVM_INSTALL_SHA256)} \"$installer\" | sha256sum -c - && "
+                'bash "$installer" && '
                 'export NVM_DIR="$HOME/.nvm" && '
                 '\\. "$NVM_DIR/nvm.sh" && '
-                "nvm install 22 && npm -v && "
+                f"nvm install {_NODE_VERSION} && nvm use {_NODE_VERSION} && npm -v && "
                 f"npm install -g {shlex.quote(tarball)} && "
                 "command -v claudette"
             ),
@@ -95,6 +114,10 @@ class Claudette(BaseInstalledAgent):
             )
 
         provider = self.model_name.split("/", 1)[0]
+        if provider not in _PROVIDER_KEYS and provider != "ollama":
+            raise ValueError(
+                f"Unknown Claudette provider prefix {provider!r}; use a documented provider or ollama/<model>"
+            )
         env: dict[str, str] = {}
         for key in _PROVIDER_KEYS.get(provider, []):
             val = os.environ.get(key)
@@ -106,7 +129,7 @@ class Claudette(BaseInstalledAgent):
         # unless the caller already set a reachable URL. Without this, a local
         # model is simply unusable under Harbor, and every benchmark run costs
         # money it does not need to.
-        if provider not in _PROVIDER_KEYS:
+        if provider == "ollama":
             base = os.environ.get("CLAUDETTE_HARBOR_OLLAMA_URL")
             if not base:
                 host = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")

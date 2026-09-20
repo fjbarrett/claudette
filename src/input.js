@@ -11,9 +11,9 @@
 import { randomUUID } from 'node:crypto';
 
 // A permission prompt accepts a tiny fixed vocabulary. Anything else typed while
-// one is pending is a follow-up, not an answer — so a user who types "actually
-// skip the tests" at a [y/n/a] prompt gets it queued rather than silently read as
-// "a" (always allow). Returns 'y' | 'n' | 'a', or null when it isn't an answer.
+// one is pending is steering text, not an answer — so a user who types "actually
+// skip the tests" at a [y/n/a] prompt denies that tool and redirects rather than
+// silently being read as "a" (always allow). Returns 'y' | 'n' | 'a', or null.
 export function classifyApprovalAnswer(text) {
   const a = String(text ?? '').trim().toLowerCase();
   if (a === 'y' || a === 'yes') return 'y';
@@ -22,11 +22,23 @@ export function classifyApprovalAnswer(text) {
   return null;
 }
 
+// Explicit steering command used while a turn is active. Ordinary submitted
+// text remains queued for the next safe boundary; only this command aborts the
+// foreground model/tool operation. `null` means "not this command", while an
+// empty string means the command was recognised but needs a prompt.
+export function parseInterruptCommand(text) {
+  const line = String(text ?? '').trim();
+  const match = line.match(/^\/interrupt(?:\s+([\s\S]*))?$/i);
+  if (!match) return null;
+  return String(match[1] ?? '').trim();
+}
+
 export class InputController {
   constructor() {
     this.pending = [];      // FIFO of { id, content, queuedAt }
     this.mode = 'idle';     // 'idle' | 'working' | 'approval'
     this._approval = null;  // resolver for the in-flight permission prompt
+    this._redirect = null;  // one prompt to run after the active loop aborts
   }
 
   setMode(mode) {
@@ -69,6 +81,15 @@ export class InputController {
         this.resolveApproval(answer);
         return { kind: 'approval', answer };
       }
+      // Prose at a gate is an explicit change of direction. Leaving it queued
+      // while the approval remains parked can make the terminal look hung for
+      // minutes. Deny the pending tool and retain the prose as the next turn.
+      const item = this.requestRedirect(content);
+      if (item) {
+        this.resolveApproval('n');
+        return { kind: 'redirect', item };
+      }
+      return { kind: 'ignored' };
     }
     const item = this.enqueue(content);
     return item ? { kind: 'queued', item } : { kind: 'ignored' };
@@ -105,6 +126,26 @@ export class InputController {
     this.pending = [];
     return items;
   }
+
+  // ── Explicit interrupt + redirect ────────────────────────────────────────
+
+  requestRedirect(content) {
+    const text = String(content ?? '').trim();
+    if (!text) return null;
+    const item = { id: randomUUID(), content: text, queuedAt: new Date().toISOString() };
+    this._redirect = item;
+    return item;
+  }
+
+  get redirectPending() {
+    return Boolean(this._redirect);
+  }
+
+  takeRedirect() {
+    const item = this._redirect;
+    this._redirect = null;
+    return item;
+  }
 }
 
 // Strip terminal artifacts that leak into captured input. While a turn runs we
@@ -118,8 +159,23 @@ export class InputController {
 // trim. Pure so it's unit-tested in isolation.
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const RENDER_GLYPHS_RE = /[⏺⎿]/u; // ⏺ ⎿
+const SPINNER_STATUS_RE = /^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+(?:(?:Thinking|Working)…?(?:\s+.*)?|Switching model(?:\s+.*)?|Running\s+.+)$/u;
+const MODEL_STATUS_RE = /^\s*(?:model|route)\s{2,}\S.*$/u;
+
+// Raw-mode permission prompts should feel like terminal buttons: one y/n/a
+// keypress confirms immediately. Restrict this to exactly one printable key;
+// callers only invoke it while an approval is pending, so ordinary typing is
+// never intercepted.
+export function classifyApprovalKeystroke(input) {
+  const key = String(input ?? '').replace(ANSI_RE, '').trim();
+  return /^[yna]$/i.test(key) ? key.toLowerCase() : null;
+}
+
 export function sanitizeUserInput(text) {
   let s = String(text ?? '').replace(ANSI_RE, '');
+  // A spinner redraw was once captured as a real user turn (and cost another
+  // provider request). It is terminal chrome, never an intentional prompt.
+  if (!s.includes('\n') && (SPINNER_STATUS_RE.test(s) || MODEL_STATUS_RE.test(s))) return '';
   // Glyph-cut only single-line input: the leak we're fixing appends an echoed
   // tool-result line to a typed line ("cont  ⎿ Wrote …"). A deliberate multi-line
   // paste (a stack trace, a build log) is content the user wants kept whole, so
@@ -163,7 +219,9 @@ export function createInputAssembler({ onLine, onCancel, onChange } = {}) {
         continue;
       }
       const start = s.indexOf(PASTE_START);
-      const segment = start === -1 ? s : s.slice(0, start);
+      // Arrow/function keys arrive as ANSI CSI sequences. Previously ESC was
+      // ignored but the printable tail (`[A`) entered the prompt buffer.
+      const segment = (start === -1 ? s : s.slice(0, start)).replace(ANSI_RE, '');
       for (const ch of segment) {
         const code = ch.charCodeAt(0);
         if (code === 0x03) { buf = ''; changed(); onCancel?.(); }        // Ctrl+C

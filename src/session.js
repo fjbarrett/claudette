@@ -1,24 +1,25 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import { saveTranscript } from './transcript.js';
-import { writeFileAtomic } from './fs-atomic.js';
+import { ensurePrivateDirectory, writeFileAtomic } from './fs-atomic.js';
+import { DATA_DIR } from './state-paths.js';
+import { compactSessionTraceForStorage } from './trace.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const SESSIONS_DIR = path.join(__dirname, '..', 'data', 'sessions');
+export const SESSIONS_DIR = path.join(DATA_DIR, 'sessions');
 export const ARCHIVE_DIR = path.join(SESSIONS_DIR, 'archive');
 const pendingWrites = new Map();
+const activeWrites = new Map(); // id -> latest queued publication
 const SAVE_DEBOUNCE_MS = 150;
 
-await fsp.mkdir(SESSIONS_DIR, { recursive: true });
+await ensurePrivateDirectory(SESSIONS_DIR);
 
-export async function createSession({ model, cwd }) {
+export async function createSession({ model, cwd, title = 'New Session' }) {
   const session = {
     id: randomUUID(),
     model,
     cwd,
-    title: 'New Session',
+    title,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     messages: [],
@@ -40,10 +41,12 @@ export async function loadSession(id) {
 
 export async function saveSession(session) {
   session.updatedAt = new Date().toISOString();
-  return commitSession(session);
+  // A direct save is newer than any queued snapshot. Flush through the same
+  // entry so the debounce timer cannot later restore stale conversation data.
+  return flushSessionSave(session);
 }
 
-export async function scheduleSessionSave(session) {
+export function scheduleSessionSave(session) {
   session.updatedAt = new Date().toISOString();
   let entry = pendingWrites.get(session.id);
   if (!entry) {
@@ -57,11 +60,14 @@ export async function scheduleSessionSave(session) {
       entry.resolve = resolve;
       entry.reject = reject;
     });
+    // Mark the shared promise handled even when a UI caller intentionally does
+    // not await a debounced save. Awaiting it still observes the rejection.
+    entry.promise.catch(() => {});
   }
 
   if (entry.timer) clearTimeout(entry.timer);
   entry.timer = setTimeout(() => {
-    void flushSessionSave(session.id);
+    flushSessionSave(session.id).catch(() => {});
   }, SAVE_DEBOUNCE_MS);
 
   return entry.promise;
@@ -124,10 +130,10 @@ export async function flushSessionSave(sessionOrId) {
   }
 }
 
-export async function listSessions() {
+export async function listSessions({ limit = 0, offset = 0 } = {}) {
   await flushAllSessionSaves();
   let files;
-  try { files = await fsp.readdir(SESSIONS_DIR); } catch { return []; }
+  try { files = await fsp.readdir(SESSIONS_DIR); } catch (err) { console.warn(`listSessions readdir failed: ${err.message}`); return []; }
   const sessions = await Promise.all(
     files
       .filter(f => f.endsWith('.json'))
@@ -139,15 +145,20 @@ export async function listSessions() {
             id: s.id,
             title: s.title ?? 'Untitled',
             model: s.model ?? '?',
+            cwd: s.cwd ?? null,
             updatedAt: s.updatedAt,
             count: s.messages?.length ?? 0,
+            messageCount: s.messages?.length ?? 0,
           };
         } catch { return null; }
       })
   );
-  return sessions
+  const sorted = sessions
     .filter(Boolean)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const start = Math.max(0, Math.floor(offset));
+  const end = limit > 0 ? start + Math.floor(limit) : undefined;
+  return sorted.slice(start, end);
 }
 
 function createPendingEntry(id) {
@@ -163,9 +174,23 @@ function createPendingEntry(id) {
 }
 
 async function commitSession(session) {
-  const file = path.join(SESSIONS_DIR, `${session.id}.json`);
-  await writeFileAtomic(file, JSON.stringify(session, null, 2) + '\n');
-  await saveTranscript(session);
+  const snapshot = cloneSession(session);
+  const file = path.join(SESSIONS_DIR, `${snapshot.id}.json`);
+  const stored = compactSessionTraceForStorage(snapshot);
+  const contents = JSON.stringify(stored, null, 2) + '\n';
+  // Atomic rename prevents torn reads, but does not order concurrent writers.
+  // A slower old save must finish before the newer snapshot is published.
+  const previous = activeWrites.get(snapshot.id) ?? Promise.resolve();
+  const write = previous.catch(() => {}).then(async () => {
+    await writeFileAtomic(file, contents);
+    await saveTranscript(snapshot);
+  });
+  activeWrites.set(snapshot.id, write);
+  try {
+    await write;
+  } finally {
+    if (activeWrites.get(snapshot.id) === write) activeWrites.delete(snapshot.id);
+  }
 }
 
 /**
@@ -180,7 +205,7 @@ export async function archiveMessages(session, reason = 'compact') {
   // loadSession() resolves short ids by prefix — an archive named
   // `<id>.compact-….json` would show up as a session and could be resumed
   // instead of the real one.
-  const file = path.join(ARCHIVE_DIR, `${session.id}.${reason}-${stamp}.json`);
+  const file = path.join(ARCHIVE_DIR, `${session.id}.${reason}-${stamp}-${randomUUID()}.json`);
   await writeFileAtomic(file, JSON.stringify({
     sessionId: session.id,
     reason,
@@ -193,16 +218,22 @@ export async function archiveMessages(session, reason = 'compact') {
 }
 
 async function flushMatchingSession(id) {
-  const match = [...pendingWrites.keys()].find(key => key === id || key.startsWith(id));
+  const keys = new Set([...pendingWrites.keys(), ...activeWrites.keys()]);
+  const match = [...keys].find(key => key === id || key.startsWith(id));
   if (match) {
     await flushSessionSave(match);
+    await activeWrites.get(match);
   }
 }
 
 async function flushAllSessionSaves() {
   await Promise.all([...pendingWrites.keys()].map(id => flushSessionSave(id)));
+  await Promise.all([...activeWrites.values()]);
 }
 
 function cloneSession(session) {
+  if (typeof structuredClone === 'function') {
+    try { return structuredClone(session); } catch {}
+  }
   return JSON.parse(JSON.stringify(session));
 }

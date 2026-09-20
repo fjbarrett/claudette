@@ -10,10 +10,72 @@
 // `onEvent(event, turn)` is an optional sink: the web server uses it to also
 // stream each event to the browser over NDJSON; the CLI leaves it unset.
 import { randomUUID } from 'node:crypto';
+import { explorationStats, isRoutineExplorationTool } from './tool-activity.js';
 
 export function truncateLine(value, max = 160) {
   const line = String(value ?? '').split('\n')[0];
   return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+}
+
+const EXPLORATION_EVENT_TYPES = new Set(['tool_call', 'tool_started', 'tool_result']);
+
+// Collapse only complete, successful, adjacent read-only lifecycles. Errors,
+// writes, shell commands, approvals, and incomplete live calls stay verbatim.
+export function compactTraceEvents(events = []) {
+  const compacted = [];
+  for (let index = 0; index < events.length;) {
+    const event = events[index];
+    if (!EXPLORATION_EVENT_TYPES.has(event?.type)
+        || !isRoutineExplorationTool(event?.data?.name)) {
+      compacted.push(event);
+      index += 1;
+      continue;
+    }
+
+    let end = index;
+    const segment = [];
+    while (end < events.length
+        && EXPLORATION_EVENT_TYPES.has(events[end]?.type)
+        && isRoutineExplorationTool(events[end]?.data?.name)) {
+      segment.push(events[end]);
+      end += 1;
+    }
+    const names = segment.filter(item => item.type === 'tool_call').map(item => item.data.name);
+    const results = segment.filter(item => item.type === 'tool_result');
+    const complete = names.length > 0 && results.length >= names.length;
+    const failed = results.some(item => item.data?.isError);
+    if (!complete || failed) {
+      compacted.push(...segment);
+      index = end;
+      continue;
+    }
+
+    const first = segment[0];
+    const last = segment.at(-1);
+    compacted.push({
+      id: first.id,
+      type: 'tool_activity_summary',
+      at: first.at,
+      data: {
+        category: 'exploration',
+        ...explorationStats(names),
+        completedAt: last.at,
+      },
+    });
+    index = end;
+  }
+  return compacted;
+}
+
+export function compactSessionTraceForStorage(session) {
+  if (!session?.turns?.length) return session;
+  return {
+    ...session,
+    turns: session.turns.map(turn => ({
+      ...turn,
+      events: compactTraceEvents(turn.events),
+    })),
+  };
 }
 
 export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], compacted = false, onEvent = null, onFinish = null } = {}) {
@@ -27,6 +89,7 @@ export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], compac
     cwd,
     expandedFiles,
     compacted, // history was auto-compacted just before this turn
+    finalModel: model,
     metrics: { durationMs: null, promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     events: [],
   };
@@ -51,7 +114,7 @@ export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], compac
     turn.status = status;
     turn.completedAt = new Date().toISOString();
     turn.metrics.durationMs = Date.now() - startedAt;
-    // Fires once per terminal turn (complete/fail) — used to append the usage
+    // Fires once per terminal turn — used to append the usage
     // log. A logging error must never break the turn.
     if (onFinish) { try { onFinish(turn); } catch { /* ignore */ } }
     return turn;
@@ -64,5 +127,7 @@ export function createTurnTrace({ prompt, model, cwd, expandedFiles = [], compac
     complete: () => finish('completed'),
     fail: () => finish('failed'),
     cancel: () => finish('cancelled'),
+    repeat: () => finish('repeating'),
+    maxIterations: () => finish('max_iterations'),
   };
 }

@@ -5,6 +5,7 @@
   "maxTurns": 12,
   "repeat": 1,
   "files": {
+    "package.json": "{\n  \"type\": \"commonjs\"\n}\n",
     "sum.js": "function sum(a, b) {\n  return a - b;\n}\n\nmodule.exports = { sum };\n",
     "test.js": "const { sum } = require('./sum');\n\nconst got = sum(2, 3);\nif (got !== 5) {\n  console.error('FAIL: sum(2, 3) returned ' + got + ', expected 5');\n  process.exit(1);\n}\nconsole.log('PASS');\n",
     "test.sh": "#!/bin/sh\n# Writes .passed only on a green run, so \"it passes now\" is checkable\n# after the fact rather than taken on the agent's word.\nrm -f .passed\nnode test.js || exit 1\necho ok > .passed\n"
@@ -15,6 +16,7 @@
       { "name": "bash", "args": { "command": "test.sh" } }
     ],
     "files": {
+      "package.json": { "equals": "{\n  \"type\": \"commonjs\"\n}\n" },
       "sum.js": { "excludes": "a - b" },
       "test.js": { "includes": "got !== 5" },
       ".passed": { "includes": "ok" }

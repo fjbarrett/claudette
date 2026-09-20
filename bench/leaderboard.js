@@ -22,19 +22,19 @@ async function main() {
   process.stdout.write(markdown);
 }
 
-async function loadLatestReports() {
-  const entries = await fs.readdir(REPORTS_DIR);
+export async function loadLatestReports(reportsDir = REPORTS_DIR) {
+  const entries = await fs.readdir(reportsDir, { withFileTypes: true });
   const latest = new Map();
 
   for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
-    const file = path.join(REPORTS_DIR, entry);
+    if (!entry.isFile() || entry.name.startsWith('.') || !entry.name.endsWith('.json')) continue;
+    const file = path.join(reportsDir, entry.name);
     const report = JSON.parse(await fs.readFile(file, 'utf8'));
     const key = `${report.model}||${report.task.id}`;
-    const stamp = report.completedAt ?? report.startedAt ?? entry;
+    const stamp = report.completedAt ?? report.startedAt ?? entry.name;
     const prev = latest.get(key);
     if (!prev || stamp > prev.stamp) {
-      latest.set(key, { stamp, report, entry });
+      latest.set(key, { stamp, report, entry: entry.name });
     }
   }
 
@@ -142,7 +142,9 @@ function fmt(value) {
   return Number(value).toFixed(1);
 }
 
-main().catch(error => {
-  console.error(error.stack || error.message);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  main().catch(error => {
+    console.error(error.stack || error.message);
+    process.exit(1);
+  });
+}

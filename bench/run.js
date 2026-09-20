@@ -6,7 +6,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { resolveOllamaBaseUrl } from '../src/config.js';
-import { chatStream, missingCredential, defaultCloudModels } from '../src/provider.js';
+import { chatStream, getModels, missingCredential, defaultCloudModels } from '../src/provider.js';
 import { loadTasks } from './tasks.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -580,8 +580,8 @@ function parseArgs(argv) {
 // a key in env — no local Ollama needed), falling back to whatever the local
 // Ollama serves.
 async function getDefaultAgentModel() {
-  const cloud = defaultCloudModels();
-  if (cloud) return cloud.agent;
+  const available = await getModels().catch(() => []);
+  if (available.length) return available[0].name;
 
   let res;
   try {

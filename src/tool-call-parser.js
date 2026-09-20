@@ -31,14 +31,10 @@ const INTERPRETER_TOOLS = {
 function normalizeToolName(raw) {
   const lower = raw.toLowerCase().replace(/[\s-]/g, '_');
   if (TOOL_ALIASES[lower]) return TOOL_ALIASES[lower];
-  // Fuzzy: if any known tool name is a substring match
-  const known = ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'grep'];
-  for (const t of known) if (lower.includes(t.replace('_', '')) || lower.includes(t)) return t;
-  // Fuzzy against aliases keys
-  for (const [alias, tool] of Object.entries(TOOL_ALIASES)) {
-    if (lower.includes(alias)) return tool;
-  }
-  return raw; // return as-is if no match
+  const known = ['bash', 'read_file', 'write_file', 'str_replace', 'glob', 'search_code'];
+  if (known.includes(lower)) return lower;
+  // Exact alias map only — no substring fuzzy to avoid bashful->bash or read_file_v2->read_file
+  return raw;
 }
 
 // Canonical param names — keyed by tool so ambiguous shorthands (e.g. 's') resolve correctly
@@ -183,8 +179,13 @@ export function parseXmlToolCalls(text) {
 }
 
 function parseTextToolCalls(text) {
+  // Hidden reasoning is untrusted prose, not an execution channel. qwen3 can
+  // include several JSON "examples" while deciding how to encode one call; the
+  // old all-object scan executed every example under --yolo. Strip complete and
+  // unterminated think blocks fail-closed, then parse only visible output.
+  const visible = String(text ?? '').replace(/<think\b[^>]*>[\s\S]*?(?:<\/think>|$)/gi, '');
   // Strip markdown code fences
-  const stripped = text.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, '$1').trim();
+  const stripped = visible.replace(/```(?:\w+)?\n?([\s\S]*?)```/g, '$1').trim();
 
   const calls = [];
   // Try the whole text, then each individual JSON object found
@@ -205,6 +206,23 @@ function parseTextToolCalls(text) {
             : rawArgs;
           calls.push({ function: { name: toolName, arguments: args } });
         }
+        continue;
+      }
+
+      // Some Ollama models return the arguments for a Bash call as the entire
+      // visible response, omitting only the tool-name wrapper. Recover that one
+      // unambiguous shape, but never execute a command-shaped JSON fragment
+      // embedded in prose or accept extra keys that could indicate ordinary
+      // structured output rather than a tool request.
+      const bareKeys = obj && typeof obj === 'object' && !Array.isArray(obj)
+        ? Object.keys(obj)
+        : [];
+      if (candidate === stripped
+          && bareKeys.length > 0
+          && bareKeys.every(key => ['command', 'cmd', 'description'].includes(key))
+          && typeof (obj.command ?? obj.cmd) === 'string'
+          && (obj.command ?? obj.cmd).trim()) {
+        calls.push({ function: { name: 'bash', arguments: normalizeArgs(obj, 'bash') } });
         continue;
       }
 
@@ -242,4 +260,3 @@ function parseTextToolCalls(text) {
 
 
 export { parseTextToolCalls, normalizeToolName, normalizeArgs, sanitizeJsonControls, extractJsonObjects };
-

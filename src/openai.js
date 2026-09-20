@@ -8,6 +8,7 @@
 
 import { resolveMaxTokens, promptCacheEnabled } from './llm-config.js';
 import { providerHttpError } from './retry.js';
+import { readSSEData, parseStreamJSON } from './streaming.js';
 
 const PREFIX = 'openai/';
 export const KEY_ENV = 'OPENAI_API_KEY';
@@ -84,6 +85,7 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
 export async function chatCompletionsStream({
   baseUrl, apiKey, model, messages, tools = [], onDelta, signal,
   label = 'OpenAI', extraHeaders = {}, effort = null, reasoningStyle = 'openai',
+  maxTokens = resolveMaxTokens(),
 }) {
   if (!apiKey) throw new Error(`${label}: missing API key`);
 
@@ -93,7 +95,7 @@ export async function chatCompletionsStream({
     stream: true,
     stream_options: { include_usage: true },
     temperature: 0,
-    max_tokens: resolveMaxTokens(),
+    max_tokens: maxTokens,
   };
   if (tools.length) body.tools = toOpenAITools(tools);
   if (effort) {
@@ -143,9 +145,30 @@ export async function chatCompletionsStream({
     throw providerHttpError(label, res, txt);
   }
 
-  const result = await parseChatCompletionsSSE(res.body, onDelta);
+  const result = await parseChatCompletionsSSE(res.body, onDelta, label, signal);
+  result.rateLimit = parseRateLimitHeaders(res.headers);
   result.toolMode = tools.length ? 'native' : 'none';
   return result;
+}
+
+/** Preserve standard OpenAI-compatible quota headers without fabricating data. */
+export function parseRateLimitHeaders(headers) {
+  const integer = name => {
+    const raw = headers?.get?.(name);
+    if (raw == null || raw === '') return null;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : null;
+  };
+  const text = name => headers?.get?.(name) || null;
+  const rateLimit = {
+    requestLimit: integer('x-ratelimit-limit-requests'),
+    remainingRequests: integer('x-ratelimit-remaining-requests'),
+    requestReset: text('x-ratelimit-reset-requests'),
+    tokenLimit: integer('x-ratelimit-limit-tokens'),
+    remainingTokens: integer('x-ratelimit-remaining-tokens'),
+    tokenReset: text('x-ratelimit-reset-tokens'),
+  };
+  return Object.values(rateLimit).some(value => value != null) ? rateLimit : null;
 }
 
 // Request fields a 400 may tell us to drop. Deliberately a short allowlist of
@@ -180,8 +203,7 @@ export function adaptPayload(payload, errorText) {
   }
 
   if (!param) {
-    // Some errors name the field only in prose.
-    param = ADAPTABLE_FIELDS.find(f => new RegExp(`'${f}'`).test(errorText)) ?? null;
+    param = ADAPTABLE_FIELDS.find(f => new RegExp(`["']${f}["']`).test(errorText)) ?? null;
   }
   if (!param || !ADAPTABLE_FIELDS.includes(param) || !(param in payload)) return null;
 
@@ -206,6 +228,9 @@ export function adaptPayload(payload, errorText) {
  */
 export function makeOpenAICompatibleProvider({
   id, label, prefixes, keyEnv, altKeyEnvs = [], baseUrl, baseUrlEnv, family, models = [],
+  modelsPath = null, selectModels = null, capabilities = [], access = null,
+  defaultModels = null, freeTierDefaults = false, transformModel = null,
+  maxTokens = null,
 }) {
   const pres = Array.isArray(prefixes) ? prefixes : [prefixes];
   const keyEnvs = [keyEnv, ...altKeyEnvs];
@@ -223,36 +248,58 @@ export function makeOpenAICompatibleProvider({
   };
   const hasCredentials = () => Boolean(readKey());
 
-  return {
+  const provider = {
     id,
     LABEL: label,
     KEY_ENV: keyEnv,
+    DEFAULT_MODELS: defaultModels,
+    FREE_TIER_DEFAULTS: freeTierDefaults,
     handles,
     stripPrefix,
     hasCredentials,
     async getModels() {
       if (!hasCredentials()) return [];
-      return models.map(idStr => ({
-        name: `${pres[0]}${idStr}`,
+      let entries = models;
+      if (modelsPath) {
+        const response = await fetch(`${readBase()}${modelsPath}`, {
+          headers: { Authorization: `Bearer ${readKey()}` },
+          signal: AbortSignal.timeout(8_000),
+        });
+        if (!response.ok) throw new Error(`${label} /models returned HTTP ${response.status}`);
+        const payload = await response.json();
+        entries = selectModels ? selectModels(payload) : (payload.data ?? []);
+      }
+      return entries.map(entry => {
+        const meta = typeof entry === 'string' ? { id: entry } : entry;
+        return {
+        name: `${pres[0]}${meta.id}`,
         size: 0,
-        family: family ?? id,
-        paramSize: 'cloud',
+        family: meta.family ?? family ?? id,
+        paramSize: meta.paramSize ?? 'cloud',
         modified: null,
-      }));
+        capabilities: meta.capabilities ?? capabilities,
+        access: meta.access ?? access,
+        contextLength: meta.contextLength ?? null,
+      };
+      });
     },
     async chatStream({ model, messages, tools = [], onDelta, signal, effort = null }) {
       if (!hasCredentials()) {
         throw new Error(`${keyEnv} is not set — cannot reach ${label}`);
       }
-      return chatCompletionsStream({
+      const options = {
         baseUrl: readBase(),
         apiKey: readKey(),
-        model: stripPrefix(model),
+        model: transformModel ? transformModel(stripPrefix(model), model) : stripPrefix(model),
         messages, tools, onDelta, signal, label,
         effort, reasoningStyle: 'openrouter',
-      });
+      };
+      const resolvedMaxTokens = typeof maxTokens === 'function' ? maxTokens() : maxTokens;
+      if (resolvedMaxTokens != null) options.maxTokens = resolvedMaxTokens;
+      return chatCompletionsStream(options);
     },
   };
+  return provider;
 }
 
 // Mark up to two ephemeral cache breakpoints on OpenAI-shaped messages: the
@@ -358,65 +405,64 @@ export function toOpenAIMessages(messages = []) {
 
 // ─── SSE stream assembly ─────────────────────────────────────────────────────
 
-async function parseChatCompletionsSSE(stream, onDelta) {
-  const reader = stream.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
+async function parseChatCompletionsSSE(stream, onDelta, label, signal) {
   let fullContent = '';
   const toolsByIndex = new Map();   // delta index → { id, name, argsBuf }
   const order = [];                 // first-seen index order
   let promptTokens = 0;
   let completionTokens = 0;
   let cachedTokens = 0;
+  let resolvedModel = null;
+  let resolvedProvider = null;
+  let completed = false;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';
+  for await (const data of readSSEData(stream)) {
+    signal?.throwIfAborted();
+    if (data.trim() === '[DONE]') { completed = true; break; }
+    if (!data.trim()) continue;
+    const chunk = parseStreamJSON(data, label);
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith('data:')) continue;
-      const data = trimmed.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
-      let chunk;
-      try { chunk = JSON.parse(data); } catch { continue; }
+    if (typeof chunk.model === 'string' && chunk.model) resolvedModel = chunk.model;
+    const upstreamProvider = chunk.provider ?? chunk.provider_name;
+    if (typeof upstreamProvider === 'string' && upstreamProvider) resolvedProvider = upstreamProvider;
 
-      if (chunk.usage) {
-        promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
-        completionTokens = chunk.usage.completion_tokens ?? completionTokens;
-        // Already inside prompt_tokens here — unlike Anthropic, which reports
-        // cached input separately. Kept only so the cost meter can discount it.
-        cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
-      }
+    if (chunk.usage) {
+      promptTokens = chunk.usage.prompt_tokens ?? promptTokens;
+      completionTokens = chunk.usage.completion_tokens ?? completionTokens;
+      // Already inside prompt_tokens here — unlike Anthropic, which reports
+      // cached input separately. Kept only so the cost meter can discount it.
+      cachedTokens = chunk.usage.prompt_tokens_details?.cached_tokens ?? cachedTokens;
+    }
 
-      const choice = chunk.choices?.[0];
-      if (!choice) continue;
-      const delta = choice.delta ?? {};
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+    // Some compatible endpoints close after finish_reason without [DONE].
+    // Keep reading here: the usage-only event can follow the last choice.
+    if (choice.finish_reason != null) completed = true;
+    const delta = choice.delta ?? {};
 
-      if (delta.content) {
-        fullContent += delta.content;
-        onDelta?.(delta.content);
-      }
+    if (delta.content) {
+      fullContent += delta.content;
+      onDelta?.(delta.content);
+    }
 
-      if (Array.isArray(delta.tool_calls)) {
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          let entry = toolsByIndex.get(idx);
-          if (!entry) {
-            entry = { id: tc.id || null, name: '', argsBuf: '' };
-            toolsByIndex.set(idx, entry);
-            order.push(idx);
-          }
-          if (tc.id) entry.id = tc.id;
-          if (tc.function?.name) entry.name = tc.function.name;
-          if (tc.function?.arguments) entry.argsBuf += tc.function.arguments;
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        let entry = toolsByIndex.get(idx);
+        if (!entry) {
+          entry = { id: tc.id || null, name: '', argsBuf: '' };
+          toolsByIndex.set(idx, entry);
+          order.push(idx);
         }
+        if (tc.id) entry.id = tc.id;
+        if (tc.function?.name) entry.name = tc.function.name;
+        if (tc.function?.arguments) entry.argsBuf += tc.function.arguments;
       }
     }
   }
+  signal?.throwIfAborted();
+  if (!completed) throw new Error(`${label}: response ended before completion`);
 
   const toolCalls = order.map((idx, i) => {
     const e = toolsByIndex.get(idx);
@@ -434,5 +480,7 @@ async function parseChatCompletionsSSE(stream, onDelta) {
     promptTokens,
     completionTokens,
     cachedTokens,
+    resolvedModel,
+    resolvedProvider,
   };
 }

@@ -22,8 +22,10 @@
 //       "forbid": ["write_file"],                   // must never be called
 //       "files":  { "src/config.js": {"includes": "90", "excludes": "30"},
 //                   "src/config.js.bak": {"absent": true} },
+//       "unchangedFiles": ["oracle_test.js"],       // exact seeded bytes
 //       "maxToolCalls": 6,                          // efficiency budget
-//       "answer": { "matches": "done" }             // regex on final text
+//       "answer": { "matches": "done", "notMatches": "unsupported claim" }
+//                                                     // positive/negative final-text regexes
 //     }
 //   }
 //
@@ -31,6 +33,8 @@
 // case catches collateral damage — the asked-for change landed, but the model
 // rewrote the file and lost the rest. `maxToolCalls` is how correctness ties
 // break: several models get the right answer, fewer get it without flailing.
+// `allowedFiles` entries are exact paths unless they end in `/**`, which allows
+// a generated directory tree such as `.venv/**` while keeping all siblings out.
 //
 // Arg matching: expected string values must be contained in the actual value
 // (substring), everything else compares strictly. Repeating a case N times
@@ -48,9 +52,10 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { chatStream, defaultCloudModels } from '../src/provider.js';
+import { chatStream, defaultCloudModels, getModels } from '../src/provider.js';
 import { TOOL_DEFS } from '../src/tools.js';
 import { runAgent } from '../src/agent-runner.js';
+import { EVIDENCE_GUIDANCE } from '../src/evidence.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -60,7 +65,8 @@ const REPORTS_DIR = path.join(__dirname, 'runs', 'evals');
 const SYSTEM_PROMPT = [
   'You are a coding agent operating inside a sandbox workspace.',
   'Use the provided tools to complete the task. All paths are relative to the workspace root.',
-  'Make minimal, targeted changes. When the task is complete, reply with a short final answer and no further tool calls.',
+  'Make minimal, targeted changes when changes are requested. When the task is complete, reply with a short final answer and no further tool calls.',
+  EVIDENCE_GUIDANCE,
 ].join(' ');
 
 // ─── Agent loop ───────────────────────────────────────────────────────────────
@@ -77,6 +83,8 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
     model,
     sandbox,
     trim,
+    status: 'running',
+    assistantResponses: [],
     toolCalls: [],
     finalText: '',
     turns: 0,
@@ -121,6 +129,13 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
       maxIterations: maxTurns,
       emit: (type, data) => {
         if (type === 'iteration_start') record.turns = data.iteration;
+        else if (type === 'assistant_text') {
+          record.assistantResponses.push({
+            iteration: data.iteration,
+            content: truncate(data.content ?? '', 500),
+            toolCalls: (data.toolCalls ?? []).map(call => call.function?.name ?? '(missing)'),
+          });
+        }
         else if (type === 'usage') {
           const inTok = data.last?.promptTokens ?? 0;
           if (inTok > record.peakInputTokens) record.peakInputTokens = inTok;
@@ -130,6 +145,7 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
       },
     });
 
+    record.status = run.status;
     record.finalText = run.status === 'completed' ? run.content : '';
     record.promptTokens = run.usage.promptTokens;
     record.completionTokens = run.usage.completionTokens;
@@ -138,10 +154,13 @@ export async function runEvalIteration(caseDef, { model, chatFn = chatStream, ke
         `${run.error?.message ?? 'no error reported'}`);
     }
 
-    const { pass, failures } = await evaluateExpectations(record, caseDef.expect ?? {}, sandbox);
+    const { pass, failures } = await evaluateExpectations(
+      record, caseDef.expect ?? {}, sandbox, caseDef.files ?? {},
+    );
     record.pass = pass;
     record.failures = failures;
   } catch (err) {
+    if (record.status === 'running') record.status = 'failed';
     record.error = err.message;
     record.failures = [`run error: ${err.message}`];
   } finally {
@@ -192,7 +211,7 @@ export function matchToolCalls(actualCalls, expectedCalls) {
   return { ok: true, missing: null };
 }
 
-export async function evaluateExpectations(record, expect, sandbox) {
+export async function evaluateExpectations(record, expect, sandbox, fixtureFiles = {}) {
   const failures = [];
 
   const { ok, missing } = matchToolCalls(record.toolCalls, expect.tools);
@@ -205,6 +224,11 @@ export async function evaluateExpectations(record, expect, sandbox) {
     if (record.toolCalls.some(c => c.name === name)) {
       failures.push(`forbidden tool was called: ${name}`);
     }
+  }
+
+  if (expect.noToolErrors && record.toolCalls.some(call => call.isError)) {
+    const failed = record.toolCalls.filter(call => call.isError).map(call => call.name);
+    failures.push(`tool errors are forbidden; failed calls: ${failed.join(', ')}`);
   }
 
   for (const [rel, check] of Object.entries(expect.files ?? {})) {
@@ -220,6 +244,9 @@ export async function evaluateExpectations(record, expect, sandbox) {
       failures.push(`file ${rel} should not exist`);
       continue;
     }
+    if (check.equals != null && content !== check.equals) {
+      failures.push(`file ${rel} does not exactly equal ${JSON.stringify(check.equals)}`);
+    }
     for (const want of [].concat(check.includes ?? [])) {
       if (!content.includes(want)) {
         failures.push(`file ${rel} does not include ${JSON.stringify(want)}`);
@@ -230,6 +257,35 @@ export async function evaluateExpectations(record, expect, sandbox) {
     for (const unwanted of [].concat(check.excludes ?? [])) {
       if (content.includes(unwanted)) {
         failures.push(`file ${rel} still includes ${JSON.stringify(unwanted)}`);
+      }
+    }
+  }
+
+  for (const rel of expect.unchangedFiles ?? []) {
+    const original = fixtureFiles[rel];
+    if (typeof original !== 'string') {
+      failures.push(`unchanged file is not a seeded fixture: ${rel}`);
+      continue;
+    }
+    try {
+      const content = await fs.readFile(path.join(sandbox, rel), 'utf8');
+      if (content !== original) failures.push(`seeded file changed: ${rel}`);
+    } catch {
+      failures.push(`seeded file missing: ${rel}`);
+    }
+  }
+
+
+  if (expect.allowedFiles) {
+    const allowed = expect.allowedFiles.map(value => String(value).split(path.sep).join('/'));
+    const exact = new Set(allowed.filter(value => !value.endsWith('/**')));
+    const prefixes = allowed
+      .filter(value => value.endsWith('/**') && value.length > 3)
+      .map(value => value.slice(0, -2));
+    const actual = await listSandboxFiles(sandbox);
+    for (const rel of actual) {
+      if (!exact.has(rel) && !prefixes.some(prefix => rel.startsWith(prefix))) {
+        failures.push(`unexpected file created: ${rel}`);
       }
     }
   }
@@ -248,17 +304,37 @@ export async function evaluateExpectations(record, expect, sandbox) {
     }
   }
 
+  if (expect.answer?.notMatches) {
+    const re = new RegExp(expect.answer.notMatches, 'i');
+    if (re.test(record.finalText)) failures.push('final answer contains a forbidden claim');
+  }
+
   return { pass: failures.length === 0, failures };
+}
+
+async function listSandboxFiles(root, current = root) {
+  const files = [];
+  const entries = await fs.readdir(current, { withFileTypes: true });
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const absolute = path.join(current, entry.name);
+    const relative = path.relative(root, absolute).split(path.sep).join('/');
+    if (entry.isDirectory()) files.push(...await listSandboxFiles(root, absolute));
+    else files.push(relative);
+  }
+  return files;
 }
 
 // ─── Case loading / CLI ───────────────────────────────────────────────────────
 
-export async function loadCases() {
-  const entries = await fs.readdir(CASES_DIR);
+export async function loadCases(casesDir = CASES_DIR) {
+  const entries = await fs.readdir(casesDir, { withFileTypes: true });
   const cases = [];
-  for (const entry of entries.sort()) {
-    if (!entry.endsWith('.json')) continue;
-    cases.push(JSON.parse(await fs.readFile(path.join(CASES_DIR, entry), 'utf8')));
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    // Finder/Archive Utility sidecars such as `._case.json` carry binary
+    // metadata, not benchmark definitions. Ignore all hidden and non-file
+    // entries before extension matching so cross-platform copies stay valid.
+    if (!entry.isFile() || entry.name.startsWith('.') || !entry.name.endsWith('.json')) continue;
+    cases.push(JSON.parse(await fs.readFile(path.join(casesDir, entry.name), 'utf8')));
   }
   return cases;
 }
@@ -266,6 +342,9 @@ export async function loadCases() {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   process.env.CLAUDETTE_BENCH_CACHE = args.cache ? '1' : '0';
+  // A model comparison must not silently finish on another route. Rotation is
+  // useful in production, but invalidates model identity, timings, and scores.
+  process.env.CLAUDETTE_MODEL_ROTATION = args.rotation ? '1' : '0';
   const cases = await loadCases();
 
 
@@ -283,7 +362,8 @@ async function main() {
       : 'Use --case <id>, --all, or --list');
   }
 
-  const model = args.model ?? defaultCloudModels()?.agent;
+  const available = args.model ? [] : await getModels().catch(() => []);
+  const model = args.model ?? available[0]?.name ?? defaultCloudModels()?.agent;
   if (!model) {
     throw new Error(
       'No --model given and no cloud API key in env: set one in .env ' +
@@ -292,19 +372,24 @@ async function main() {
   }
 
   const startedAt = Date.now();
-  console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}` +
-    `  |  response cache: ${args.cache ? 'ON (--cache; timings are not measurements)' : 'OFF (default)'}`);
+  if (!args.json) {
+    console.log(`context trimming: ${args.trim ? 'ON (default)' : 'OFF (--no-trim baseline)'}` +
+      `  |  response cache: ${args.cache ? 'ON (--cache; timings are not measurements)' : 'OFF (default)'}` +
+      `  |  model rotation: ${args.rotation ? 'ON (--rotation)' : 'OFF (comparison default)'}`);
+  }
   const results = [];
   for (const caseDef of selected) {
     const repeat = args.repeat ?? caseDef.repeat ?? 1;
     const iterations = [];
     for (let i = 1; i <= repeat; i++) {
-      process.stdout.write(`─ ${caseDef.id} (${i}/${repeat}) ... `);
+      if (!args.json) process.stdout.write(`─ ${caseDef.id} (${i}/${repeat}) ... `);
       const record = await runEvalIteration(caseDef, { model, keepSandbox: args.keep, trim: args.trim });
       iterations.push(record);
       const tok = `in=${record.promptTokens} peak=${record.peakInputTokens} out=${record.completionTokens}`;
-      console.log(`${record.pass ? 'pass' : `FAIL  [${record.failures.join(' | ')}]`}  (${record.toolCalls.length} tools, ${tok})`);
-      if (args.verbose) {
+      if (!args.json) {
+        console.log(`${record.pass ? 'pass' : `FAIL  [${record.failures.join(' | ')}]`}  (${record.toolCalls.length} tools, ${tok})`);
+      }
+      if (args.verbose && !args.json) {
         for (const call of record.toolCalls) {
           console.log(`    ${call.isError ? '✗' : '·'} ${call.name}(${truncate(JSON.stringify(call.args), 120)})`);
         }
@@ -335,6 +420,7 @@ async function main() {
     // Recorded so a report is interpretable later: with the cache on, the
     // durations and token counts may belong to a run from another day.
     cache: args.cache,
+    rotation: args.rotation,
     totals: {
       cases: results.length,
       passed: results.filter(r => r.passAtK).length,
@@ -382,7 +468,7 @@ async function writeReport(summary, model) {
 }
 
 export function parseArgs(argv) {
-  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, cache: false, trim: true, json: false };
+  const args = { cases: [], all: false, list: false, model: null, repeat: null, keep: false, verbose: false, cache: false, trim: true, json: false, rotation: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--case') args.cases.push(argv[++i]);
@@ -402,6 +488,8 @@ export function parseArgs(argv) {
     else if (arg === '--cache') args.cache = true;
     else if (arg === '--no-cache') args.cache = false;   // now the default; kept so old commands still run
     else if (arg === '--json') args.json = true;
+    else if (arg === '--rotation') args.rotation = true;
+    else if (arg === '--no-rotation') args.rotation = false;
     else if (arg === '--trim') args.trim = true;       // context trimming on (default)
     else if (arg === '--no-trim') args.trim = false;   // baseline: re-send everything
     else throw new Error(`Unknown flag: ${arg}`);

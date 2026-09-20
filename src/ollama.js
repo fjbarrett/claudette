@@ -1,11 +1,13 @@
 // Ollama API client — direct connection, no server proxy
 import { resolveOllamaBaseUrl } from './config.js';
 import { providerHttpError } from './retry.js';
+import { requireToolSupport } from './model-policy.js';
+import { readStreamLines, parseStreamJSON } from './streaming.js';
 
 const BASE = resolveOllamaBaseUrl();
 
 export async function getModels() {
-  const res = await fetch(`${BASE}/api/tags`);
+  const res = await fetch(`${BASE}/api/tags`, { signal: AbortSignal.timeout(5000) });
   if (!res.ok) throw new Error(`Ollama /api/tags: ${res.status} ${res.statusText}`);
   const { models = [] } = await res.json();
   return models.map(m => ({
@@ -18,6 +20,7 @@ export async function getModels() {
     // Auto-selection used to guess from a hardcoded list of name fragments,
     // which rots: none of qwen3.6/gpt-oss/devstral matched it.
     capabilities: Array.isArray(m.capabilities) ? m.capabilities : [],
+    access: { free: true, kind: 'local', provider: 'ollama' },
   }));
 }
 
@@ -87,6 +90,9 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
     if (!unsupportedTools) {
       throw providerHttpError('Ollama', res, txt);
     }
+    if (requireToolSupport()) {
+      throw new Error(`Ollama model "${model}" rejected native tools; ${process.env.CLAUDETTE_REQUIRE_TOOLS ? 'CLAUDETTE_REQUIRE_TOOLS is enabled' : 'native tools are required'}.`);
+    }
 
     toolMode = 'text';
     const fallbackMessages = injectFallbackToolPrompt(messages);
@@ -101,43 +107,36 @@ export async function chatStream({ model, messages, tools = [], onDelta, signal,
     }
   }
 
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
   let fullContent = '';
   let toolCalls = [];
   let promptTokens = 0;
   let completionTokens = 0;
+  let completed = false;
 
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
+  for await (const line of readStreamLines(res.body)) {
+    signal?.throwIfAborted();
+    if (!line.trim()) continue;
+    const chunk = parseStreamJSON(line, 'Ollama');
 
-    buf += dec.decode(value, { stream: true });
-    const lines = buf.split('\n');
-    buf = lines.pop() ?? '';
+    const delta = chunk.message?.content ?? '';
+    if (delta) {
+      fullContent += delta;
+      onDelta?.(delta);
+    }
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let chunk;
-      try { chunk = JSON.parse(line); } catch { continue; }
+    if (chunk.message?.tool_calls?.length) {
+      toolCalls.push(...chunk.message.tool_calls);
+    }
 
-      const delta = chunk.message?.content ?? '';
-      if (delta) {
-        fullContent += delta;
-        onDelta?.(delta);
-      }
-
-      if (chunk.message?.tool_calls?.length) {
-        toolCalls.push(...chunk.message.tool_calls);
-      }
-
-      if (chunk.done) {
-        promptTokens = chunk.prompt_eval_count ?? 0;
-        completionTokens = chunk.eval_count ?? 0;
-      }
+    if (chunk.done) {
+      completed = true;
+      promptTokens = chunk.prompt_eval_count ?? 0;
+      completionTokens = chunk.eval_count ?? 0;
+      break;
     }
   }
+  signal?.throwIfAborted();
+  if (!completed) throw new Error('Ollama: response ended before completion');
 
   return {
     content: stripSpecialTokens(fullContent),

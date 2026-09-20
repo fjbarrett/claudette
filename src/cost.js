@@ -29,6 +29,8 @@ const DEFAULT_PRICES = {
   'gpt-4.1': { in: 2, out: 8 },
   'o4-mini': { in: 1.1, out: 4.4 },
   'o3': { in: 2, out: 8 },
+  'deepseek-v4-pro': { in: 0.435, out: 0.87 },
+  'deepseek-v4-flash': { in: 0.14, out: 0.28 },
   'deepseek': { in: 0.27, out: 1.1 },
   'llama-3.3': { in: 0.1, out: 0.3 },
 };

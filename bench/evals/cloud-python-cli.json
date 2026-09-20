@@ -1,0 +1,31 @@
+{
+  "id": "cloud-python-cli",
+  "title": "Create and verify a standard-library Python slugify CLI in a workspace venv",
+  "prompt": "Create a Python CLI and its tests without network access. Do not read or modify the existing oracle_test.py. Use write_file to create slugify.py, test_slugify.py, and .gitignore, in that order. slugify.py must export slugify(text): normalize Unicode accents to ASCII, lowercase, replace each run of non-alphanumeric characters with one hyphen, and strip leading/trailing hyphens. Required examples include Crème brûlée -> creme-brulee, alpha___beta...gamma -> alpha-beta-gamma, ---Version 2.0--- -> version-2-0, and !!! -> an empty string. Its argparse CLI takes one positional text argument and prints the slug. test_slugify.py must use unittest and cover at least accents, repeated separators, leading/trailing punctuation, digits, and an empty punctuation-only value. .gitignore must contain exactly these three lines with no comment: .venv/, __pycache__/, and *.py[cod]. Then run these four checks as separate Bash calls in order: python3 -m venv .venv; .venv/bin/python -m unittest -v test_slugify.py; .venv/bin/python -m unittest -v oracle_test.py; .venv/bin/python slugify.py \"Crème brûlée & Coffee!\". If a check fails, make a targeted repair and rerun it. Do not install packages or create other project files. If every check passes and the sample prints creme-brulee-coffee, reply with exactly PYTHON_CLI_OK.",
+  "files": {
+    "oracle_test.py": "import subprocess\nimport sys\nimport unittest\n\nfrom slugify import slugify\n\n\nclass OracleTests(unittest.TestCase):\n    def test_accents(self):\n        self.assertEqual(slugify(\"Crème brûlée & Coffee!\"), \"creme-brulee-coffee\")\n\n    def test_separator_runs(self):\n        self.assertEqual(slugify(\"alpha___beta...gamma\"), \"alpha-beta-gamma\")\n\n    def test_edges_and_digits(self):\n        self.assertEqual(slugify(\"---Version 2.0---\"), \"version-2-0\")\n\n    def test_empty(self):\n        self.assertEqual(slugify(\"!!!\"), \"\")\n\n    def test_cli(self):\n        result = subprocess.run(\n            [sys.executable, \"slugify.py\", \"  Déjà vu  \"],\n            check=True,\n            capture_output=True,\n            text=True,\n        )\n        self.assertEqual(result.stdout, \"deja-vu\\n\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+  },
+  "maxTurns": 14,
+  "repeat": 1,
+  "expect": {
+    "tools": [
+      { "name": "write_file", "args": { "path": "slugify.py" } },
+      { "name": "write_file", "args": { "path": "test_slugify.py" } },
+      { "name": "write_file", "args": { "path": ".gitignore" } },
+      { "name": "bash", "args": { "command": "python3 -m venv .venv" } },
+      { "name": "bash", "args": { "command": ".venv/bin/python -m unittest -v test_slugify.py" } },
+      { "name": "bash", "args": { "command": ".venv/bin/python -m unittest -v oracle_test.py" } },
+      { "name": "bash", "args": { "command": ".venv/bin/python slugify.py" } }
+    ],
+    "forbid": ["fetch_url"],
+    "maxToolCalls": 14,
+    "allowedFiles": ["oracle_test.py", "slugify.py", "test_slugify.py", ".gitignore", ".venv/**", "__pycache__/**"],
+    "files": {
+      "oracle_test.py": { "includes": ["class OracleTests", "deja-vu\\n"] },
+      "slugify.py": { "includes": ["def slugify", "argparse", "unicodedata", "if __name__ =="] },
+      "test_slugify.py": { "includes": ["unittest", "slugify", "Crème", "Version", "version-2-0"] },
+      ".gitignore": { "equals": ".venv/\n__pycache__/\n*.py[cod]\n" }
+    },
+    "answer": { "matches": "^\\s*PYTHON_CLI_OK\\s*$" }
+  }
+}

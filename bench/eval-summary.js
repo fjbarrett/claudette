@@ -43,21 +43,21 @@ async function main() {
  * newest *report* silently drops every case that run did not include, which
  * reads as "never tested" for results that are sitting right there on disk.
  */
-async function loadLatestPerModel(since) {
-  const entries = await fs.readdir(REPORTS_DIR);
+export async function loadLatestPerModel(since, reportsDir = REPORTS_DIR) {
+  const entries = await fs.readdir(reportsDir, { withFileTypes: true });
   const latest = new Map(); // model -> caseId -> {stamp, result}
 
   for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue;
-    if (since && entry < since) continue;
+    if (!entry.isFile() || entry.name.startsWith('.') || !entry.name.endsWith('.json')) continue;
+    if (since && entry.name < since) continue;
     let report;
     try {
-      report = JSON.parse(await fs.readFile(path.join(REPORTS_DIR, entry), 'utf8'));
+      report = JSON.parse(await fs.readFile(path.join(reportsDir, entry.name), 'utf8'));
     } catch {
       continue; // a run killed mid-write should not break the table
     }
     if (!report?.model || !Array.isArray(report.results)) continue;
-    const stamp = report.generatedAt ?? entry;
+    const stamp = report.generatedAt ?? entry.name;
     if (!latest.has(report.model)) latest.set(report.model, new Map());
     const byCase = latest.get(report.model);
     for (const result of report.results) {
@@ -126,7 +126,9 @@ function renderMarkdown(runs, since) {
   return lines.join('\n');
 }
 
-main().catch(error => {
-  console.error(error.message);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  main().catch(error => {
+    console.error(error.message);
+    process.exit(1);
+  });
+}

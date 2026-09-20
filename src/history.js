@@ -8,10 +8,10 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { DATA_DIR } from './state-paths.js';
+import { appendPrivateFileSync } from './fs-atomic.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const HISTORY_DIR = path.join(__dirname, '..', 'data', 'history');
+const HISTORY_DIR = path.join(DATA_DIR, 'history');
 const MAX_LINES = 1000;
 
 export function historyFile(cwd, dir = HISTORY_DIR) {
@@ -36,18 +36,27 @@ export async function loadHistory(cwd, { dir = HISTORY_DIR, max = MAX_LINES } = 
 // Append one entered line. Skips blanks and consecutive duplicates, and only
 // stores single-line entries (a pasted block collapses to one space-joined line
 // so up-arrow recall stays sane). Best-effort: never throws.
+const historyLastLine = new Map(); // file -> last appended line (in-memory dedup, avoids read race)
 export function appendHistory(cwd, line, { dir = HISTORY_DIR } = {}) {
   const text = String(line ?? '').replace(/\s+/g, ' ').trim();
   if (!text) return;
   try {
-    fs.mkdirSync(dir, { recursive: true });
     const file = historyFile(cwd, dir);
-    let last = '';
-    try {
-      const prev = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
-      last = prev[prev.length - 1] ?? '';
-    } catch { /* no file yet */ }
-    if (text === last) return; // skip immediate duplicate
-    fs.appendFileSync(file, text + '\n', 'utf8');
+    if (historyLastLine.get(file) === text) return;
+    // Best-effort duplicate check via in-memory, plus file read as fallback
+    if (!historyLastLine.has(file)) {
+      try {
+        const prev = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+        const last = prev[prev.length - 1] ?? '';
+        if (text === last) { historyLastLine.set(file, text); return; }
+      } catch {}
+    }
+    appendPrivateFileSync(file, text + '\n');
+    historyLastLine.set(file, text);
+    // bound map
+    if (historyLastLine.size > 100) {
+      const first = historyLastLine.keys().next().value;
+      historyLastLine.delete(first);
+    }
   } catch { /* history is best-effort */ }
 }

@@ -164,14 +164,17 @@ export function validateTask(task, source = 'task') {
 }
 
 export async function loadTasks(tasksDir = TASKS_DIR) {
-  const entries = await fs.readdir(tasksDir);
+  const entries = await fs.readdir(tasksDir, { withFileTypes: true });
   const tasks = [];
   for (const entry of entries) {
-    const ext = path.extname(entry).toLowerCase();
+    // Never parse AppleDouble/Finder sidecars or extension-shaped directories
+    // as task definitions after a macOS → Linux archive transfer.
+    if (!entry.isFile() || entry.name.startsWith('.')) continue;
+    const ext = path.extname(entry.name).toLowerCase();
     if (ext !== '.json' && ext !== '.yaml' && ext !== '.yml') continue;
-    const raw = await fs.readFile(path.join(tasksDir, entry), 'utf8');
+    const raw = await fs.readFile(path.join(tasksDir, entry.name), 'utf8');
     const task = ext === '.json' ? JSON.parse(raw) : parseYaml(raw);
-    tasks.push(validateTask(task, entry));
+    tasks.push(validateTask(task, entry.name));
   }
   return tasks.sort((a, b) => a.id.localeCompare(b.id));
 }

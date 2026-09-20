@@ -11,10 +11,11 @@ import path from 'node:path';
 import os from 'node:os';
 import http from 'node:http';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync, execFile as nativeExecFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { stripVTControlCharacters } from 'node:util';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -57,33 +58,33 @@ const LIVE_SKIP = process.env.CLAUDETTE_SKIP_LIVE
   ? 'live-model suite skipped (CLAUDETTE_SKIP_LIVE); run `npm run test:live` for it'
   : (LIVE_MODEL ? false : 'no local Ollama model available (start Ollama or pull a model)');
 
-function httpGet(url) {
+function httpGet(url, headers = {}) {
   return new Promise((resolve, reject) => {
-    http.get(url, res => {
+    http.get(url, { headers }, res => {
       let body = '';
       res.on('data', d => body += d);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, body: JSON.parse(body) }); }
-        catch { resolve({ status: res.statusCode, body }); }
+        try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(body) }); }
+        catch { resolve({ status: res.statusCode, headers: res.headers, body }); }
       });
     }).on('error', reject);
   });
 }
 
-function httpPost(url, data) {
+function httpPost(url, data, headers = {}) {
   return new Promise((resolve, reject) => {
     const payload = typeof data === 'string' ? data : JSON.stringify(data);
     const opts = new URL(url);
     const req = http.request({
       hostname: opts.hostname, port: opts.port, path: opts.pathname + opts.search,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...headers },
     }, res => {
       let body = '';
       res.on('data', d => body += d);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, body: JSON.parse(body) }); }
-        catch { resolve({ status: res.statusCode, body }); }
+        try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(body) }); }
+        catch { resolve({ status: res.statusCode, headers: res.headers, body }); }
       });
     });
     req.on('error', reject);
@@ -215,6 +216,276 @@ describe('env.js (.env loader)', async () => {
     const applied = loadEnv({ env: {}, files: ['/no/such/path/.env'] });
     assert.deepEqual(applied, []);
   });
+
+  test('default candidates never trust cwd and support an explicit config file', async () => {
+    const { candidateFiles } = await import('../src/env.js');
+    const defaults = candidateFiles({
+      env: {},
+      cwd: '/untrusted/project',
+      home: '/trusted/home',
+      packageRoot: '/trusted/package',
+    });
+    assert.deepEqual(defaults, [
+      path.join('/trusted/package', '.env'),
+      path.join('/trusted/home', '.config', 'claudette', '.env'),
+    ]);
+    assert.equal(defaults.includes(path.join('/untrusted/project', '.env')), false);
+
+    assert.deepEqual(candidateFiles({
+      env: { CLAUDETTE_ENV_FILE: '../config/claudette.env' },
+      cwd: '/trusted/launch',
+      home: '/trusted/home',
+      packageRoot: '/trusted/package',
+    }), [
+      path.join('/trusted/config', 'claudette.env'),
+      path.join('/trusted/package', '.env'),
+      path.join('/trusted/home', '.config', 'claudette', '.env'),
+    ]);
+  });
+});
+
+describe('workspace confinement', async () => {
+  test('macOS workspace sandbox is production-default and test-opt-in', async () => {
+    const { workspaceSandboxEnabled } = await import('../src/workspace-sandbox.js');
+    assert.equal(workspaceSandboxEnabled({}, 'darwin'), true);
+    assert.equal(workspaceSandboxEnabled({ NODE_ENV: 'test' }, 'darwin'), false);
+    assert.equal(workspaceSandboxEnabled({ NODE_ENV: 'test', CLAUDETTE_WORKSPACE_SANDBOX: '1' }, 'darwin'), true);
+    assert.equal(workspaceSandboxEnabled({}, 'linux'), false);
+    assert.equal(workspaceSandboxEnabled({ CLAUDETTE_WORKSPACE_SANDBOX: '0' }, 'darwin'), false);
+  });
+
+  test('sandbox workspace follows --cwd and data state can be relocated', async () => {
+    const { resolveBashNetworkAccess, resolveSandboxWorkspace } = await import('../src/workspace-sandbox.js');
+    const { resolveDataDir } = await import('../src/state-paths.js');
+    assert.equal(resolveSandboxWorkspace(['--cwd', 'child'], '/tmp/root'), '/tmp/root/child');
+    assert.equal(resolveSandboxWorkspace([], '/tmp/root'), '/tmp/root');
+    assert.equal(resolveDataDir({ CLAUDETTE_DATA_DIR: '/tmp/local-state' }), '/tmp/local-state');
+    assert.equal(resolveBashNetworkAccess([], {}), false);
+    assert.equal(resolveBashNetworkAccess(['--network'], {}), true);
+    assert.equal(resolveBashNetworkAccess([], { CLAUDETTE_BASH_NETWORK: 'yes' }), true);
+    assert.equal(resolveBashNetworkAccess([], { CLAUDETTE_BASH_NETWORK: '0' }), false);
+  });
+
+  test('control-directory bootstrap rejects symlinks and keeps state private', async () => {
+    const workspace = await makeTmpDir();
+    const outside = await makeTmpDir();
+    const { prepareWorkspaceControlDirs } = await import('../src/workspace-sandbox.js');
+    try {
+      await fsp.symlink(outside, path.join(workspace, '.claudette'));
+      await assert.rejects(
+        prepareWorkspaceControlDirs(workspace),
+        /Refusing unsafe Claudette control path/,
+      );
+      assert.deepEqual(await fsp.readdir(outside), [], 'no control directories were written outside');
+
+      await fsp.unlink(path.join(workspace, '.claudette'));
+      const roots = await prepareWorkspaceControlDirs(workspace);
+      for (const root of Object.values(roots)) {
+        const stat = await fsp.lstat(root);
+        assert.equal(stat.isSymbolicLink(), false);
+        assert.equal(stat.mode & 0o777, 0o700);
+      }
+    } finally {
+      await cleanDir(workspace);
+      await cleanDir(outside);
+    }
+  });
+
+  test('profiles deny outside file mutation and model-side remote control', async () => {
+    const { buildWorkspaceSandboxProfile } = await import('../src/workspace-sandbox.js');
+    const { bashNetworkEnabled, buildBashSandboxProfile } = await import('../src/tools.js');
+    const outer = buildWorkspaceSandboxProfile();
+    const bash = buildBashSandboxProfile();
+    assert.match(outer, /deny file-write\*/);
+    assert.match(outer, /deny file-read-data/);
+    assert.match(outer, /deny appleevent-send/);
+    assert.match(outer, /\(literal "\/etc"\)/);
+    assert.match(outer, /\(literal "\/var"\)/);
+    assert.match(bash, /deny signal \(require-not \(target same-sandbox\)\)/,
+      'sandboxed commands may manage their own child tree but not other processes');
+    assert.match(bash, /deny network-outbound/);
+    const networkedBash = buildBashSandboxProfile({ allowNetwork: true });
+    assert.doesNotMatch(networkedBash, /deny network-outbound/,
+      'explicit network mode removes only the outbound-network denial');
+    assert.doesNotMatch(bash, /mDNSResponder|resolv\.conf/,
+      'default profile does not gain resolver-file access');
+    assert.match(networkedBash, /\(literal "\/private\/var\/run\/mDNSResponder"\)/,
+      'explicit mode reads only the trusted macOS resolver socket');
+    assert.match(networkedBash, /\(literal "\/private\/var\/run\/resolv\.conf"\)/,
+      'explicit mode reads only the trusted macOS resolver configuration');
+    assert.match(networkedBash, /\(literal "\/etc"\)/);
+    assert.match(networkedBash, /\(literal "\/var"\)/,
+      'explicit mode permits metadata probes of macOS resolver symlink roots');
+    assert.equal(bashNetworkEnabled({}), false);
+    assert.equal(bashNetworkEnabled({ CLAUDETTE_BASH_NETWORK: 'on' }), true);
+    assert.equal(bashNetworkEnabled({ CLAUDETTE_BASH_NETWORK: 'false' }), false);
+    assert.match(bash, /\(literal "\/dev\/urandom"\)/,
+      'language runtimes can read system entropy without gaining device writes');
+    assert.match(bash, /\(subpath \(param "DEVELOPER_ROOT"\)\)/,
+      'only the canonical system-selected developer root is readable');
+    assert.doesNotMatch(bash, /\(subpath "\/Applications"\)/,
+      'the profile never grants blanket Applications access');
+  });
+
+  test('macOS profile permits inside work and denies sibling read/write', { skip: process.platform !== 'darwin' }, async () => {
+    const workspace = await fsp.realpath(await makeTmpDir());
+    const sibling = path.join(path.dirname(workspace), `claudette-outside-${randomUUID()}.txt`);
+    await fsp.writeFile(sibling, 'outside-secret');
+    try {
+      const { buildWorkspaceSandboxProfile } = await import('../src/workspace-sandbox.js');
+      const nodeRuntime = path.dirname(path.dirname(process.execPath));
+      const probe = spawnSync('/usr/bin/sandbox-exec', [
+        '-D', `WORKSPACE=${workspace}`,
+        '-D', `PACKAGE_ROOT=${ROOT}`,
+        '-D', `NODE_RUNTIME=${nodeRuntime}`,
+        '-D', `HOST_ROOT=${path.dirname(os.homedir())}`,
+        '-D', `HOST_HOME=${os.homedir()}`,
+        '-D', `PACKAGE_PARENT=${path.dirname(ROOT)}`,
+        '-D', 'TTY_PATH=/dev/null',
+        '-p', buildWorkspaceSandboxProfile(),
+        '/bin/bash', '-c', `touch inside.txt; cat ${JSON.stringify(sibling)} >/dev/null 2>&1; echo read=$?; touch ${JSON.stringify(sibling)} 2>/dev/null; echo write=$?`,
+      ], { cwd: workspace, encoding: 'utf8' });
+      assert.equal(probe.status, 0, probe.stderr);
+      assert.match(probe.stdout, /read=1/);
+      assert.match(probe.stdout, /write=1/);
+      assert.equal(await fsp.readFile(path.join(workspace, 'inside.txt'), 'utf8'), '');
+      assert.equal(await fsp.readFile(sibling, 'utf8'), 'outside-secret');
+    } finally {
+      await cleanDir(workspace);
+      await fsp.unlink(sibling).catch(() => {});
+    }
+  });
+
+  test('workspace transition guard accepts descendants and rejects siblings', async () => {
+    const root = await makeTmpDir();
+    const child = path.join(root, 'child');
+    const sibling = await makeTmpDir();
+    await fsp.mkdir(child);
+    try {
+      const { confineWorkspacePath } = await import('../src/chat.js');
+      assert.equal(await confineWorkspacePath(child, root), await fsp.realpath(child));
+      await assert.rejects(confineWorkspacePath(sibling, root), /outside the launch workspace/);
+    } finally {
+      await cleanDir(root);
+      await cleanDir(sibling);
+    }
+  });
+});
+
+// The launcher-side Bash broker is a capability boundary, not a general RPC
+// service. Exercise its schema/lifecycle without relying on a filesystem socket
+// or allowing callers to select executables, profiles, environments, or roots.
+describe('Bash broker IPC', async () => {
+  function linkedChannels(EventEmitter) {
+    const left = new EventEmitter();
+    const right = new EventEmitter();
+    for (const channel of [left, right]) {
+      channel.connected = true;
+      channel.channel = { ref() {}, unref() {} };
+    }
+    left.send = (message, callback) => {
+      queueMicrotask(() => right.emit('message', structuredClone(message)));
+      callback?.(null);
+    };
+    right.send = (message, callback) => {
+      queueMicrotask(() => left.emit('message', structuredClone(message)));
+      callback?.(null);
+    };
+    const disconnect = () => {
+      left.connected = false;
+      right.connected = false;
+      left.emit('disconnect');
+      right.emit('disconnect');
+    };
+    return { parent: left, child: right, disconnect };
+  }
+
+  test('rejects malformed requests that try to add an environment', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { attachBashBroker } = await import('../src/bash-broker.js');
+    const channel = new EventEmitter();
+    channel.connected = true;
+    const sent = [];
+    channel.send = (message, callback) => { sent.push(message); callback?.(null); };
+    let executed = false;
+    const close = attachBashBroker(channel, {
+      workspace: '/fixed/workspace',
+      execute: async () => { executed = true; return 'must not run'; },
+    });
+    try {
+      channel.emit('message', { channel: 'claudette-bash-broker', version: 1, type: 'hello' });
+      const token = sent.find(message => message.type === 'ready')?.token;
+      assert.ok(token, 'handshake returns a per-channel capability');
+      channel.emit('message', {
+        channel: 'claudette-bash-broker', version: 1, type: 'request', token,
+        id: 'malformed-1', command: 'echo unsafe', cwd: '/fixed/workspace',
+        env: { PATH: '/attacker' },
+      });
+      const rejection = sent.find(message => message.type === 'rejected' && message.id === 'malformed-1');
+      assert.match(rejection?.error ?? '', /Malformed or unauthorized/);
+      assert.equal(executed, false, 'executor is unreachable for a non-exact schema');
+    } finally {
+      close();
+    }
+  });
+
+  test('forwards cancellation to the active launcher executor', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { attachBashBroker, createBashBrokerClient } = await import('../src/bash-broker.js');
+    const pair = linkedChannels(EventEmitter);
+    let signalSeen;
+    let markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const closeParent = attachBashBroker(pair.parent, {
+      workspace: '/fixed/workspace',
+      execute: ({ signal }) => new Promise((resolve, reject) => {
+        signalSeen = signal;
+        markStarted();
+        signal.addEventListener('abort', () => reject(new Error('executor aborted')), { once: true });
+      }),
+    });
+    const client = createBashBrokerClient(pair.child);
+    try {
+      await client.ready();
+      const controller = new AbortController();
+      const running = client.run('sleep 30', '/fixed/workspace', controller.signal);
+      await started;
+      controller.abort();
+      await assert.rejects(running, /interrupted by the user/);
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(signalSeen?.aborted, true, 'parent executor receives the cancellation');
+    } finally {
+      client.close();
+      closeParent();
+    }
+  });
+
+  test('broker death rejects the caller and aborts active work', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { attachBashBroker, createBashBrokerClient } = await import('../src/bash-broker.js');
+    const pair = linkedChannels(EventEmitter);
+    let signalSeen;
+    let markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const closeParent = attachBashBroker(pair.parent, {
+      workspace: '/fixed/workspace',
+      execute: ({ signal }) => new Promise((resolve, reject) => {
+        signalSeen = signal;
+        markStarted();
+        signal.addEventListener('abort', () => reject(new Error('executor aborted')), { once: true });
+      }),
+    });
+    const client = createBashBrokerClient(pair.child);
+    await client.ready();
+    const running = client.run('sleep 30', '/fixed/workspace');
+    await started;
+    pair.disconnect();
+    await assert.rejects(running, /broker disconnected/i);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(signalSeen?.aborted, true, 'launcher cleanup aborts the command');
+    client.close();
+    closeParent();
+  });
 });
 
 // ─── Session module tests ─────────────────────────────────────────────────────
@@ -335,6 +606,53 @@ describe('session.js', async () => {
     assert.equal(loaded.title, 'Latest Title');
     assert.equal(loaded.messages.at(-1)?.content, 'latest snapshot');
     try { await fsp.unlink(path.join(SESSIONS_DIR, `${session.id}.json`)); } catch {}
+  });
+
+  test('an ignored debounced save failure does not become an unhandled rejection', async () => {
+    const { scheduleSessionSave } = await import('../src/session.js');
+    let unhandled = null;
+    const onUnhandled = reason => { unhandled = reason; };
+    process.once('unhandledRejection', onUnhandled);
+    scheduleSessionSave({
+      id: 'invalid\0session',
+      model: 'mock',
+      cwd: '/tmp',
+      messages: [],
+      turns: [],
+    });
+    await new Promise(resolve => setTimeout(resolve, 250));
+    await new Promise(resolve => setImmediate(resolve));
+    process.off('unhandledRejection', onUnhandled);
+    assert.equal(unhandled, null);
+  });
+
+  test('formatTranscript separates tools and summarizes successful read-only exploration', async () => {
+    const { formatTranscript } = await import('../src/transcript.js');
+    const session = {
+      id: 'transcript-test', title: 'Transcript', model: 'mock', cwd: '/work',
+      messages: [
+        { role: 'user', content: 'inspect it' },
+        { role: 'assistant', content: '', tool_calls: [
+          { id: 'read-1', function: { name: 'read_file', arguments: { path: 'secret.txt' } } },
+          { id: 'list-1', function: { name: 'list_dir', arguments: { path: '.' } } },
+        ] },
+        { role: 'tool', tool_call_id: 'read-1', content: 'large private file body' },
+        { role: 'tool', tool_call_id: 'list-1', content: 'Directory: .\n- secret.txt' },
+        { role: 'assistant', content: 'I found the relevant file.' },
+        { role: 'assistant', content: '', tool_calls: [
+          { id: 'bash-1', function: { name: 'bash', arguments: { command: 'npm test' } } },
+        ] },
+        { role: 'tool', tool_call_id: 'bash-1', content: 'tests passed' },
+      ],
+    };
+    const transcript = formatTranscript(session);
+    assert.match(transcript, /\[USER\]\ninspect it/);
+    assert.match(transcript, /\[TOOLS\]\nExplored 2 items — 1 read · 1 listing/);
+    assert.ok(!transcript.includes('large private file body'), 'routine result bodies are omitted');
+    assert.match(transcript, /\[ASSISTANT\]\nI found the relevant file\./);
+    assert.match(transcript, /\[TOOLS\]\n\[CALL bash\]\n\{\n  "command": "npm test"/);
+    assert.match(transcript, /\[RESULT bash\]\ntests passed/);
+    assert.equal(session.messages.length, 7, 'formatting does not mutate resumable protocol history');
   });
 });
 
@@ -467,7 +785,7 @@ describe('context.js', async () => {
 // accumulated file reads re-sent every iteration).
 
 describe('context.js (tool-output trimming)', async () => {
-  const { trimToolOutputs } = await import('../src/context.js');
+  const { resolveToolOutputTrimOptions, trimToolOutputs } = await import('../src/context.js');
 
   test('collapses old large tool results, keeps the most recent N, never mutates input', () => {
     const msgs = [{ role: 'system', content: 'sys' }, { role: 'user', content: 'hi' }];
@@ -490,6 +808,39 @@ describe('context.js (tool-output trimming)', async () => {
     const manySmall = Array.from({ length: 10 }, () => ({ role: 'tool', content: 'tiny' }));
     assert.equal(trimToolOutputs(manySmall), manySmall, 'all-small results → nothing worth collapsing');
   });
+
+  test('a total budget excerpts large recent results fairly without mutating stored history', () => {
+    const lengths = [100, 5000, 200, 5000];
+    const msgs = lengths.map((length, i) => ({ role: 'tool', tool_call_id: `c${i}`, content: String(i).repeat(length) }));
+    const trimmed = trimToolOutputs(msgs, { keep: 6, maxTotalChars: 2000 });
+    const contents = trimmed.map(message => message.content);
+    assert.ok(contents.reduce((sum, content) => sum + content.length, 0) <= 2000);
+    assert.equal(contents[0], msgs[0].content, 'small result keeps its full budget');
+    assert.equal(contents[2], msgs[2].content, 'unused small-result budget is redistributed');
+    assert.match(contents[1], /tool output excerpted from 5000 chars/);
+    assert.match(contents[3], /tool output excerpted from 5000 chars/);
+    assert.deepEqual(trimmed.map(message => message.tool_call_id), ['c0', 'c1', 'c2', 'c3']);
+    assert.deepEqual(msgs.map(message => message.content.length), lengths, 'stored messages stay full');
+  });
+
+  test('Groq gets an 8K tool-output budget with an env override and disable switch', () => {
+    assert.deepEqual(resolveToolOutputTrimOptions('groq/qwen/qwen3.8-27b', {}), { maxTotalChars: 8000 });
+    assert.deepEqual(resolveToolOutputTrimOptions('groq/openai/gpt-oss-120b', { GROQ_TOOL_OUTPUT_CHARS: '4096.9' }), { maxTotalChars: 4096 });
+    assert.equal(resolveToolOutputTrimOptions('groq/openai/gpt-oss-120b', { GROQ_TOOL_OUTPUT_CHARS: '0' }), undefined);
+    assert.equal(resolveToolOutputTrimOptions('openai/gpt-4o', {}), undefined);
+  });
+
+  test('OpenRouter gets a 12K tool-output budget with an env override and disable switch', () => {
+    assert.deepEqual(resolveToolOutputTrimOptions('openrouter/free', {}), { maxTotalChars: 12_000 });
+    assert.deepEqual(
+      resolveToolOutputTrimOptions('openrouter/nvidia/model:free', { OPENROUTER_TOOL_OUTPUT_CHARS: '3456' }),
+      { maxTotalChars: 3456 },
+    );
+    assert.equal(
+      resolveToolOutputTrimOptions('openrouter/free', { OPENROUTER_TOOL_OUTPUT_CHARS: '0' }),
+      undefined,
+    );
+  });
 });
 
 // ─── Tools module tests ───────────────────────────────────────────────────────
@@ -509,6 +860,276 @@ describe('tools.js', async () => {
     const { executeTool } = await import('../src/tools.js');
     const out = await executeTool('bash', { command: 'echo hello-world' }, { cwd: tmpDir, workspace: tmpDir });
     assert.ok(out.includes('hello-world'), 'got stdout');
+  });
+
+  test('executeTool bash: automatically activates an existing workspace .venv', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const workspace = path.join(tmpDir, `venv-workspace-${randomUUID()}`);
+    const bin = path.join(workspace, '.venv', 'bin');
+    await fsp.mkdir(bin, { recursive: true });
+    await fsp.writeFile(path.join(workspace, '.venv', 'pyvenv.cfg'), 'home = /usr/bin\n');
+    await fsp.writeFile(path.join(bin, 'python3'), '#!/bin/sh\necho workspace-python\n', { mode: 0o755 });
+
+    const out = await executeTool('bash', {
+      command: 'python3; printf "venv=%s\\n" "$VIRTUAL_ENV"',
+    }, { cwd: workspace, workspace });
+    const expectedVirtualEnv = await fsp.realpath(path.join(workspace, '.venv'));
+    assert.match(out, /workspace-python/);
+    assert.ok(out.includes(`venv=${expectedVirtualEnv}`), out);
+  });
+
+  test('resolveWorkspaceVirtualEnv: ignores a workspace-controlled venv symlink', async () => {
+    const { resolveWorkspaceVirtualEnv } = await import('../src/tools.js');
+    const workspace = path.join(tmpDir, `venv-symlink-workspace-${randomUUID()}`);
+    const outside = path.join(tmpDir, `venv-symlink-target-${randomUUID()}`);
+    await fsp.mkdir(path.join(outside, 'bin'), { recursive: true });
+    await fsp.writeFile(path.join(outside, 'pyvenv.cfg'), 'home = /usr/bin\n');
+    await fsp.writeFile(path.join(outside, 'bin', 'python3'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    await fsp.mkdir(workspace);
+    await fsp.symlink(outside, path.join(workspace, '.venv'));
+
+    assert.equal(await resolveWorkspaceVirtualEnv(workspace), null);
+  });
+
+  test('trustedExternalPythonRuntimeRoot: allows known system prefixes only', async () => {
+    const { trustedExternalPythonRuntimeRoot } = await import('../src/tools.js');
+    assert.equal(trustedExternalPythonRuntimeRoot('/opt/anaconda3/bin/python3.14', 'darwin'), '/opt/anaconda3');
+    assert.equal(trustedExternalPythonRuntimeRoot('/opt/conda/bin/python3', 'linux'), '/opt/conda');
+    assert.equal(trustedExternalPythonRuntimeRoot('/opt/custom/bin/python3', 'darwin'), null);
+    assert.equal(trustedExternalPythonRuntimeRoot('/Users/alice/.pyenv/versions/3.14/bin/python3', 'darwin'), null);
+  });
+
+  test('explainBashFailure: identifies PEP 668 without calling the workspace read-only', async () => {
+    const { explainBashFailure } = await import('../src/tools.js');
+    const explained = explainBashFailure('error: externally-managed-environment');
+    assert.match(explained, /PEP 668/);
+    assert.match(explained, /not evidence that the workspace is read-only/);
+    assert.match(explained, /\.venv\/bin\/python/);
+    assert.equal(explainBashFailure('ordinary command failure'), 'ordinary command failure');
+  });
+
+  test('executeTool bash: strict sandbox uses the workspace virtualenv', { skip: process.platform !== 'darwin' }, async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const workspace = path.join(tmpDir, `sandbox-venv-workspace-${randomUUID()}`);
+    const bin = path.join(workspace, '.venv', 'bin');
+    await fsp.mkdir(bin, { recursive: true });
+    await fsp.writeFile(path.join(workspace, '.venv', 'pyvenv.cfg'), 'home = /usr/bin\n');
+    await fsp.writeFile(path.join(bin, 'python3'), '#!/bin/sh\necho sandbox-workspace-python\n', { mode: 0o755 });
+    const previous = process.env.CLAUDETTE_BASH_SANDBOX;
+    process.env.CLAUDETTE_BASH_SANDBOX = '1';
+    try {
+      const out = await executeTool('bash', { command: 'python3' }, { cwd: workspace, workspace });
+      assert.equal(out, 'sandbox-workspace-python');
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDETTE_BASH_SANDBOX;
+      else process.env.CLAUDETTE_BASH_SANDBOX = previous;
+    }
+  });
+
+  test('executeTool bash: strict sandbox supports disk SQLite in a home-directory workspace', { skip: process.platform !== 'darwin' }, async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const workspace = await fsp.realpath(await fsp.mkdtemp(path.join(os.homedir(), '.claudette-sqlite-test-')));
+    const previous = process.env.CLAUDETTE_BASH_SANDBOX;
+    process.env.CLAUDETTE_BASH_SANDBOX = '1';
+    try {
+      const code = [
+        'import os, sqlite3, tempfile',
+        'for filename in ["relative.db", os.path.abspath("absolute.db"), os.path.join(tempfile.mkdtemp(), "temp.db")]:',
+        '    with sqlite3.connect(filename) as db:',
+        '        db.execute("pragma journal_mode=wal")',
+        '        db.execute("create table results (value integer)")',
+        '        db.execute("insert into results values (42)")',
+        '    with sqlite3.connect(filename) as db:',
+        '        assert db.execute("select value from results").fetchone() == (42,)',
+        'print("sqlite-disk-ok")',
+      ].join('\n');
+      await fsp.writeFile(path.join(workspace, 'sqlite_probe.py'), code);
+      const out = await executeTool('bash', { command: 'python3 sqlite_probe.py' }, { cwd: workspace, workspace });
+      assert.match(out, /sqlite-disk-ok/);
+      await assert.rejects(executeTool('bash', { command: 'ls /Users' }, { cwd: workspace, workspace }),
+        /Operation not permitted|Permission denied/, 'parent metadata does not grant directory listings');
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDETTE_BASH_SANDBOX;
+      else process.env.CLAUDETTE_BASH_SANDBOX = previous;
+      await cleanDir(workspace);
+    }
+  });
+
+  test('executeTool bash: marks collection coverage and masked check statuses as limited evidence', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const workspace = path.join(tmpDir, 'check-evidence');
+    await fsp.mkdir(workspace);
+    await fsp.writeFile(path.join(workspace, 'pytest'), '#!/bin/sh\nprintf "655 tests collected\\nTOTAL 11082 9240 12.26%%\\n"\n', { mode: 0o755 });
+    await fsp.writeFile(path.join(workspace, 'mypy'), '#!/bin/sh\nexit 2\n', { mode: 0o755 });
+    const collected = await executeTool('bash', { command: './pytest --co -q | tail -2 || true' }, { cwd: workspace, workspace });
+    assert.match(collected, /collection-only/i);
+    assert.match(collected, /does not execute/i);
+    assert.match(collected, /not.*test-suite coverage/i);
+    assert.match(collected, /statement counts.*not.*file lengths/i);
+    assert.match(collected, /655 tests collected/);
+    const masked = await executeTool('bash', { command: './mypy src || true' }, { cwd: workspace, workspace });
+    assert.match(masked, /exit status.*masked/i);
+    assert.match(masked, /not proof.*passed/i);
+    assert.equal(await executeTool('bash', { command: "printf 'pytest --co || true'" }, { cwd: workspace, workspace }),
+      'pytest --co || true', 'quoted command examples must not acquire execution notes');
+  });
+
+  test('executeTool bash: output pipelines preserve upstream failures', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await assert.rejects(executeTool('bash', {
+      command: "printf 'mypy failed\\n'; (printf 'sqlite3.OperationalError: unable to open database file\\n' >&2; exit 7) 2>&1 | tail -10",
+    }, { cwd: tmpDir, workspace: tmpDir }), /sqlite3.OperationalError/);
+    assert.match(await executeTool('bash', {
+      command: "printf 'passing check\\n' | tail -10",
+    }, { cwd: tmpDir, workspace: tmpDir }), /passing check/);
+  });
+
+  test('executeTool bash: strict sandbox scrubs secrets and blocks parent escape', { skip: process.platform !== 'darwin' }, async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const previousSandbox = process.env.CLAUDETTE_BASH_SANDBOX;
+    const previousKey = process.env.OPENAI_API_KEY;
+    const previousAllow = process.env.CLAUDETTE_TOOL_ENV_ALLOW;
+    process.env.CLAUDETTE_BASH_SANDBOX = '1';
+    process.env.OPENAI_API_KEY = 'must-not-reach-tools';
+    delete process.env.CLAUDETTE_TOOL_ENV_ALLOW;
+    try {
+      const out = await executeTool('bash', {
+        command: 'test -z "$OPENAI_API_KEY" && echo scrubbed > inside.txt; cat inside.txt',
+      }, { cwd: tmpDir, workspace: tmpDir });
+      assert.equal(out, 'scrubbed');
+      await assert.rejects(
+        executeTool('bash', { command: 'cd .. && pwd' }, { cwd: tmpDir, workspace: tmpDir }),
+        /Parent traversal is not allowed/
+      );
+    } finally {
+      if (previousSandbox === undefined) delete process.env.CLAUDETTE_BASH_SANDBOX;
+      else process.env.CLAUDETTE_BASH_SANDBOX = previousSandbox;
+      if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousKey;
+      if (previousAllow === undefined) delete process.env.CLAUDETTE_TOOL_ENV_ALLOW;
+      else process.env.CLAUDETTE_TOOL_ENV_ALLOW = previousAllow;
+    }
+  });
+
+  test('executeTool bash: nested login shells can read system startup files without extra stderr', { skip: process.platform !== 'darwin' }, async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const previous = process.env.CLAUDETTE_BASH_SANDBOX;
+    process.env.CLAUDETTE_BASH_SANDBOX = '1';
+    try {
+      const output = await executeTool('bash', {
+        command: "sh -lc 'printf login-ok'",
+      }, { cwd: tmpDir, workspace: tmpDir });
+      assert.equal(output, 'login-ok', 'login startup must not contaminate worker logs');
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDETTE_BASH_SANDBOX;
+      else process.env.CLAUDETTE_BASH_SANDBOX = previous;
+    }
+  });
+
+  test('executeTool bash: strict OS sandbox denies an absolute outside read', { skip: process.platform !== 'darwin' }, async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const outside = path.join(path.dirname(tmpDir), `claudette-outside-${randomUUID()}.txt`);
+    const previous = process.env.CLAUDETTE_BASH_SANDBOX;
+    await fsp.writeFile(outside, 'do-not-read');
+    process.env.CLAUDETTE_BASH_SANDBOX = '1';
+    try {
+      await assert.rejects(
+        executeTool('bash', { command: `cat ${JSON.stringify(outside)}` }, { cwd: tmpDir, workspace: tmpDir }),
+        /Operation not permitted|Permission denied/
+      );
+      assert.equal(await fsp.readFile(outside, 'utf8'), 'do-not-read');
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDETTE_BASH_SANDBOX;
+      else process.env.CLAUDETTE_BASH_SANDBOX = previous;
+      await fsp.unlink(outside).catch(() => {});
+    }
+  });
+
+  test('executeTool bash: strict sandbox permits local tooling and loopback but not parent signals', { skip: process.platform !== 'darwin' }, async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const server = http.createServer((_req, res) => res.end('loopback-ok'));
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const { port } = server.address();
+    const previous = process.env.CLAUDETTE_BASH_SANDBOX;
+    process.env.CLAUDETTE_BASH_SANDBOX = '1';
+    try {
+      const out = await executeTool('bash', {
+        command: `node -e "fetch('http://127.0.0.1:${port}').then(r => r.text()).then(console.log)" && npm --version`,
+      }, { cwd: tmpDir, workspace: tmpDir });
+      assert.match(out, /loopback-ok/);
+      assert.match(out, /\d+\.\d+\.\d+/);
+      const childOut = await executeTool('bash', {
+        command: '/bin/sleep 2 & worker=$!; /bin/kill -TERM "$worker"; wait "$worker"; test "$?" -ge 128 && echo child-signal-ok',
+      }, { cwd: tmpDir, workspace: tmpDir });
+      assert.match(childOut, /^child-signal-ok/m);
+      await assert.rejects(
+        executeTool('bash', { command: `kill -0 ${process.pid}` }, { cwd: tmpDir, workspace: tmpDir }),
+        /Operation not permitted|Permission denied/
+      );
+    } finally {
+      if (previous === undefined) delete process.env.CLAUDETTE_BASH_SANDBOX;
+      else process.env.CLAUDETTE_BASH_SANDBOX = previous;
+      await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('looksLikeDevServerCommand: detects common servers without swallowing builds or explicit backgrounding', async () => {
+    const { looksLikeDevServerCommand } = await import('../src/tools.js');
+    for (const command of [
+      'npm run dev',
+      'cd web && PORT=4321 pnpm start',
+      'npx next dev --turbo',
+      'python3 -m http.server 8080',
+      'node server.js',
+      'docker compose up',
+    ]) assert.equal(looksLikeDevServerCommand(command), true, command);
+
+    for (const command of [
+      'npm run build',
+      'npm test',
+      'node --check server.js',
+      'node -e "setTimeout(() => {}, 5000)"',
+      'npm run dev > dev.log 2>&1 &',
+      'docker compose up -d',
+      'cd infra && docker compose up --detach',
+    ]) assert.equal(looksLikeDevServerCommand(command), false, command);
+  });
+
+  test('executeTool bash: a recognized dev server starts in the background with logs and a stop command', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const appDir = path.join(tmpDir, `background-dev-${randomUUID()}`);
+    await fsp.mkdir(appDir);
+    await fsp.writeFile(path.join(appDir, 'package.json'), JSON.stringify({
+      scripts: { dev: 'node -e "console.log(\'DEV_SERVER_READY\'); setInterval(() => {}, 1000)"' },
+    }));
+
+    const startedAt = Date.now();
+    const out = await executeTool('bash', { command: 'npm run dev' }, { cwd: appDir, workspace: tmpDir });
+    assert.ok(Date.now() - startedAt < 2000, `returned promptly: ${out}`);
+    const pid = Number(out.match(/^PID: (\d+)$/m)?.[1]);
+    const logPath = out.match(/^Logs: (.+)$/m)?.[1];
+    assert.ok(pid > 0, `returned a PID: ${out}`);
+    assert.ok(logPath, `returned a log path: ${out}`);
+    assert.equal(path.isAbsolute(logPath), true, 'log path is canonical and absolute');
+    assert.equal((await fsp.lstat(path.dirname(logPath))).isSymbolicLink(), false,
+      'validated control directory is never a workspace symlink');
+    assert.match(out, new RegExp(`Stop: kill -- -${pid}`));
+
+    try {
+      let logText = '';
+      for (let attempt = 0; attempt < 60 && !logText.includes('DEV_SERVER_READY'); attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        try { logText = await fsp.readFile(logPath, 'utf8'); } catch {}
+      }
+      assert.match(logText, /DEV_SERVER_READY/, 'the detached server reached its ready state');
+      assert.doesNotThrow(() => process.kill(pid, 0), 'the detached process remains alive after the tool returns');
+    } finally {
+      try { process.kill(-pid, 'SIGTERM'); } catch {}
+      await fsp.rm(logPath, { force: true });
+    }
   });
 
   test('executeTool read_file: a missing file returns an actionable error (not bare ENOENT)', async () => {
@@ -608,12 +1229,20 @@ describe('tools.js', async () => {
     const out = await executeTool('read_file', { path: 'sample.txt' }, { cwd: tmpDir, workspace: tmpDir });
     assert.ok(out.includes('sample content'), 'reads file');
     assert.ok(out.includes('second line'), 'reads all lines');
+    const zeroRange = await executeTool(
+      'read_file',
+      { path: 'sample.txt', offset: 0, limit: 0 },
+      { cwd: tmpDir, workspace: tmpDir },
+    );
+    assert.equal(zeroRange, out, 'nonpositive ranges are normalized to a full-file read');
   });
 
   test('executeTool read_file: error on missing required path arg', async () => {
     const { executeTool } = await import('../src/tools.js');
-    const out = await executeTool('read_file', {}, { cwd: tmpDir, workspace: tmpDir });
-    assert.ok(out.includes('Error') || out.includes('requires'), 'error for missing path');
+    await assert.rejects(
+      executeTool('read_file', {}, { cwd: tmpDir, workspace: tmpDir }),
+      /requires.*path/i,
+    );
   });
 
   test('executeTool read_file: lists directory contents', async () => {
@@ -681,8 +1310,10 @@ describe('tools.js', async () => {
 
   test('executeTool write_file: error on missing content', async () => {
     const { executeTool } = await import('../src/tools.js');
-    const out = await executeTool('write_file', { path: 'x.txt' }, { cwd: tmpDir, workspace: tmpDir });
-    assert.ok(out.includes('Error'), 'error when content missing');
+    await assert.rejects(
+      executeTool('write_file', { path: 'x.txt' }, { cwd: tmpDir, workspace: tmpDir }),
+      /requires.*content/i,
+    );
   });
 
   test('executeTool str_replace: replaces unique string', async () => {
@@ -751,8 +1382,10 @@ describe('tools.js', async () => {
 
   test('executeTool glob: requires pattern arg', async () => {
     const { executeTool } = await import('../src/tools.js');
-    const out = await executeTool('glob', {}, { cwd: tmpDir, workspace: tmpDir });
-    assert.ok(out.includes('Error'), 'error for missing pattern');
+    await assert.rejects(
+      executeTool('glob', {}, { cwd: tmpDir, workspace: tmpDir }),
+      /requires.*pattern/i,
+    );
   });
 
   test('executeTool search_code: finds matching lines with line numbers', async () => {
@@ -811,6 +1444,53 @@ describe('tools.js', async () => {
     assert.ok(deep.includes('leaf.txt'), 'depth 2 shows grandchild');
   });
 
+  test('executeTool list_dir: shows but does not descend into generated trees by default', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    await fsp.mkdir(path.join(tmpDir, '.next', 'cache', 'webpack'), { recursive: true });
+    await fsp.mkdir(path.join(tmpDir, 'node_modules', 'a-package'), { recursive: true });
+    await fsp.writeFile(path.join(tmpDir, '.next', 'cache', 'webpack', 'huge.bin'), 'x');
+    await fsp.writeFile(path.join(tmpDir, 'node_modules', 'a-package', 'index.js'), 'x');
+
+    const pruned = await executeTool('list_dir', { path: '.', depth: 5 }, { cwd: tmpDir, workspace: tmpDir });
+    assert.match(pruned, /\.next\/ \[generated; contents skipped\]/);
+    assert.match(pruned, /node_modules\/ \[generated; contents skipped\]/);
+    assert.ok(!pruned.includes('huge.bin') && !pruned.includes('a-package'), 'generated contents stay out of context');
+
+    const explicit = await executeTool(
+      'list_dir', { path: '.next', depth: 3, include_generated: true },
+      { cwd: tmpDir, workspace: tmpDir },
+    );
+    assert.ok(explicit.includes('huge.bin'), 'an explicit generated path remains inspectable');
+  });
+
+  test('executeTool list_dir: caps broad listings with an actionable marker', async () => {
+    const { executeTool, resolveListDirMaxEntries } = await import('../src/tools.js');
+    const crowded = path.join(tmpDir, 'crowded');
+    await fsp.mkdir(crowded, { recursive: true });
+    await Promise.all(Array.from({ length: 12 }, (_, i) => fsp.writeFile(path.join(crowded, `file-${i}.txt`), '')));
+    const out = await executeTool(
+      'list_dir', { path: 'crowded', depth: 1, max_entries: 5 },
+      { cwd: tmpDir, workspace: tmpDir },
+    );
+    assert.equal(out.split('\n').filter(line => line.startsWith('- ')).length, 5);
+    assert.match(out, /listing capped at 5 entries; use a narrower path/);
+    assert.equal(resolveListDirMaxEntries(50_000), 1_000, 'model cannot request an unbounded listing');
+  });
+
+  test('executeTool list_dir: preserves the root inventory before deep traversal consumes the cap', async () => {
+    const { executeTool } = await import('../src/tools.js');
+    const overview = path.join(tmpDir, 'overview');
+    const first = path.join(overview, 'a-large-tree');
+    await fsp.mkdir(first, { recursive: true });
+    await Promise.all(Array.from({ length: 10 }, (_, i) => fsp.writeFile(path.join(first, `nested-${i}.txt`), '')));
+    await fsp.writeFile(path.join(overview, 'z-important-root.txt'), 'keep visible');
+    const out = await executeTool(
+      'list_dir', { path: 'overview', depth: 2, max_entries: 5 },
+      { cwd: tmpDir, workspace: tmpDir },
+    );
+    assert.ok(out.includes('z-important-root.txt'), 'root sibling is listed before descending into a-large-tree');
+  });
+
   test('executeTool fetch_url: refuses loopback and private destinations', async () => {
     const { executeTool } = await import('../src/tools.js');
     // fetch_url is auto-approved, so it must not reach the host's own network.
@@ -837,6 +1517,55 @@ describe('tools.js', async () => {
         /private or loopback/,
         `${host} is blocked`
       );
+    }
+  });
+
+  test('fetch_url validates every DNS answer before choosing a pinned address', async () => {
+    const { resolvePublicHost } = await import('../src/tools.js');
+    const parsed = new URL('https://public.example/resource');
+    await assert.rejects(
+      resolvePublicHost(parsed, async () => [
+        { address: '93.184.216.34', family: 4 },
+        { address: '127.0.0.1', family: 4 },
+      ]),
+      /private or loopback.*127\.0\.0\.1/,
+    );
+    assert.deepEqual(
+      await resolvePublicHost(parsed, async () => [{ address: '93.184.216.34', family: 4 }]),
+      { address: '93.184.216.34', family: 4 },
+    );
+  });
+
+  test('pinned fetch transport enforces response-size and deadline limits', async () => {
+    const { requestPinnedUrl, resolveFetchLimits } = await import('../src/tools.js');
+    const miniServer = http.createServer((req, res) => {
+      if (req.url === '/large') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('x'.repeat(512));
+        return;
+      }
+      setTimeout(() => {
+        if (!res.destroyed) res.end('late');
+      }, 100);
+    });
+    await new Promise(resolve => miniServer.listen(0, '127.0.0.1', resolve));
+    const { port } = miniServer.address();
+    const pinned = { address: '127.0.0.1', family: 4 };
+    try {
+      await assert.rejects(
+        requestPinnedUrl(new URL(`http://public.test:${port}/large`), pinned, null, { timeoutMs: 1_000, maxBytes: 100 }),
+        /exceeds 100 bytes/,
+      );
+      await assert.rejects(
+        requestPinnedUrl(new URL(`http://public.test:${port}/slow`), pinned, null, { timeoutMs: 20, maxBytes: 1_000 }),
+        /timed out after 20 ms/,
+      );
+      assert.deepEqual(resolveFetchLimits({ CLAUDETTE_FETCH_TIMEOUT: '321', CLAUDETTE_FETCH_MAX_BYTES: '654' }), {
+        timeoutMs: 321,
+        maxBytes: 654,
+      });
+    } finally {
+      await new Promise(resolve => miniServer.close(resolve));
     }
   });
 
@@ -869,8 +1598,10 @@ describe('tools.js', async () => {
 
   test('executeTool fetch_url: throws on missing url arg', async () => {
     const { executeTool } = await import('../src/tools.js');
-    const out = await executeTool('fetch_url', {}, { cwd: tmpDir, workspace: tmpDir });
-    assert.ok(out.includes('Error'), 'error for missing url');
+    await assert.rejects(
+      () => executeTool('fetch_url', {}, { cwd: tmpDir, workspace: tmpDir }),
+      /fetch_url requires/
+    );
   });
 
   test('executeTool patch_file: applies a single patch', async () => {
@@ -922,7 +1653,7 @@ describe('tools.js', async () => {
     assert.equal(resolveBashTimeout({ CLAUDETTE_BASH_TIMEOUT: 'nope' }), 120_000);
   });
 
-  test('executeTool bash: a timeout returns guidance (raise timeout / don\'t run servers)', async () => {
+  test('executeTool bash: a timeout returns guidance for long foreground commands', async () => {
     const { executeTool } = await import('../src/tools.js');
     const prev = process.env.CLAUDETTE_BASH_TIMEOUT;
     process.env.CLAUDETTE_BASH_TIMEOUT = '300'; // 0.3s
@@ -932,7 +1663,7 @@ describe('tools.js', async () => {
         await executeTool('bash', { command: 'sleep 2' }, { cwd: tmpDir, workspace: tmpDir });
       } catch (e) { msg = e.message; }
       assert.match(msg, /timed out after/);
-      assert.match(msg, /CLAUDETTE_BASH_TIMEOUT|never exits|next dev/, 'gives a recovery hint');
+      assert.match(msg, /CLAUDETTE_BASH_TIMEOUT|background/, 'gives a recovery hint');
     } finally {
       if (prev === undefined) delete process.env.CLAUDETTE_BASH_TIMEOUT; else process.env.CLAUDETTE_BASH_TIMEOUT = prev;
     }
@@ -1384,7 +2115,7 @@ describe('provider.js', async () => {
     assert.equal(providerFor('anthropic:claude-opus-4-8').chatStream, anthropic.chatStream, 'legacy colon');
     assert.equal(providerFor('openai/gpt-4o').chatStream, openai.chatStream);
     assert.equal(providerFor('deepseek/deepseek-reasoner').chatStream, deepseek.chatStream);
-    assert.equal(providerFor('groq/llama-3.3-70b-versatile').chatStream, groq.chatStream);
+    assert.equal(providerFor('groq/openai/gpt-oss-120b').chatStream, groq.chatStream);
     assert.equal(providerFor('hf/meta-llama/Llama-3.3-70B-Instruct').chatStream, huggingface.chatStream);
     // Bare names and explicit ollama/ prefix → Ollama. So do unknown org/model
     // ids (e.g. a HuggingFace-style local Ollama pull) that lack a known prefix.
@@ -1395,13 +2126,15 @@ describe('provider.js', async () => {
 
   test('getModels merges cloud providers (only those with a key set)', async () => {
     const { getModels } = await import('../src/provider.js');
-    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'GROQ_API_KEY', 'HF_TOKEN'];
+    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'DEEPSEEK_API_KEY', 'DEEPSEEK_KEY', 'GROQ_API_KEY', 'HF_TOKEN', 'HF_KEY'];
     const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
     process.env.ANTHROPIC_API_KEY = 'k';
     process.env.OPENAI_API_KEY = 'k';
     delete process.env.DEEPSEEK_API_KEY;
+    delete process.env.DEEPSEEK_KEY;
     delete process.env.GROQ_API_KEY;
     delete process.env.HF_TOKEN;
+    delete process.env.HF_KEY;
     try {
       const models = await getModels();
       const names = models.map(m => m.name);
@@ -1416,9 +2149,10 @@ describe('provider.js', async () => {
 
   test('defaultCloudModels picks the first credentialed provider in registry order', async () => {
     const { defaultCloudModels } = await import('../src/provider.js');
-    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
+    const keys = ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'GROQ_API_KEY', 'OPENROUTER_API_KEY'];
     const prev = Object.fromEntries(keys.map(k => [k, process.env[k]]));
     try {
+      delete process.env.OPENROUTER_API_KEY;
       process.env.ANTHROPIC_API_KEY = 'k';
       process.env.OPENAI_API_KEY = 'k';
       assert.equal(defaultCloudModels().agent, 'anthropic/claude-opus-4-8',
@@ -1431,6 +2165,11 @@ describe('provider.js', async () => {
       assert.equal(defaultCloudModels().judge, 'openai/gpt-4o-mini');
 
       delete process.env.OPENAI_API_KEY;
+      process.env.GROQ_API_KEY = 'k';
+      assert.equal(defaultCloudModels().agent, 'groq/openai/gpt-oss-120b');
+      assert.equal(defaultCloudModels().judge, 'groq/openai/gpt-oss-20b');
+
+      delete process.env.GROQ_API_KEY;
       assert.equal(defaultCloudModels(), null, 'null when no credentialed provider declares defaults');
     } finally {
       for (const k of keys) { if (prev[k] == null) delete process.env[k]; else process.env[k] = prev[k]; }
@@ -1457,9 +2196,314 @@ describe('provider.js', async () => {
   });
 });
 
+describe('provider model rotation (free native-tool failover)', async () => {
+  const {
+    createModelRotation,
+    estimateRequestTokens,
+    modelRotationEnabled,
+    providerRequestedTokens,
+    resolveGroqRotationTokenLimit,
+    resolveModelRotationMax,
+    runWithModelRotation,
+  } = await import('../src/provider.js');
+
+  const freeTool = name => ({ name, capabilities: ['tools'], access: { free: true } });
+
+  test('rotation defaults on, is explicitly disableable, and has a bounded switch budget', () => {
+    assert.equal(modelRotationEnabled({}), true);
+    assert.equal(modelRotationEnabled({ CLAUDETTE_MODEL_ROTATION: '0' }), false);
+    assert.equal(resolveModelRotationMax({}), 2);
+    assert.equal(resolveModelRotationMax({ CLAUDETTE_MODEL_ROTATION_MAX: '2' }), 2);
+    assert.equal(resolveModelRotationMax({ CLAUDETTE_MODEL_ROTATION_MAX: 'nope' }), 2);
+    assert.equal(resolveGroqRotationTokenLimit({}), 8_000);
+    assert.equal(resolveGroqRotationTokenLimit({ GROQ_TPM_LIMIT: '16000' }), 16_000);
+    assert.ok(estimateRequestTokens([{ role: 'user', content: 'hello' }], []) >= 1_024);
+    assert.equal(providerRequestedTokens(new Error('Limit 8000, Requested 24,678, reduce it')), 24_678);
+  });
+
+  test('selector uses only free tool models and hops providers before siblings', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'groq/start',
+      enabled: true,
+      maxSwitches: 2,
+      loadModels: async () => [
+        freeTool('groq/start'),
+        freeTool('groq/second'),
+        freeTool('openrouter/free'),
+        { name: 'paid/tools', capabilities: ['tools'], access: { free: false } },
+        { name: 'free/no-tools', capabilities: [], access: { free: true } },
+      ],
+    });
+    const rateLimit = Object.assign(new Error('limited'), { status: 429 });
+    assert.equal(await rotation.next({ from: 'groq/start', error: rateLimit }), 'openrouter/free');
+    assert.equal(await rotation.next({ from: 'openrouter/free', error: rateLimit }), null,
+      'provider-wide failures do not bounce back to the failed Groq provider');
+    assert.deepEqual(rotation.attemptedModels, ['groq/start', 'openrouter/free']);
+  });
+
+  test('selector follows the shared coding rank for model-specific failures', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'openrouter/poolside/laguna-s-2.1:free',
+      enabled: true,
+      maxSwitches: 3,
+      loadModels: async () => [
+        freeTool('openrouter/minimax/minimax-m3:free'),
+        freeTool('groq/openai/gpt-oss-120b'),
+        freeTool('openrouter/z-ai/glm-5.2:free'),
+        freeTool('openrouter/poolside/laguna-s-2.1:free'),
+      ],
+    });
+    const modelFailure = Object.assign(new Error('model unavailable'), { status: 404 });
+    assert.equal(
+      await rotation.next({ from: 'openrouter/poolside/laguna-s-2.1:free', error: modelFailure }),
+      'openrouter/z-ai/glm-5.2:free',
+    );
+    assert.equal(
+      await rotation.next({ from: 'openrouter/z-ai/glm-5.2:free', error: modelFailure }),
+      'groq/openai/gpt-oss-120b',
+    );
+    assert.equal(
+      await rotation.next({ from: 'groq/openai/gpt-oss-120b', error: modelFailure }),
+      'openrouter/minimax/minimax-m3:free',
+    );
+  });
+
+  test('selector prefers benchmarked Ollama Cloud winners when they are live', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'ollama/broken',
+      enabled: true,
+      loadModels: async () => [
+        freeTool('openrouter/poolside/laguna-s-2.1:free'),
+        freeTool('deepseek-v4-pro:cloud'),
+        freeTool('kimi-k2.7-code:cloud'),
+      ],
+    });
+    const modelFailure = Object.assign(new Error('model unavailable'), { status: 404 });
+    assert.equal(
+      await rotation.next({ from: 'ollama/broken', error: modelFailure }),
+      'kimi-k2.7-code:cloud',
+    );
+    assert.equal(
+      await rotation.next({ from: 'kimi-k2.7-code:cloud', error: modelFailure }),
+      'deepseek-v4-pro:cloud',
+    );
+  });
+
+  test('provider-wide limits hop providers while preserving rank within viable routes', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'openrouter/poolside/laguna-s-2.1:free',
+      enabled: true,
+      loadModels: async () => [
+        freeTool('openrouter/z-ai/glm-5.2:free'),
+        freeTool('groq/openai/gpt-oss-120b'),
+        freeTool('openrouter/minimax/minimax-m3:free'),
+        freeTool('hf/fallback'),
+      ],
+    });
+    const rateLimit = Object.assign(new Error('account rate limit'), { status: 429 });
+    assert.equal(
+      await rotation.next({ from: 'openrouter/poolside/laguna-s-2.1:free', error: rateLimit }),
+      'groq/openai/gpt-oss-120b',
+      'a shared OpenRouter limit does not immediately burn another OpenRouter request',
+    );
+    assert.equal(
+      await rotation.next({ from: 'groq/openai/gpt-oss-120b', error: rateLimit }),
+      'hf/fallback',
+      'a second provider-wide limit keeps both failed providers cooled down',
+    );
+    assert.deepEqual(rotation.failedProviders, ['openrouter', 'groq']);
+  });
+
+  test('oversized requests skip Groq instead of sending a guaranteed 413', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'openrouter/poolside/laguna-s-2.1:free',
+      enabled: true,
+      loadModels: async () => [
+        freeTool('openrouter/z-ai/glm-5.2:free'),
+        freeTool('groq/openai/gpt-oss-120b'),
+      ],
+    });
+    const stalled = Object.assign(new Error('provider stalled'), { stall: true });
+    assert.equal(
+      await rotation.next({
+        from: 'openrouter/poolside/laguna-s-2.1:free', error: stalled, requestTokens: 24_678,
+      }),
+      null,
+      'the failed OpenRouter provider stays cooled when Groq cannot fit the request',
+    );
+    assert.deepEqual(rotation.lastSkippedModels, ['groq/openai/gpt-oss-120b']);
+  });
+
+  test('a silent rate limit rotates and returns the successful fallback', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'groq/start', enabled: true,
+      loadModels: async () => [freeTool('groq/start'), freeTool('openrouter/free')],
+    });
+    const calls = [];
+    const switches = [];
+    let text = '';
+    const result = await runWithModelRotation({
+      model: 'groq/start', rotation, enabled: true,
+      onDelta: delta => { text += delta; },
+      onSwitch: change => switches.push(change),
+      request: async (model, { fastFail, onDelta }) => {
+        calls.push({ model, fastFail });
+        if (model === 'groq/start') throw Object.assign(new Error('429'), { status: 429 });
+        onDelta('done');
+        return { content: 'done', promptTokens: 3, completionTokens: 1 };
+      },
+    });
+    assert.equal(result.selectedModel, 'openrouter/free');
+    assert.deepEqual(result.attemptedModels, ['groq/start', 'openrouter/free']);
+    assert.deepEqual(calls, [
+      { model: 'groq/start', fastFail: true },
+      { model: 'openrouter/free', fastFail: true },
+    ]);
+    assert.equal(switches[0].reason, 'rate limit');
+    assert.equal(text, 'done');
+  });
+
+  test('never rotates after streamed output, avoiding duplicate partial answers', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'groq/start', enabled: true,
+      loadModels: async () => [freeTool('groq/start'), freeTool('openrouter/free')],
+    });
+    let calls = 0;
+    await assert.rejects(
+      runWithModelRotation({
+        model: 'groq/start', rotation, enabled: true,
+        request: async (_model, { onDelta }) => {
+          calls++;
+          onDelta('partial');
+          throw Object.assign(new Error('stream broke'), { status: 503 });
+        },
+      }),
+      /stream broke/,
+    );
+    assert.equal(calls, 1);
+    assert.equal(rotation.switches, 0);
+  });
+
+  test('one-model setups retain bounded same-model retry behavior', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'ollama/only', enabled: true, loadModels: async () => [],
+    });
+    const modes = [];
+    const result = await runWithModelRotation({
+      model: 'ollama/only', rotation, enabled: true,
+      request: async (_model, { fastFail }) => {
+        modes.push(fastFail);
+        if (fastFail) throw Object.assign(new Error('server restarting'), { status: 503 });
+        return { content: 'recovered' };
+      },
+    });
+    assert.equal(result.content, 'recovered');
+    assert.deepEqual(modes, [true, false]);
+  });
+
+  test('one-model setups do not repeat deterministic request-too-large failures', async () => {
+    const rotation = createModelRotation({
+      initialModel: 'groq/only', enabled: true, loadModels: async () => [],
+    });
+    let calls = 0;
+    await assert.rejects(
+      runWithModelRotation({
+        model: 'groq/only', rotation, enabled: true,
+        request: async () => {
+          calls++;
+          throw Object.assign(new Error('request too large'), { status: 413 });
+        },
+      }),
+      /request too large/,
+    );
+    assert.equal(calls, 1, 'a deterministic 413 is not sent to the same model twice');
+  });
+});
+
+describe('model-policy.js (free + native-tools boundary)', async () => {
+  const {
+    filterModelsForPolicy,
+    modelPolicyDescription,
+    rankFreeCodingModels,
+    unavailableModelMessage,
+  } = await import('../src/model-policy.js');
+
+  const models = [
+    { name: 'groq/free-tools', capabilities: ['tools'], access: { free: true } },
+    { name: 'free/no-tools', capabilities: [], access: { free: true } },
+    { name: 'paid/tools', capabilities: ['tools'], access: { free: false } },
+  ];
+
+  test('free/tool policy keeps only models satisfying both hard requirements', () => {
+    const env = {
+      CLAUDETTE_FREE_TIER_ONLY: '1', CLAUDETTE_REQUIRE_TOOLS: '1', CLAUDETTE_ALWAYS_TRACK: '0',
+    };
+    assert.deepEqual(filterModelsForPolicy(models, env).map(model => model.name), ['groq/free-tools']);
+    assert.equal(modelPolicyDescription(env), 'free-tier only, native tools required');
+  });
+
+  test('shared coding rank is stable and leaves unavailable routes out', () => {
+    const live = [
+      { name: 'openrouter/free' },
+      { name: 'gpt-oss:20b-cloud' },
+      { name: 'groq/openai/gpt-oss-20b' },
+      { name: 'custom/free-tools' },
+      { name: 'deepseek-v4-pro:cloud' },
+      { name: 'openrouter/z-ai/glm-5.2:free' },
+      { name: 'kimi-k2.7-code:cloud' },
+      { name: 'openrouter/poolside/laguna-s-2.1:free' },
+      { name: 'custom/second' },
+    ];
+    assert.deepEqual(rankFreeCodingModels(live).map(model => model.name), [
+      'kimi-k2.7-code:cloud',
+      'deepseek-v4-pro:cloud',
+      'openrouter/poolside/laguna-s-2.1:free',
+      'openrouter/z-ai/glm-5.2:free',
+      'groq/openai/gpt-oss-20b',
+      'gpt-oss:20b-cloud',
+      'openrouter/free',
+      'custom/free-tools',
+      'custom/second',
+    ]);
+  });
+
+  test('free, native-tools, and tracking boundaries default on and allow explicit opt-out', async () => {
+    const { freeTierOnly, requireToolSupport, alwaysTrack } = await import('../src/model-policy.js');
+    assert.equal(freeTierOnly({}), true);
+    assert.equal(requireToolSupport({}), true);
+    assert.equal(alwaysTrack({}), true);
+    assert.equal(freeTierOnly({ CLAUDETTE_FREE_TIER_ONLY: '0' }), false);
+    assert.equal(requireToolSupport({ CLAUDETTE_REQUIRE_TOOLS: '0' }), false);
+    assert.equal(alwaysTrack({ CLAUDETTE_ALWAYS_TRACK: '0' }), false);
+  });
+
+  test('each policy can be enabled independently', () => {
+    assert.deepEqual(
+      filterModelsForPolicy(models, {
+        CLAUDETTE_FREE_TIER_ONLY: '1', CLAUDETTE_REQUIRE_TOOLS: '0', CLAUDETTE_ALWAYS_TRACK: '0',
+      }).map(model => model.name),
+      ['groq/free-tools', 'free/no-tools'],
+    );
+    assert.deepEqual(
+      filterModelsForPolicy(models, {
+        CLAUDETTE_FREE_TIER_ONLY: '0', CLAUDETTE_REQUIRE_TOOLS: '1', CLAUDETTE_ALWAYS_TRACK: '0',
+      }).map(model => model.name),
+      ['groq/free-tools', 'paid/tools'],
+    );
+  });
+
+  test('direct DeepSeek rejection explains the free OpenRouter alternative', () => {
+    const message = unavailableModelMessage('deepseek/deepseek-v4-flash', {
+      CLAUDETTE_FREE_TIER_ONLY: '1',
+    });
+    assert.match(message, /billed per token/i);
+    assert.match(message, /openrouter\/\.\.\.:free/i);
+  });
+});
+
 describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async () => {
   // Build a one-shot mock /chat/completions SSE server. Returns { url, get() }.
-  function mockChatServer(events) {
+  function mockChatServer(events, headers = {}) {
     let captured = { auth: null, body: null, path: null };
     const server = http.createServer((req, res) => {
       captured.path = req.url;
@@ -1468,7 +2512,7 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
       req.on('data', c => body += c);
       req.on('end', () => {
         captured.body = JSON.parse(body);
-        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', ...headers });
         for (const e of events) res.write(`data: ${JSON.stringify(e)}\n\n`);
         res.write('data: [DONE]\n\n');
         res.end();
@@ -1481,7 +2525,7 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
   const txt = content => ({ choices: [{ index: 0, delta: { content } }] });
   const tc = partial => ({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, ...partial }] } }] });
   const SSE_EVENTS = [
-    txt('Hello '),
+    { ...txt('Hello '), model: 'upstream/free-model', provider: 'free-host' },
     txt('world'),
     tc({ id: 'call_1', type: 'function', function: { name: 'read_file', arguments: '' } }),
     tc({ function: { arguments: '{"path":' } }),
@@ -1490,7 +2534,14 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
   ];
 
   test('openai chatStream streams text + tool_calls and strips the prefix', async () => {
-    const { server, captured } = mockChatServer(SSE_EVENTS);
+    const { server, captured } = mockChatServer(SSE_EVENTS, {
+      'x-ratelimit-limit-requests': '1000',
+      'x-ratelimit-remaining-requests': '987',
+      'x-ratelimit-reset-requests': '3h12m',
+      'x-ratelimit-limit-tokens': '8000',
+      'x-ratelimit-remaining-tokens': '7123',
+      'x-ratelimit-reset-tokens': '7.5s',
+    });
     await new Promise(r => server.listen(0, '127.0.0.1', r));
     const { port } = server.address();
     const prevBase = process.env.OPENAI_BASE_URL;
@@ -1517,6 +2568,16 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
       assert.equal(result.promptTokens, 11);
       assert.equal(result.completionTokens, 22);
       assert.equal(result.toolMode, 'native');
+      assert.equal(result.resolvedModel, 'upstream/free-model');
+      assert.equal(result.resolvedProvider, 'free-host');
+      assert.deepEqual(result.rateLimit, {
+        requestLimit: 1000,
+        remainingRequests: 987,
+        requestReset: '3h12m',
+        tokenLimit: 8000,
+        remainingTokens: 7123,
+        tokenReset: '7.5s',
+      });
       assert.equal(captured.path, '/chat/completions');
       assert.equal(captured.auth, 'Bearer sk-test');
       assert.equal(captured.body.model, 'gpt-4o', 'openai/ prefix stripped');
@@ -1552,6 +2613,100 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
       if (prevBase == null) delete process.env.DEEPSEEK_BASE_URL; else process.env.DEEPSEEK_BASE_URL = prevBase;
       if (prevKey == null) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = prevKey;
       await new Promise((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  test('DeepSeek accepts the configured DEEPSEEK_KEY alias', async () => {
+    const previous = { primary: process.env.DEEPSEEK_API_KEY, alias: process.env.DEEPSEEK_KEY };
+    try {
+      delete process.env.DEEPSEEK_API_KEY;
+      process.env.DEEPSEEK_KEY = 'ds-alias-test';
+      const deepseek = await import('../src/deepseek.js');
+      assert.equal(deepseek.hasCredentials(), true);
+    } finally {
+      if (previous.primary == null) delete process.env.DEEPSEEK_API_KEY; else process.env.DEEPSEEK_API_KEY = previous.primary;
+      if (previous.alias == null) delete process.env.DEEPSEEK_KEY; else process.env.DEEPSEEK_KEY = previous.alias;
+    }
+  });
+
+  test('groq getModels exposes only active reviewed Free-plan coding models', async () => {
+    let auth = null;
+    const server = http.createServer((req, res) => {
+      auth = req.headers.authorization;
+      assert.equal(req.url, '/models');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        data: [
+          { id: 'openai/gpt-oss-120b' },
+          { id: 'openai/gpt-oss-20b' },
+          { id: 'qwen/qwen3.8-27b' },
+          { id: 'qwen/qwen3.6-27b' },
+          { id: 'llama-3.3-70b-versatile' },
+          { id: 'hypothetical/paid-model' },
+        ],
+      }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const previousBase = process.env.GROQ_BASE_URL;
+    const previousKey = process.env.GROQ_API_KEY;
+    process.env.GROQ_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+    process.env.GROQ_API_KEY = 'groq-test';
+    try {
+      const groq = await import('../src/groq.js');
+      const models = await groq.getModels();
+      assert.equal(auth, 'Bearer groq-test');
+      assert.deepEqual(models.map(model => model.name), [
+        'groq/openai/gpt-oss-120b',
+        'groq/openai/gpt-oss-20b',
+        'groq/qwen/qwen3.8-27b',
+        'groq/qwen/qwen3.6-27b',
+      ]);
+      assert.ok(models.every(model => model.capabilities.includes('tools')));
+    } finally {
+      if (previousBase == null) delete process.env.GROQ_BASE_URL;
+      else process.env.GROQ_BASE_URL = previousBase;
+      if (previousKey == null) delete process.env.GROQ_API_KEY;
+      else process.env.GROQ_API_KEY = previousKey;
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  test('groq chatStream reserves an output size that fits the Free-plan TPM limit', async () => {
+    const { server, captured } = mockChatServer([
+      { choices: [{ index: 0, delta: { content: 'ok' } }] },
+    ]);
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const previous = {
+      base: process.env.GROQ_BASE_URL,
+      key: process.env.GROQ_API_KEY,
+      max: process.env.GROQ_MAX_TOKENS,
+      genericMax: process.env.CLAUDETTE_MAX_TOKENS,
+    };
+    process.env.GROQ_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+    process.env.GROQ_API_KEY = 'groq-test';
+    delete process.env.GROQ_MAX_TOKENS;
+    delete process.env.CLAUDETTE_MAX_TOKENS;
+    try {
+      const groq = await import('../src/groq.js');
+      assert.equal(groq.resolveGroqMaxTokens(), 1_024);
+      const result = await groq.chatStream({
+        model: 'groq/openai/gpt-oss-120b',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(result.content, 'ok');
+      assert.equal(captured.body.max_tokens, 1_024);
+
+      process.env.GROQ_MAX_TOKENS = '1536.9';
+      assert.equal(groq.resolveGroqMaxTokens(), 1_536, 'provider override can raise the Free default');
+      delete process.env.GROQ_MAX_TOKENS;
+      process.env.CLAUDETTE_MAX_TOKENS = '512';
+      assert.equal(groq.resolveGroqMaxTokens(), 512, 'a smaller global cap is honored');
+    } finally {
+      if (previous.base == null) delete process.env.GROQ_BASE_URL; else process.env.GROQ_BASE_URL = previous.base;
+      if (previous.key == null) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = previous.key;
+      if (previous.max == null) delete process.env.GROQ_MAX_TOKENS; else process.env.GROQ_MAX_TOKENS = previous.max;
+      if (previous.genericMax == null) delete process.env.CLAUDETTE_MAX_TOKENS; else process.env.CLAUDETTE_MAX_TOKENS = previous.genericMax;
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
   });
 
@@ -1647,6 +2802,38 @@ describe('openai-compatible adapters (openai/deepseek/groq/huggingface)', async 
     assert.ok(handles('huggingface/meta-llama/Llama-3.3-70B-Instruct'));
     assert.equal(stripPrefix('hf/meta-llama/Llama-3.3-70B-Instruct'), 'meta-llama/Llama-3.3-70B-Instruct');
   });
+
+  test('Hugging Face discovery exposes only live zero-price tool providers', async () => {
+    const server = http.createServer((req, res) => {
+      assert.equal(req.url, '/models');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: [{
+        id: 'org/coder', owned_by: 'org', providers: [
+          { provider: 'free-host', status: 'live', is_free: true, supports_tools: true, context_length: 100_000 },
+          { provider: 'paid-host', status: 'live', is_free: false, supports_tools: true },
+          { provider: 'chat-only', status: 'live', is_free: true, supports_tools: false },
+        ],
+      }] }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const previous = { base: process.env.HF_BASE_URL, key: process.env.HF_KEY, token: process.env.HF_TOKEN };
+    process.env.HF_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+    process.env.HF_KEY = 'hf-test';
+    delete process.env.HF_TOKEN;
+    try {
+      const hf = await import('../src/huggingface.js');
+      const models = await hf.getModels();
+      assert.deepEqual(models.map(model => model.name), ['hf/org/coder:free-host']);
+      assert.deepEqual(models[0].capabilities, ['tools']);
+      assert.equal(models[0].access.free, true);
+      assert.equal(hf.resolveHfMaxTokens(), 1_024);
+    } finally {
+      if (previous.base == null) delete process.env.HF_BASE_URL; else process.env.HF_BASE_URL = previous.base;
+      if (previous.key == null) delete process.env.HF_KEY; else process.env.HF_KEY = previous.key;
+      if (previous.token == null) delete process.env.HF_TOKEN; else process.env.HF_TOKEN = previous.token;
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
 });
 
 describe('provider catalog (openrouter/google/xai/mistral/together/fireworks/cohere/perplexity)', async () => {
@@ -1680,18 +2867,74 @@ describe('provider catalog (openrouter/google/xai/mistral/together/fireworks/coh
     );
   });
 
-  test('catalog models appear in the merged list only when their key is set', async () => {
-    const { getModels } = await import('../src/provider.js');
+  test('OpenRouter dynamically exposes only zero-price native-tool routes', async () => {
+    const { catalogProviders } = await import('../src/providers.js');
+    const openrouter = catalogProviders.find(provider => provider.id === 'openrouter');
     const prev = process.env.OPENROUTER_API_KEY;
+    const prevBase = process.env.OPENROUTER_BASE_URL;
+    const server = http.createServer((req, res) => {
+      assert.equal(req.url, '/models?supported_parameters=tools');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: [
+        {
+          id: 'deepseek/deepseek-r1:free', context_length: 131072,
+          pricing: { prompt: '0', completion: '0' }, supported_parameters: ['tools', 'max_tokens'],
+        },
+        {
+          id: 'paid/with-tools', pricing: { prompt: '0.1', completion: '0.2' },
+          supported_parameters: ['tools'],
+        },
+        {
+          id: 'free/without-tools:free', pricing: { prompt: '0', completion: '0' },
+          supported_parameters: ['max_tokens'],
+        },
+      ] }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
     try {
       delete process.env.OPENROUTER_API_KEY;
-      let names = (await getModels()).map(m => m.name);
-      assert.ok(!names.some(n => n.startsWith('openrouter/')), 'absent without key');
+      assert.deepEqual(await openrouter.getModels(), [], 'absent without key');
+      process.env.OPENROUTER_BASE_URL = `http://127.0.0.1:${server.address().port}`;
       process.env.OPENROUTER_API_KEY = 'or-test';
-      names = (await getModels()).map(m => m.name);
-      assert.ok(names.some(n => n.startsWith('openrouter/')), 'present with key');
+      const models = await openrouter.getModels();
+      assert.deepEqual(models.map(model => model.name), [
+        'openrouter/free',
+        'openrouter/deepseek/deepseek-r1:free',
+      ]);
+      assert.ok(models.every(model => model.access.free));
+      assert.ok(models.every(model => model.capabilities.includes('tools')));
     } finally {
       if (prev == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = prev;
+      if (prevBase == null) delete process.env.OPENROUTER_BASE_URL; else process.env.OPENROUTER_BASE_URL = prevBase;
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  test('OpenRouter free alias sends the official openrouter/free model id', async () => {
+    let receivedBody = null;
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', chunk => body += chunk);
+      req.on('end', () => {
+        receivedBody = JSON.parse(body);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end('data: [DONE]\n\n');
+      });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const previous = { key: process.env.OPENROUTER_API_KEY, base: process.env.OPENROUTER_BASE_URL };
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    process.env.OPENROUTER_BASE_URL = `http://127.0.0.1:${server.address().port}`;
+    try {
+      const { catalogProviders } = await import('../src/providers.js');
+      const openrouter = catalogProviders.find(provider => provider.id === 'openrouter');
+      await openrouter.chatStream({ model: 'openrouter/free', messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(receivedBody.model, 'openrouter/free');
+      assert.equal(receivedBody.max_tokens, 1_024, 'free route uses the efficient output cap');
+    } finally {
+      if (previous.key == null) delete process.env.OPENROUTER_API_KEY; else process.env.OPENROUTER_API_KEY = previous.key;
+      if (previous.base == null) delete process.env.OPENROUTER_BASE_URL; else process.env.OPENROUTER_BASE_URL = previous.base;
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
   });
 
@@ -1782,17 +3025,27 @@ describe('server.js HTTP API', async () => {
   });
 
   test('GET /api/health returns ok', async () => {
-    const { status, body } = await httpGet(`${BASE}/api/health`);
+    const { status, headers, body } = await httpGet(`${BASE}/api/health`);
     assert.equal(status, 200);
     assert.ok(body.ok, 'health ok');
     assert.ok(body.ollamaBaseUrl, 'has ollamaBaseUrl');
     assert.ok(body.workspaceRoot, 'has workspaceRoot');
+    assert.equal(headers['x-content-type-options'], 'nosniff');
+    assert.equal(headers['x-frame-options'], 'DENY');
+    assert.equal(headers['cache-control'], 'no-store');
+  });
+
+  test('Host, Origin, and fetch metadata reject cross-site requests', async () => {
+    assert.equal((await httpGet(`${BASE}/api/health`, { Host: `evil.example:${TEST_PORT}` })).status, 421);
+    assert.equal((await httpGet(`${BASE}/api/health`, { Origin: `http://evil.example:${TEST_PORT}` })).status, 403);
+    assert.equal((await httpGet(`${BASE}/api/health`, { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
   });
 
   test('GET /api/models returns model list', async () => {
     const { status, body } = await httpGet(`${BASE}/api/models`);
     assert.equal(status, 200);
     assert.ok(Array.isArray(body.models), 'models is array');
+    assert.equal(typeof body.defaultModel, 'string', 'configured/default model is identified for the browser');
     // Content depends on what is reachable — with no Ollama and no key the right
     // answer is an empty list, not a failure. Only the shape is guaranteed.
     for (const m of body.models) assert.ok(m.name, 'every model has a name');
@@ -1817,9 +3070,11 @@ describe('server.js HTTP API', async () => {
   });
 
   test('GET /bench.html serves the bench dashboard', async () => {
-    const { status, body } = await httpGet(`${BASE}/bench.html`);
+    const { status, headers, body } = await httpGet(`${BASE}/bench.html`);
     assert.equal(status, 200);
     assert.ok(String(body).includes('Benchmark Results'), 'dashboard page served');
+    assert.match(headers['content-security-policy'] ?? '', /script-src 'self' 'nonce-/);
+    assert.match(String(body), /<script nonce="[^"]+"/);
   });
 
   test('POST /api/sessions creates a new session', async () => {
@@ -1862,7 +3117,7 @@ describe('server.js HTTP API', async () => {
 
   test('GET /api/sessions/:id 404 for unknown session', async () => {
     const { status } = await httpGet(`${BASE}/api/sessions/nonexistent-id`);
-    assert.equal(status, 500); // server throws, caught as 500 (expected behavior)
+    assert.equal(status, 404);
   });
 
   test('POST /api/expand with no @tokens returns text unchanged', async () => {
@@ -1893,6 +3148,26 @@ describe('server.js HTTP API', async () => {
     assert.equal(status, 200);
     assert.ok(body.text.includes('@this-does-not-exist.txt'), 'leaves @token unchanged');
     assert.deepEqual(body.files, []);
+  });
+
+  test('POST /api/expand refuses symlinks that resolve outside the workspace', async () => {
+    const outside = path.join(os.tmpdir(), `claudette-server-outside-${randomUUID()}.txt`);
+    const linkName = `.claudette-server-link-${randomUUID()}.txt`;
+    const link = path.join(ROOT, linkName);
+    await fsp.writeFile(outside, 'server-secret-must-not-expand');
+    await fsp.symlink(outside, link);
+    try {
+      const { status, body } = await httpPost(`${BASE}/api/expand`, {
+        text: `read @${linkName}`,
+        cwd: ROOT,
+      });
+      assert.equal(status, 200);
+      assert.deepEqual(body.files, []);
+      assert.doesNotMatch(body.text, /server-secret-must-not-expand/);
+    } finally {
+      await fsp.unlink(link).catch(() => {});
+      await fsp.unlink(outside).catch(() => {});
+    }
   });
 
   test('GET / serves index.html', async () => {
@@ -1961,6 +3236,13 @@ describe('server.js HTTP API', async () => {
     assert.match(body.error ?? '', /valid JSON/i);
   });
 
+  test('POST APIs require JSON objects with known, typed fields', async () => {
+    assert.equal((await httpPost(`${BASE}/api/sessions`, '{}', { 'Content-Type': 'text/plain' })).status, 415);
+    assert.equal((await httpPost(`${BASE}/api/sessions`, [])).status, 400);
+    assert.equal((await httpPost(`${BASE}/api/sessions`, { surprise: true })).status, 400);
+    assert.equal((await httpPost(`${BASE}/api/sessions`, { title: { nested: true } })).status, 400);
+  });
+
   test('a second concurrent turn on one session is refused', async () => {
     // Two overlapping POSTs both loaded the session, both appended, and the
     // slower save clobbered the faster one — the first turn's messages vanished.
@@ -2004,6 +3286,241 @@ describe('server.js HTTP API', async () => {
     const { status } = await httpGet(`${BASE}/../../etc/passwd`);
     // Should be 404 or 403, not 200
     assert.ok(status === 404 || status === 403, `status ${status} is safe`);
+  });
+
+  test('static file serving refuses a symlink outside public', async () => {
+    const outside = path.join(os.tmpdir(), `claudette-static-outside-${randomUUID()}.txt`);
+    const linkName = `.claudette-static-link-${randomUUID()}.txt`;
+    const link = path.join(ROOT, 'public', linkName);
+    await fsp.writeFile(outside, 'static-secret');
+    await fsp.symlink(outside, link);
+    try {
+      const { status, body } = await httpGet(`${BASE}/${linkName}`);
+      assert.notEqual(status, 200);
+      assert.doesNotMatch(String(body), /static-secret/);
+    } finally {
+      await fsp.unlink(link).catch(() => {});
+      await fsp.unlink(outside).catch(() => {});
+    }
+  });
+
+  test('non-loopback binding refuses to start without token and allowed hosts', () => {
+    const result = spawnSync(process.execPath, ['server.js'], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        HOST: '0.0.0.0',
+        PORT: String(TEST_PORT),
+        CLAUDETTE_SERVER_TOKEN: '',
+        CLAUDETTE_ALLOWED_HOSTS: '',
+      },
+      encoding: 'utf8',
+      timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0);
+    assert.match(`${result.stdout}${result.stderr}`, /requires CLAUDETTE_SERVER_TOKEN and CLAUDETTE_ALLOWED_HOSTS/);
+  });
+});
+
+describe('server.js configured bearer boundary', () => {
+  let serverProcess;
+  let port;
+  let base;
+  const token = 'test-only-server-token';
+
+  before(async () => {
+    port = await getFreePort();
+    base = `http://127.0.0.1:${port}`;
+    serverProcess = spawn(process.execPath, ['server.js'], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        NODE_ENV: 'test',
+        CLAUDETTE_SERVER_TOKEN: token,
+        CLAUDETTE_ALLOWED_HOSTS: '127.0.0.1',
+      },
+      stdio: 'pipe',
+    });
+
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('authenticated server start timeout')), 10_000);
+      const cleanup = () => {
+        serverProcess.stdout.off('data', onStdout);
+        serverProcess.stderr.off('data', onStderr);
+        serverProcess.off('exit', onExit);
+      };
+      const ready = () => {
+        clearTimeout(timeout);
+        cleanup();
+        resolve();
+      };
+      const onStdout = data => {
+        if (data.toString().includes('listening')) ready();
+      };
+      const onStderr = data => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`authenticated server failed: ${data.toString().trim()}`));
+      };
+      const onExit = (code, signal) => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`authenticated server exited before ready (code=${code}, signal=${signal})`));
+      };
+      serverProcess.stdout.on('data', onStdout);
+      serverProcess.stderr.on('data', onStderr);
+      serverProcess.on('error', reject);
+      serverProcess.on('exit', onExit);
+    });
+  });
+
+  after(async () => {
+    if (!serverProcess || serverProcess.exitCode != null) return;
+    serverProcess.kill();
+    await new Promise(resolve => serverProcess.once('exit', resolve));
+  });
+
+  test('requires the exact bearer token for browser APIs', async () => {
+    const missing = await httpGet(`${base}/api/health`);
+    assert.equal(missing.status, 401);
+    assert.match(String(missing.headers['www-authenticate']), /^Bearer /);
+
+    const wrong = await httpGet(`${base}/api/health`, { Authorization: 'Bearer wrong-token' });
+    assert.equal(wrong.status, 401);
+
+    const valid = await httpGet(`${base}/api/health`, { Authorization: `Bearer ${token}` });
+    assert.equal(valid.status, 200);
+    assert.equal(valid.body.ok, true);
+  });
+
+  test('rejects a forged Host or cross-origin request even with a valid token', async () => {
+    const authorization = `Bearer ${token}`;
+    const badHost = await httpGet(`${base}/api/health`, {
+      Authorization: authorization,
+      Host: `attacker.example:${port}`,
+    });
+    assert.equal(badHost.status, 421);
+
+    const badOrigin = await httpGet(`${base}/api/health`, {
+      Authorization: authorization,
+      Origin: `https://attacker.example:${port}`,
+    });
+    assert.equal(badOrigin.status, 403);
+
+    const allowedOrigin = await httpGet(`${base}/api/health`, {
+      Authorization: authorization,
+      Origin: `http://127.0.0.1:${port}`,
+    });
+    assert.equal(allowedOrigin.status, 200);
+  });
+});
+
+describe('server.js shared tool-less runner path', () => {
+  let modelServer;
+  let serverProcess;
+  let tmpDir;
+  let base;
+  const requests = [];
+  const model = 'mock-web-runner:latest';
+  const toolShapedText = '{"name":"write_file","arguments":{"path":"must-not-exist.txt","content":"no"}}';
+
+  before(async () => {
+    tmpDir = await makeTmpDir();
+    modelServer = http.createServer(async (req, res) => {
+      if (req.method !== 'POST' || req.url !== '/api/chat') {
+        res.writeHead(404).end();
+        return;
+      }
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      createNdjsonResponse(res, [
+        { message: { content: toolShapedText } },
+        { done: true, prompt_eval_count: 7, eval_count: 3 },
+      ]);
+    });
+    await new Promise(resolve => modelServer.listen(0, '127.0.0.1', resolve));
+
+    const port = await getFreePort();
+    base = `http://127.0.0.1:${port}`;
+    serverProcess = spawn(process.execPath, ['server.js'], {
+      cwd: ROOT,
+      env: {
+        ...process.env,
+        PORT: String(port),
+        HOST: '127.0.0.1',
+        NODE_ENV: 'test',
+        WORKSPACE_ROOT: tmpDir,
+        CLAUDETTE_DATA_DIR: path.join(tmpDir, '.state'),
+        OLLAMA_BASE_URL: `http://127.0.0.1:${modelServer.address().port}`,
+        CLAUDETTE_MODEL_ROTATION: '0',
+        CLAUDETTE_FREE_TIER_ONLY: '0',
+        CLAUDETTE_REQUIRE_TOOLS: '0',
+        CLAUDETTE_ALWAYS_TRACK: '0',
+      },
+      stdio: 'pipe',
+    });
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('shared-runner server start timeout')), 10_000);
+      const onStdout = data => {
+        if (!data.toString().includes('listening')) return;
+        clearTimeout(timeout);
+        cleanup();
+        resolve();
+      };
+      const onExit = (code, signal) => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(new Error(`shared-runner server exited before ready (code=${code}, signal=${signal})`));
+      };
+      const cleanup = () => {
+        serverProcess.stdout.off('data', onStdout);
+        serverProcess.off('exit', onExit);
+      };
+      serverProcess.stdout.on('data', onStdout);
+      serverProcess.on('error', reject);
+      serverProcess.on('exit', onExit);
+    });
+  });
+
+  after(async () => {
+    if (serverProcess && serverProcess.exitCode == null) {
+      serverProcess.kill();
+      await new Promise(resolve => serverProcess.once('exit', resolve));
+    }
+    if (modelServer) {
+      await new Promise((resolve, reject) => modelServer.close(err => err ? reject(err) : resolve()));
+    }
+    if (tmpDir) await cleanDir(tmpDir);
+  });
+
+  test('streams through runAgent with no tools and persists its shared result', async () => {
+    const { body: created } = await httpPost(`${base}/api/sessions`, { model, cwd: tmpDir });
+    const turn = await httpPostStream(`${base}/api/sessions/${created.session.id}/messages`, {
+      content: 'Return the requested text.',
+      model,
+      cwd: tmpDir,
+    });
+
+    assert.equal(turn.status, 200);
+    assert.ok(turn.lines.some(line => line.type === 'delta' && line.content === toolShapedText));
+    assert.ok(turn.lines.some(line => line.type === 'done'));
+    assert.ok(!turn.lines.some(line => line.type === 'error'));
+    assert.equal(requests.length, 1);
+    assert.ok(!requests[0].tools, 'web runner offers no executable tools');
+    await assert.rejects(() => fsp.stat(path.join(tmpDir, 'must-not-exist.txt')), /ENOENT/);
+
+    const { body: loaded } = await httpGet(`${base}/api/sessions/${created.session.id}`);
+    assert.deepEqual(loaded.session.messages.map(message => message.role), ['user', 'assistant']);
+    assert.equal(loaded.session.messages[1].content, toolShapedText);
+    assert.equal(loaded.session.turns.at(-1).status, 'completed');
+
+    const source = await fsp.readFile(path.join(ROOT, 'server.js'), 'utf8');
+    assert.match(source, /runAgent\(\{/);
+    assert.match(source, /tools:\s*\[\]/);
+    assert.doesNotMatch(source, /import\s*\{[^}]*chatStream[^}]*\}\s*from/);
   });
 });
 
@@ -2062,7 +3579,12 @@ describe('CLI (claudette.js)', async () => {
       proc.stdout.on('data', d => stdout += d);
       proc.stderr.on('data', d => stderr += d);
 
-      const lines = [...inputs, '/exit\n'];
+      // EOF is the reliable shutdown signal for these piped CLI tests. Appending
+      // `/exit` on a wall-clock timer raced slower commands such as /models and
+      // /files: readline had no active question listener, so the exit line (and
+      // occasionally the assertion target's output) was lost. The CLI already
+      // guarantees that a running command finishes after stdin closes.
+      const lines = [...inputs];
       let idx = 0;
       function sendNext() {
         if (idx < lines.length) {
@@ -2098,6 +3620,20 @@ describe('CLI (claudette.js)', async () => {
     const { stdout } = await runCliWithInput(['/help\n']);
     assert.ok(stdout.includes('/model') || stdout.includes('help'), '/help output');
     assert.ok(stdout.includes('/diff') && stdout.includes('/commit'), 'shows git workflow commands');
+    assert.ok(stdout.includes('/interrupt'), 'shows active-turn steering command');
+    assert.ok(stdout.includes('/copy'), 'shows clipboard command');
+  });
+
+  test('CLI /copy handles empty history and rejects arguments without a model request', async () => {
+    for (const [command, expected] of [
+      ['/copy\n', /No assistant message to copy yet/],
+      ['/copy extra\n', /Usage: \/copy/],
+    ]) {
+      const { stdout, timedOut } = await runCliWithInput([command], { args: ['--model', 'mock-cli:latest'] });
+      assert.equal(timedOut, false);
+      assert.match(stdout, expected);
+      assert.doesNotMatch(stdout, /PONG|Unknown command/);
+    }
   });
 
   test('CLI parser normalizes grep-like tool calls to search_code', async () => {
@@ -2155,6 +3691,18 @@ describe('CLI (claudette.js)', async () => {
     assert.equal(calls[1]?.function?.arguments?.command, 'node --check src/chat.js');
   });
 
+  test('CLI parser never executes tool-shaped JSON or XML from hidden reasoning', async () => {
+    const { __test_parseTextToolCalls } = await import('../src/chat.js');
+    const hiddenJson = '{"name":"write_file","arguments":{"path":"reasoning.txt","content":"must not run"}}';
+    const hiddenXml = '<function=bash><parameter=command>touch reasoning.txt</parameter></function>';
+    const visible = '{"name":"read_file","arguments":{"path":"README.md"}}';
+    const calls = __test_parseTextToolCalls(`<think>${hiddenJson}\n${hiddenXml}</think>\n${visible}`);
+    assert.deepEqual(calls.map(call => call.function.name), ['read_file']);
+    assert.equal(calls[0].function.arguments.path, 'README.md');
+    assert.deepEqual(__test_parseTextToolCalls(`<think>${hiddenJson}`), [],
+      'unterminated hidden reasoning fails closed');
+  });
+
   // The exact-bash shortcut used to run any command that followed a magic
   // sentence, straight from the prompt, with no permission check — and the
   // prompt it scanned was the @file-EXPANDED one, so a file you merely asked it
@@ -2177,6 +3725,19 @@ describe('CLI (claudette.js)', async () => {
       { name: 'plain:32b', size: 20e9, capabilities: ['completion', 'tools'] },
     ]);
     assert.equal(picked, 'plain:32b');
+  });
+
+  test('pickDefaultModel follows the shared free coding rank when routes are live', async () => {
+    const { pickDefaultModel } = await import('../src/chat.js');
+    const tools = ['tools'];
+    assert.equal(pickDefaultModel([
+      { name: 'deepseek-v4-pro:cloud', capabilities: tools },
+      { name: 'openrouter/cohere/north-mini-code:free', capabilities: tools },
+      { name: 'kimi-k2.7-code:cloud', capabilities: tools },
+      { name: 'groq/openai/gpt-oss-120b', capabilities: tools },
+      { name: 'openrouter/poolside/laguna-s-2.1:free', capabilities: tools },
+      { name: 'openrouter/z-ai/glm-5.2:free', capabilities: tools },
+    ]), 'kimi-k2.7-code:cloud');
   });
 
   test('pickDefaultModel prefers coding-tuned, then smaller', async () => {
@@ -2278,13 +3839,17 @@ describe('CLI (claudette.js)', async () => {
     // developer happened to have those pulled. Assert on the model this suite
     // actually serves.
     const { stdout } = await runCliWithInput(['/models\n']);
-    assert.ok(stdout.includes('mock-cli'), 'lists the reachable model');
-    assert.ok(/Available Models/i.test(stdout), 'renders the model table');
+    const plain = stripVTControlCharacters(stdout);
+    assert.ok(plain.includes('mock-cli'), 'lists the reachable model');
+    assert.ok(/Available Models/i.test(plain), 'renders the model table');
+    assert.match(plain, /mock-cli:latest\s{2,}1b/, 'separates long model IDs from metadata');
   });
 
   test('CLI /config shows config table', async () => {
     const { stdout } = await runCliWithInput(['/config\n']);
-    assert.ok(stdout.includes('model') || stdout.includes('workspace'), 'shows config');
+    const plain = stripVTControlCharacters(stdout);
+    assert.ok(plain.includes('model') || plain.includes('workspace'), 'shows config');
+    assert.match(plain, /rotation\s+disabled/i, 'shows the effective model-rotation policy');
   });
 
   test('CLI /session shows session info', async () => {
@@ -2399,6 +3964,17 @@ describe('CLI (claudette.js)', async () => {
 });
 
 describe('CLI tool loop with mock Ollama', async () => {
+  const hermeticModelEnv = {
+    CLAUDETTE_WORKSPACE_SANDBOX: process.platform === 'darwin' ? '1' : '0',
+    CLAUDETTE_FREE_TIER_ONLY: '0',
+    CLAUDETTE_REQUIRE_TOOLS: '0',
+    ANTHROPIC_API_KEY: '', OPENAI_API_KEY: '', DEEPSEEK_API_KEY: '', DEEPSEEK_KEY: '',
+    GROQ_API_KEY: '', HF_TOKEN: '', HF_KEY: '', HUGGINGFACE_API_KEY: '',
+    OPENROUTER_API_KEY: '', TOGETHER_API_KEY: '', FIREWORKS_API_KEY: '',
+    GEMINI_API_KEY: '', GOOGLE_API_KEY: '', XAI_API_KEY: '', MISTRAL_API_KEY: '',
+    COHERE_API_KEY: '', PERPLEXITY_API_KEY: '',
+  };
+
   function runCliWithInput(inputs, options = {}) {
     const {
       timeout = 30_000,
@@ -2407,22 +3983,39 @@ describe('CLI tool loop with mock Ollama', async () => {
       cwd = ROOT,
       inputDelayMs = 300,
       finalDelayMs = 500,
+      waitForOutput = [],
     } = options;
     return new Promise((resolve, reject) => {
       const proc = spawn('node', ['claudette.js', ...args], {
         cwd,
-        env: { ...process.env, ...env },
+        env: { ...process.env, ...hermeticModelEnv, ...env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let stdout = '', stderr = '';
-      proc.stdout.on('data', d => stdout += d);
+      let waitingFor = null;
+      let nextTimer = null;
+      proc.stdout.on('data', d => {
+        stdout += d;
+        if (waitingFor && stdout.includes(waitingFor)) sendNext();
+      });
       proc.stderr.on('data', d => stderr += d);
 
-      const lines = [...inputs, '/exit\n'];
+      // EOF is the reliable shutdown signal after all requested inputs. A
+      // synthetic `/exit` can arrive while the CLI is still inside a turn and
+      // be consumed by its temporary mid-turn listener instead of the REPL.
+      const lines = [...inputs];
       let idx = 0;
       function sendNext() {
+        if (nextTimer) return;
         if (idx < lines.length) {
-          setTimeout(() => {
+          const marker = waitForOutput[idx];
+          if (marker && !stdout.includes(marker)) {
+            waitingFor = marker;
+            return;
+          }
+          waitingFor = null;
+          nextTimer = setTimeout(() => {
+            nextTimer = null;
             proc.stdin.write(lines[idx++]);
             sendNext();
           }, inputDelayMs);
@@ -2571,14 +4164,18 @@ describe('CLI tool loop with mock Ollama', async () => {
       ['inspect the file\n'],
       {
         args: ['-y', '--cwd', tmpDir, '--model', 'mock-coder:latest'],
-        env: { OLLAMA_BASE_URL: mockBaseUrl },
+        env: {
+          OLLAMA_BASE_URL: mockBaseUrl,
+          CLAUDETTE_WORKSPACE_SANDBOX: process.platform === 'darwin' ? '1' : '0',
+        },
         timeout: 15_000,
       }
     );
 
     assert.equal(timedOut, false, 'cli should exit normally');
-    assert.ok(stdout.includes('⏺ Read'), 'tool call was shown with its clean label');
-    assert.ok(stdout.includes('Read') || stdout.includes('notes.txt'), 'tool result was shown');
+    assert.ok(stdout.includes('Tools'), 'tool activity is separated from assistant prose');
+    assert.ok(stdout.includes('Explored 1 item'), 'routine read is summarized instead of printed twice');
+    assert.ok(!stdout.includes('⏺ Read('), 'successful routine reads do not leave one permanent row per call');
     assert.ok(stdout.includes('Final answer: saw alpha from file.'), 'assistant finished with final answer');
     assert.equal(requestBodies.length, 2, 'two chat requests expected for tool loop');
     assert.ok(
@@ -2623,12 +4220,30 @@ describe('CLI tool loop with mock Ollama', async () => {
     );
   });
 
+  test('CLI acknowledges y immediately and shows the approved command running', async () => {
+    const { stdout, stderr, timedOut } = await runCliWithInput(
+      ['run pwd\n', 'y\n'],
+      {
+        args: ['--cwd', tmpDir, '--model', 'mock-coder:latest'],
+        env: { OLLAMA_BASE_URL: mockBaseUrl },
+        inputDelayMs: 100,
+        waitForOutput: [null, 'Allow this tool call?'],
+        timeout: 15_000,
+      }
+    );
+
+    assert.equal(timedOut, false, 'permission-gated CLI should exit normally');
+    assert.ok(stdout.includes('Accepted y'), `the approval key is visibly acknowledged; stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`);
+    assert.ok(stdout.includes('Running Bash: pwd'), 'the status names the active command');
+    assert.ok(stdout.includes(`Command completed in ${tmpDir}.`), 'agent continues after the approved command');
+  });
+
   // `claudette -p "…"` — the headless entry point a script or CI job uses.
   function runHeadlessCli(prompt, extraArgs = []) {
     return new Promise((resolve, reject) => {
       const proc = spawn('node', ['claudette.js', '-p', prompt, '-y', '--cwd', tmpDir, '--model', 'mock-coder:latest', ...extraArgs], {
         cwd: ROOT,
-        env: { ...process.env, OLLAMA_BASE_URL: mockBaseUrl },
+        env: { ...process.env, ...hermeticModelEnv, OLLAMA_BASE_URL: mockBaseUrl },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let stdout = '', stderr = '';
@@ -2648,6 +4263,13 @@ describe('CLI tool loop with mock Ollama', async () => {
     assert.match(stdout, /Final answer: saw alpha from file\./);
   });
 
+  test('-p executes a brokered Bash tool loop and exits 0', async () => {
+    const { stdout, stderr, code, timedOut } = await runHeadlessCli('run pwd');
+    assert.equal(timedOut, false, `headless exits on its own; stderr=${stderr}`);
+    assert.equal(code, 0);
+    assert.match(stdout, new RegExp(`Command completed in ${tmpDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  });
+
   test('-p output is clean enough to pipe (no banner, spinner, or cost footer)', async () => {
     const { stdout } = await runHeadlessCli('inspect the file');
     assert.ok(!stdout.includes('◆ Claudette'), 'no banner');
@@ -2657,7 +4279,10 @@ describe('CLI tool loop with mock Ollama', async () => {
   });
 
   test('records a per-turn trace (session.turns[]) with events and metrics', async () => {
-    const sessionsDir = path.join(ROOT, 'data', 'sessions');
+    const sessionsDir = process.platform === 'darwin'
+      ? path.join(tmpDir, '.claudette', 'state', 'sessions')
+      : path.join(ROOT, 'data', 'sessions');
+    await fsp.mkdir(sessionsDir, { recursive: true });
     const before = new Set(await fsp.readdir(sessionsDir));
 
     const { timedOut } = await runCliWithInput(
@@ -2680,10 +4305,12 @@ describe('CLI tool loop with mock Ollama', async () => {
       assert.ok(turn, 'a session with a trace for this prompt was written');
 
       const types = turn.events.map(e => e.type);
-      for (const expected of ['input_received', 'files_expanded', 'model_request_started', 'tool_call', 'tool_result', 'assistant_completed']) {
+      for (const expected of ['input_received', 'files_expanded', 'model_request_started', 'tool_activity_summary', 'assistant_completed']) {
         assert.ok(types.includes(expected), `turn records "${expected}" event (got: ${types.join(', ')})`);
       }
-      assert.equal(turn.events.find(e => e.type === 'tool_call').data.name, 'read_file', 'tool_call event names the tool');
+      const exploration = turn.events.find(e => e.type === 'tool_activity_summary');
+      assert.equal(exploration.data.calls, 1, 'stored trace summarizes one routine call');
+      assert.equal(exploration.data.byTool.read_file, 1, 'summary retains the tool count');
       assert.equal(turn.status, 'completed', 'turn marked completed');
       assert.ok(turn.metrics.durationMs >= 0, 'turn records a duration');
       assert.equal(typeof turn.metrics.totalTokens, 'number', 'turn records token metrics');
@@ -2876,6 +4503,25 @@ describe('tool-call-parser: normalizeArgs per-tool alias table', async () => {
     assert.equal(call.function.name, 'read_file');
     assert.equal(call.function.arguments.path, 'CLAUDE.md');
   });
+
+  test('a standalone bare Bash argument object is recovered conservatively', () => {
+    const [call] = parseTextToolCalls('{"command":".venv/bin/mypy --no-incremental src","description":"run mypy"}');
+    assert.equal(call.function.name, 'bash');
+    assert.equal(call.function.arguments.command, '.venv/bin/mypy --no-incremental src');
+    assert.equal(call.function.arguments.description, 'run mypy');
+
+    assert.deepEqual(
+      parseTextToolCalls('Example only: {"command":"rm -rf build"}'),
+      [],
+      'a command-shaped fragment inside prose is not executable',
+    );
+    assert.deepEqual(parseTextToolCalls('{"path":"README.md"}'), [], 'ambiguous bare arguments stay prose');
+    assert.deepEqual(
+      parseTextToolCalls('{"command":"npm test","status":"suggested"}'),
+      [],
+      'extra structured-output fields fail closed',
+    );
+  });
 });
 
 // ─── Per-directory prompt history (up-arrow recall) ──────────────────────────
@@ -2894,6 +4540,8 @@ describe('src/history.js (per-directory prompt history)', async () => {
     assert.deepEqual(await loadHistory(a, { dir }), ['second', 'first'], 'newest-first, deduped, no blanks');
     assert.deepEqual(await loadHistory(b, { dir }), ['other'], 'separate dirs keep separate history');
     assert.notEqual(historyFile(a, dir), historyFile(b, dir), 'distinct files per directory');
+    assert.equal((await fsp.stat(dir)).mode & 0o777, 0o700);
+    assert.equal((await fsp.stat(historyFile(a, dir))).mode & 0o777, 0o600);
     await cleanDir(dir);
   });
 
@@ -2907,7 +4555,7 @@ describe('src/history.js (per-directory prompt history)', async () => {
 // ─── Turn trace terminal status ──────────────────────────────────────────────
 
 describe('src/trace.js (turn status)', async () => {
-  const { createTurnTrace } = await import('../src/trace.js');
+  const { compactTraceEvents, createTurnTrace } = await import('../src/trace.js');
 
   test('complete/fail/cancel set distinct statuses and fire onFinish once', () => {
     for (const [method, expected] of [['complete', 'completed'], ['fail', 'failed'], ['cancel', 'cancelled']]) {
@@ -2919,13 +4567,30 @@ describe('src/trace.js (turn status)', async () => {
       assert.ok(tr.turn.metrics.durationMs >= 0, 'duration stamped');
     }
   });
+
+  test('compactTraceEvents summarizes successful exploration but retains errors and commands', () => {
+    const events = [
+      { id: 'a', type: 'tool_call', at: 't1', data: { name: 'read_file' } },
+      { id: 'b', type: 'tool_started', at: 't2', data: { name: 'read_file' } },
+      { id: 'c', type: 'tool_result', at: 't3', data: { name: 'read_file', isError: false } },
+      { id: 'd', type: 'tool_call', at: 't4', data: { name: 'bash' } },
+      { id: 'e', type: 'tool_result', at: 't5', data: { name: 'bash', isError: false } },
+      { id: 'f', type: 'tool_call', at: 't6', data: { name: 'list_dir' } },
+      { id: 'g', type: 'tool_result', at: 't7', data: { name: 'list_dir', isError: true } },
+    ];
+    const compacted = compactTraceEvents(events);
+    assert.equal(compacted[0].type, 'tool_activity_summary');
+    assert.equal(compacted[0].data.calls, 1);
+    assert.equal(compacted[0].data.byTool.read_file, 1);
+    assert.deepEqual(compacted.slice(1), events.slice(3), 'Bash and failed listings remain verbatim');
+  });
 });
 
 // ─── Token-spend usage log (dataset) ─────────────────────────────────────────
 // One flat JSONL record per finished turn, for building token-efficiency datasets.
 
 describe('src/usage.js (token-spend log)', async () => {
-  const { buildUsageRecord, appendUsage } = await import('../src/usage.js');
+  const { buildUsageRecord, appendUsage, usageEnabled } = await import('../src/usage.js');
   const { estimateCost } = await import('../src/cost.js');
 
   test('buildUsageRecord flattens a finished turn into a dataset row', () => {
@@ -2933,13 +4598,19 @@ describe('src/usage.js (token-spend log)', async () => {
       id: 't1', model: 'anthropic/claude-haiku-4.5', cwd: '/w', status: 'completed',
       prompt: 'do the thing', completedAt: '2026-06-12T00:00:00.000Z',
       metrics: { promptTokens: 1000, completionTokens: 200, totalTokens: 1200, durationMs: 1500 },
-      events: [{ type: 'tool_call' }, { type: 'tool_result' }, { type: 'tool_call' }],
+      events: [
+        { type: 'model_resolved', data: { model: 'actual/free-model', provider: 'free-host' } },
+        { type: 'tool_call' }, { type: 'tool_result' }, { type: 'tool_call' },
+        { type: 'tool_activity_summary', data: { calls: 3 } },
+      ],
     };
     const rec = buildUsageRecord(turn, { id: 's1' });
     assert.equal(rec.sessionId, 's1');
     assert.equal(rec.turnId, 't1');
     assert.equal(rec.totalTokens, 1200);
-    assert.equal(rec.toolCalls, 2, 'counts tool_call events only');
+    assert.equal(rec.toolCalls, 5, 'counts raw calls and calls represented by compact summaries');
+    assert.deepEqual(rec.resolvedModels, ['actual/free-model']);
+    assert.deepEqual(rec.resolvedProviders, ['free-host']);
     assert.equal(rec.estCostUsd, estimateCost('anthropic/claude-haiku-4.5', turn.metrics));
     assert.equal(rec.prompt, 'do the thing');
     assert.equal(rec.ts, '2026-06-12T00:00:00.000Z');
@@ -2966,6 +4637,21 @@ describe('src/usage.js (token-spend log)', async () => {
     assert.equal(plain.compacted, false);
   });
 
+  test('buildUsageRecord tracks automatic model switches and the final model', () => {
+    const turn = {
+      id: 't-switch', model: 'groq/openai/gpt-oss-120b', finalModel: 'openrouter/free',
+      status: 'completed', metrics: { promptTokens: 10, completionTokens: 2, totalTokens: 12 },
+      events: [{
+        type: 'model_switch',
+        data: { from: 'groq/openai/gpt-oss-120b', to: 'openrouter/free', reason: 'rate limit' },
+      }],
+    };
+    const rec = buildUsageRecord(turn, { id: 's-switch' });
+    assert.equal(rec.finalModel, 'openrouter/free');
+    assert.deepEqual(rec.attemptedModels, ['groq/openai/gpt-oss-120b', 'openrouter/free']);
+    assert.equal(rec.modelSwitches, 1);
+  });
+
   test('appendUsage writes one parseable JSONL record per call', async () => {
     const dir = await makeTmpDir();
     appendUsage({ a: 1 }, { dir });
@@ -2973,7 +4659,29 @@ describe('src/usage.js (token-spend log)', async () => {
     const lines = (await fsp.readFile(path.join(dir, 'usage.jsonl'), 'utf8')).trim().split('\n');
     assert.equal(lines.length, 2, 'append-only');
     assert.deepEqual(lines.map(l => JSON.parse(l).a), [1, 2], 'each line is valid JSON in order');
+    assert.equal((await fsp.stat(dir)).mode & 0o777, 0o700);
+    assert.equal((await fsp.stat(path.join(dir, 'usage.jsonl'))).mode & 0o777, 0o600);
     await cleanDir(dir);
+  });
+
+  test('always-track overrides the ordinary usage-log off switch', () => {
+    const previous = {
+      nodeEnv: process.env.NODE_ENV,
+      log: process.env.CLAUDETTE_USAGE_LOG,
+      always: process.env.CLAUDETTE_ALWAYS_TRACK,
+    };
+    try {
+      process.env.NODE_ENV = 'development';
+      process.env.CLAUDETTE_USAGE_LOG = '0';
+      process.env.CLAUDETTE_ALWAYS_TRACK = '1';
+      assert.equal(usageEnabled(), true);
+      process.env.CLAUDETTE_ALWAYS_TRACK = '0';
+      assert.equal(usageEnabled(), false);
+    } finally {
+      if (previous.nodeEnv == null) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous.nodeEnv;
+      if (previous.log == null) delete process.env.CLAUDETTE_USAGE_LOG; else process.env.CLAUDETTE_USAGE_LOG = previous.log;
+      if (previous.always == null) delete process.env.CLAUDETTE_ALWAYS_TRACK; else process.env.CLAUDETTE_ALWAYS_TRACK = previous.always;
+    }
   });
 });
 
@@ -2982,7 +4690,7 @@ describe('src/usage.js (token-spend log)', async () => {
 // into one steering message at a safe boundary — never a second agent loop.
 
 describe('src/input.js (follow-up queue)', async () => {
-  const { InputController, buildFollowUpMessage, classifyApprovalAnswer, createInputAssembler, sanitizeUserInput, createBurstReader } = await import('../src/input.js');
+  const { InputController, buildFollowUpMessage, classifyApprovalAnswer, classifyApprovalKeystroke, createInputAssembler, parseInterruptCommand, sanitizeUserInput, createBurstReader } = await import('../src/input.js');
 
   // ── Prompt sanitization (echoed tool-render glyphs leaking into input) ──
   test('sanitizeUserInput: cuts a single typed line at a leaked tool-render glyph', () => {
@@ -2993,6 +4701,15 @@ describe('src/input.js (follow-up queue)', async () => {
 
   test('sanitizeUserInput: strips ANSI escapes but keeps real text', () => {
     assert.equal(sanitizeUserInput('\x1b[35m\x1b[1mhello\x1b[0m world'), 'hello world');
+  });
+
+  test('sanitizeUserInput: rejects a leaked spinner status line', () => {
+    assert.equal(sanitizeUserInput('⠙ Working…   ↑3.0k ↓1.0k · iter 1/150'), '');
+    assert.equal(sanitizeUserInput('⠧ Thinking…'), '');
+    assert.equal(sanitizeUserInput('⠙ Working · step 4/150 · 3 tools · in 25k · out 3.6k · 2m05s'), '');
+    assert.equal(sanitizeUserInput('⠸ Running Bash: npm test · step 5/150 · 4 tools'), '');
+    assert.equal(sanitizeUserInput('model  openrouter/poolside/laguna-s-2.1:free'), '');
+    assert.equal(sanitizeUserInput('route  OpenRouter / Poolside'), '');
   });
 
   test('sanitizeUserInput: a deliberate multi-line paste keeps its newlines (not glyph-cut)', () => {
@@ -3032,6 +4749,14 @@ describe('src/input.js (follow-up queue)', async () => {
     const feed = createInputAssembler({ onLine: l => lines.push(l) });
     feed('also update the README\r');
     assert.deepEqual(lines, ['also update the README']);
+  });
+
+  test('assembler: terminal arrow keys do not leak printable `[A` text', () => {
+    const lines = [];
+    const feed = createInputAssembler({ onLine: l => lines.push(l) });
+    feed('\x1b[A');
+    feed('yes\r');
+    assert.deepEqual(lines, ['yes']);
   });
 
   test('assembler: onChange echoes the growing buffer and clears on submit', () => {
@@ -3131,22 +4856,16 @@ describe('src/input.js (follow-up queue)', async () => {
     assert.equal(q.awaitingApproval, false);
   });
 
-  test('text typed at a permission prompt is queued and leaves it pending', async () => {
+  test('text typed at a permission prompt denies the tool and becomes an immediate redirect', async () => {
     const q = new InputController();
-    let settled = null;
-    q.awaitApproval().then(v => { settled = v; });
+    const pending = q.awaitApproval();
 
     const routed = q.submit('actually, skip the tests');
-    assert.equal(routed.kind, 'queued', 'non-answers steer instead of approving');
-    assert.equal(q.size, 1);
-    await new Promise(r => setImmediate(r));
-    assert.equal(settled, null, 'prompt still waiting for a real answer');
-    assert.equal(q.mode, 'approval', 'still in approval mode');
-
-    q.submit('yes');
-    assert.equal(await q.drain().length, 1, 'only the steering line was queued');
-    await new Promise(r => setImmediate(r));
-    assert.equal(settled, 'y', "'yes' normalises to y");
+    assert.equal(routed.kind, 'redirect', 'prose at the gate steers immediately');
+    assert.equal(await pending, 'n', 'pending tool is denied before redirecting');
+    assert.equal(q.size, 0, 'redirect does not wait in the ordinary safe queue');
+    assert.equal(q.mode, 'working', 'approval mode is released');
+    assert.equal(q.takeRedirect().content, 'actually, skip the tests');
   });
 
   test('resolveApproval reports whether anything was waiting (interrupt path)', async () => {
@@ -3168,6 +4887,35 @@ describe('src/input.js (follow-up queue)', async () => {
     for (const text of ['yeah', 'nope', 'y please', 'add tests', '']) {
       assert.equal(classifyApprovalAnswer(text), null, `${JSON.stringify(text)} is not an answer`);
     }
+  });
+
+  test('classifyApprovalKeystroke accepts exactly one y/n/a key', () => {
+    assert.equal(classifyApprovalKeystroke('y'), 'y');
+    assert.equal(classifyApprovalKeystroke('N'), 'n');
+    assert.equal(classifyApprovalKeystroke('a'), 'a');
+    assert.equal(classifyApprovalKeystroke('yes'), null, 'words still need Enter through normal line input');
+    assert.equal(classifyApprovalKeystroke('x'), null);
+  });
+
+  test('parseInterruptCommand distinguishes redirects from ordinary queued text', () => {
+    assert.equal(parseInterruptCommand('/interrupt stop the test and inspect logs'), 'stop the test and inspect logs');
+    assert.equal(parseInterruptCommand('  /INTERRUPT   use the smaller fixture  '), 'use the smaller fixture');
+    assert.equal(parseInterruptCommand('/interrupt'), '', 'recognised but missing its prompt');
+    assert.equal(parseInterruptCommand('ordinary follow-up'), null);
+    assert.equal(parseInterruptCommand('/interrupted nope'), null, 'requires the exact command');
+  });
+
+  test('one explicit redirect is retained separately from ordinary follow-ups', () => {
+    const q = new InputController();
+    q.enqueue('queued safely');
+    const redirect = q.requestRedirect('stop and do this now');
+    assert.equal(q.redirectPending, true);
+    assert.equal(q.size, 1, 'redirect does not consume or mingle with the safe queue');
+    assert.equal(q.takeRedirect().content, 'stop and do this now');
+    assert.equal(q.redirectPending, false);
+    assert.equal(q.takeRedirect(), null, 'redirect is delivered only once');
+    assert.equal(q.drain()[0].content, 'queued safely', 'ordinary follow-up is preserved');
+    assert.ok(redirect.id && redirect.queuedAt, 'redirect is stamped for traceability');
   });
 
   test('buildFollowUpMessage: null when empty, plain for one, numbered+labeled for many', () => {
@@ -3230,8 +4978,25 @@ describe('src/input.js (follow-up queue)', async () => {
 // ─── chat.js: effort + bypass settings ────────────────────────────────────────
 
 describe('chat.js (effort + bypass)', async () => {
-  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS, resolveMaxIterations, explainStreamError, resolveActNudge, createActNudger, resolveVerifyGate, looksLikeVerification, buildVerifyNudge } =
+  const { isValidEffort, EFFORT_LEVELS, resolveAutoApprove, BYPASS_FLAGS, resolveMaxIterations, explainStreamError, resolveActNudge, createActNudger, resolveVerifyGate, looksLikeVerification, buildVerifyNudge, runRedirectSequence } =
     await import('../src/chat.js');
+
+  test('runRedirectSequence waits for cleanup before starting the injected prompt', async () => {
+    const seen = [];
+    let active = 0;
+    let maxActive = 0;
+    await runRedirectSequence('first', async prompt => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      seen.push(`start:${prompt}`);
+      await new Promise(resolve => setImmediate(resolve));
+      seen.push(`end:${prompt}`);
+      active--;
+      return prompt === 'first' ? { content: 'redirected' } : null;
+    });
+    assert.equal(maxActive, 1, 'never runs two agent turns concurrently');
+    assert.deepEqual(seen, ['start:first', 'end:first', 'start:redirected', 'end:redirected']);
+  });
 
   test('resolveVerifyGate: on by default, CLAUDETTE_VERIFY_GATE=0 disables', () => {
     assert.equal(resolveVerifyGate({}), true);
@@ -3384,7 +5149,57 @@ describe('chat.js (credential guard)', async () => {
   });
 });
 
-// ─── ui.js: incremental markdown stream ───────────────────────────────────────
+// ─── ui.js: managed turn status + incremental markdown stream ────────────────
+
+describe('ui.js (managed turn status)', async () => {
+  const { buildTurnStatusLines, buildAssistantFooter } = await import('../src/ui.js');
+
+  test('completion footer keeps only router/provider and token count', () => {
+    assert.equal(buildAssistantFooter({
+      model: 'openrouter/poolside/laguna-s-2.1:free',
+      resolvedProvider: 'Poolside',
+      tokens: 3652,
+      costUsd: 1.23,
+      sessionCostUsd: 4.56,
+      rateLimit: { remainingTokens: 7000 },
+    }), 'OpenRouter / Poolside · ~3652 tokens');
+    assert.equal(
+      buildAssistantFooter({ model: 'groq/openai/gpt-oss-120b', resolvedProvider: 'Groq', tokens: 42 }),
+      'Groq · ~42 tokens',
+    );
+    assert.equal(buildAssistantFooter({ model: 'qwen3.6:27b', tokens: 9 }), 'Ollama · ~9 tokens');
+  });
+
+  test('live footer keeps one compact route identity with labeled progress and tokens', () => {
+    const startedAt = Date.now() - 125_000;
+    const lines = buildTurnStatusLines({
+      activeModel: 'openrouter/free',
+      resolvedModel: 'poolside/laguna-s-2.1',
+      resolvedProvider: 'Poolside',
+      phase: 'Working', iteration: 10, maxIterations: 150, toolCount: 7,
+      promptTokens: 25_000, completionTokens: 3_600, queueCount: 1, startedAt,
+    }, 240, '⠸', startedAt + 125_000);
+    const out = lines.join('\n');
+    assert.equal(lines[0], '  route  OpenRouter / Poolside');
+    assert.ok(!out.includes('openrouter/free'), 'selected model id is not repeated');
+    assert.ok(!out.includes('poolside/laguna-s-2.1'), 'resolved model id is not repeated');
+    for (const expected of ['step 10/150', '7 tools', 'in 25k', 'out 3.6k', '2m05s', '1 queued']) {
+      assert.ok(out.includes(expected), `status labels ${expected}`);
+    }
+    assert.ok(!out.includes('↑') && !out.includes('↓'), 'cryptic token arrows are gone');
+  });
+
+  test('wraps a long provider label without restoring model ids', () => {
+    const provider = 'A-Very-Long-Upstream-Provider';
+    const model = 'openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free';
+    const lines = buildTurnStatusLines({ activeModel: model, resolvedProvider: provider, phase: 'Thinking', startedAt: 1 }, 28, '⠋', 1);
+    const identityRows = lines.slice(0, -1);
+    const reconstructed = identityRows.map(line => line.slice(9)).join('');
+    assert.equal(reconstructed, `OpenRouter / ${provider}`);
+    assert.ok(!lines.join('\n').includes(model));
+    assert.ok(identityRows.every(line => !line.includes('…')), 'identity is never ellipsized');
+  });
+});
 
 describe('ui.js (markdown stream)', async () => {
   const { createMarkdownStream, palette } = await import('../src/ui.js');
@@ -3444,6 +5259,40 @@ describe('ui.js (markdown stream)', async () => {
 // `import { run } from 'claudette'` — the scriptable surface. Driven here by a
 // scripted chatFn so it needs no provider.
 
+describe('repository syntax checker', () => {
+  test('checks every source file, preserves failures, and respects ignored paths', async () => {
+    const dir = await makeTmpDir();
+    try {
+      assert.equal(spawnSync('git', ['init', '--quiet'], { cwd: dir }).status, 0);
+      await fsp.writeFile(path.join(dir, '.gitignore'), 'ignored/\n');
+      await fsp.writeFile(path.join(dir, '00 tracked.js'), 'const = ;\n');
+      assert.equal(spawnSync('git', ['add', '--', '00 tracked.js'], { cwd: dir }).status, 0);
+      await fsp.writeFile(path.join(dir, 'middle untracked.cjs'), 'const = ;\n');
+      await fsp.writeFile(path.join(dir, 'zz valid.mjs'), 'export const ok = true;\n');
+      await fsp.mkdir(path.join(dir, 'ignored'));
+      await fsp.writeFile(path.join(dir, 'ignored', 'broken.js'), 'const = ;\n');
+      const check = () => spawnSync(process.execPath, [path.join(ROOT, 'scripts/check-syntax.js')], {
+        cwd: dir, encoding: 'utf8',
+      });
+      const failed = check();
+      assert.equal(failed.status, 1, failed.stderr);
+      assert.match(failed.stdout, /3 files; 2 failed/,
+        'a later valid file must not hide earlier errors, including an untracked file');
+      assert.match(failed.stderr, /00 tracked\.js/);
+      assert.match(failed.stderr, /middle untracked\.cjs/);
+
+      await fsp.rm(path.join(dir, '00 tracked.js'));
+      await fsp.writeFile(path.join(dir, 'middle untracked.cjs'), 'module.exports = true;\n');
+      const passed = check();
+      assert.equal(passed.status, 0, passed.stderr);
+      assert.match(passed.stdout, /2 files; 0 failed/,
+        'deleted tracked files and ignored generated files are skipped');
+    } finally {
+      await cleanDir(dir);
+    }
+  });
+});
+
 describe('index.js (library API)', async () => {
   const lib = await import('../index.js');
 
@@ -3487,7 +5336,7 @@ describe('index.js (library API)', async () => {
 
   test('run() executes tools against the given cwd, and only there', async () => {
     const res = await lib.run('read the note', {
-      model: 'mock', cwd: ws, projectInstructions: false,
+      model: 'mock', cwd: ws, projectInstructions: false, tools: true,
       chatFn: scripted([
         { toolCalls: [{ id: 'r', function: { name: 'read_file', arguments: { path: 'note.txt' } } }] },
         { content: 'It says library speaking.' },
@@ -3505,7 +5354,7 @@ describe('index.js (library API)', async () => {
   test('approve() gates tools — a script can allow reads but not writes', async () => {
     const target = path.join(ws, 'should-not-exist.txt');
     const res = await lib.run('write a file', {
-      model: 'mock', cwd: ws, projectInstructions: false,
+      model: 'mock', cwd: ws, projectInstructions: false, tools: true,
       approve: (name) => name !== 'write_file',
       chatFn: scripted([
         { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'should-not-exist.txt', content: 'x' } } }] },
@@ -3528,14 +5377,57 @@ describe('index.js (library API)', async () => {
     assert.deepEqual(res.toolCalls, [], 'tool-shaped text is not executed when tools are off');
   });
 
+  test('library capabilities are off by default and Bash needs a separate opt-in', async () => {
+    const offered = [];
+    const seenUsers = [];
+    const chatFn = async ({ messages, tools }) => {
+      offered.push(tools.map(tool => tool.function.name));
+      seenUsers.push(messages.find(message => message.role === 'user')?.content ?? '');
+      return { content: 'ok', toolCalls: null, promptTokens: 1, completionTokens: 1 };
+    };
+    await lib.run('inspect @note.txt', {
+      model: 'mock', cwd: ws, projectInstructions: false, chatFn,
+    });
+    await lib.run('inspect', {
+      model: 'mock', cwd: ws, projectInstructions: false, tools: true, chatFn,
+    });
+    await lib.run('inspect', {
+      model: 'mock', cwd: ws, projectInstructions: false, tools: true, allowShell: true, chatFn,
+    });
+    assert.deepEqual(offered[0], []);
+    assert.match(seenUsers[0], /@note\.txt/, 'prompt expansion is also opt-in');
+    assert.equal(offered[1].includes('bash'), false);
+    assert.equal(offered[2].includes('bash'), true);
+  });
+
   test('@paths are expanded into the prompt and reported', async () => {
     const chatFn = scripted([{ content: 'read it' }]);
     const res = await lib.run('summarise @note.txt', {
-      model: 'mock', cwd: ws, projectInstructions: false, chatFn,
+      model: 'mock', cwd: ws, projectInstructions: false, expandAtFiles: true, chatFn,
     });
     assert.deepEqual(res.files, ['note.txt']);
     const sentUser = chatFn.seen[0].find(m => m.role === 'user');
     assert.match(sentUser.content, /library speaking/, 'file contents inlined');
+  });
+
+  test('@path expansion refuses a symlink that resolves outside the workspace', async () => {
+    const outside = path.join(path.dirname(ws), `claudette-expand-${randomUUID()}.txt`);
+    const link = path.join(ws, 'outside-note.txt');
+    await fsp.writeFile(outside, 'must not enter the prompt');
+    await fsp.symlink(outside, link);
+    try {
+      const chatFn = scripted([{ content: 'ok' }]);
+      const res = await lib.run('summarise @outside-note.txt', {
+        model: 'mock', cwd: ws, projectInstructions: false, expandAtFiles: true, chatFn,
+      });
+      assert.deepEqual(res.files, []);
+      const user = chatFn.seen[0].find(message => message.role === 'user').content;
+      assert.match(user, /@outside-note\.txt/);
+      assert.doesNotMatch(user, /must not enter the prompt/);
+    } finally {
+      await fsp.unlink(link).catch(() => {});
+      await fsp.unlink(outside).catch(() => {});
+    }
   });
 
   test('expandAtFiles:false leaves @tokens alone', async () => {
@@ -3580,6 +5472,87 @@ describe('index.js (library API)', async () => {
     }, /non-empty string/);
   });
 
+  test('stream() starts only when consumed and aborts before returning from an early break', async () => {
+    let calls = 0;
+    let requestSignal;
+    let cleanedUp = false;
+    const events = lib.stream('say hi', {
+      model: 'mock', cwd: ws,
+      chatFn: async ({ signal, onDelta }) => {
+        calls++;
+        requestSignal = signal;
+        onDelta('hello');
+        await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+        await new Promise(resolve => setImmediate(resolve));
+        cleanedUp = true;
+        signal.throwIfAborted();
+      },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls, 0, 'creating an unused stream must not start a provider request');
+    for await (const event of events) {
+      if (event.type === 'text') break;
+    }
+    assert.equal(calls, 1);
+    assert.equal(requestSignal.aborted, true);
+    assert.equal(cleanedUp, true, 'iterator cleanup waits for the request to settle');
+  });
+
+  test('createAgent() keeps a cancelled stream busy until provider cleanup finishes', async () => {
+    let finishCleanup;
+    const cleanupGate = new Promise(resolve => { finishCleanup = resolve; });
+    let reportAbort;
+    const aborted = new Promise(resolve => { reportAbort = resolve; });
+    let cleanedUp = false;
+    const agent = lib.createAgent({
+      model: 'mock', cwd: ws,
+      chatFn: async ({ signal, onDelta }) => {
+        onDelta('hello');
+        await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+        reportAbort();
+        await cleanupGate;
+        cleanedUp = true;
+        signal.throwIfAborted();
+      },
+    });
+    const consuming = (async () => {
+      for await (const event of agent.stream('first')) {
+        if (event.type === 'text') break;
+      }
+    })();
+    try {
+      await aborted;
+      await new Promise(resolve => setImmediate(resolve));
+      assert.throws(() => agent.reset(), /while a turn is in progress/);
+      await assert.rejects(agent.send('overlap'), /already has a turn in progress/);
+    } finally {
+      finishCleanup();
+      await consuming;
+    }
+    assert.equal(cleanedUp, true);
+    assert.deepEqual(agent.messages, [], 'an abandoned stream does not commit incomplete history');
+    agent.reset();
+    const result = await agent.send('next', { chatFn: scripted([{ content: 'ready' }]) });
+    assert.equal(result.text, 'ready');
+  });
+
+  test('createAgent().stream() honors a signal supplied in the agent defaults', async () => {
+    const controller = new AbortController();
+    const agent = lib.createAgent({
+      model: 'mock', cwd: ws, signal: controller.signal,
+      chatFn: async ({ signal }) => {
+        controller.abort();
+        assert.equal(signal.aborted, true);
+        signal.throwIfAborted();
+      },
+    });
+    let result;
+    for await (const event of agent.stream('cancel')) {
+      if (event.type === 'result') result = event;
+    }
+    assert.equal(result.status, 'cancelled');
+  });
+
   test('createAgent() carries the conversation between calls', async () => {
     const chatFn = scripted([{ content: 'first answer' }, { content: 'second answer' }]);
     const agent = lib.createAgent({ model: 'mock', cwd: ws, projectInstructions: false, chatFn });
@@ -3597,6 +5570,79 @@ describe('index.js (library API)', async () => {
 
     agent.reset();
     assert.deepEqual(agent.messages, []);
+  });
+
+  test('createAgent() commits streamed history and fallback model for the next turn', async () => {
+    const seenModels = [];
+    const seenMessages = [];
+    let request = 0;
+    const chatFn = async ({ model, messages }) => {
+      seenModels.push(model);
+      seenMessages.push(messages);
+      request++;
+      return {
+        content: request === 1 ? 'streamed answer' : 'continued answer',
+        toolCalls: null,
+        promptTokens: 1,
+        completionTokens: 1,
+        ...(request === 1 ? { selectedModel: 'stream-fallback' } : {}),
+      };
+    };
+    const agent = lib.createAgent({
+      model: 'stream-start', cwd: ws, projectInstructions: false, tools: false, chatFn,
+    });
+    let streamedResult;
+    for await (const event of agent.stream('remember this')) {
+      if (event.type === 'result') streamedResult = event;
+    }
+    assert.equal(streamedResult.model, 'stream-fallback');
+    assert.ok(agent.messages.some(message => message.role === 'assistant' && message.content === 'streamed answer'));
+
+    await agent.send('continue');
+    assert.deepEqual(seenModels, ['stream-start', 'stream-fallback']);
+    assert.ok(seenMessages[1].some(message => message.role === 'user' && message.content.includes('remember this')));
+    assert.ok(seenMessages[1].some(message => message.role === 'assistant' && message.content === 'streamed answer'));
+  });
+
+  test('createAgent() rejects overlapping turns that would race shared history', async () => {
+    let release;
+    const waiting = new Promise(resolve => { release = resolve; });
+    const agent = lib.createAgent({
+      model: 'mock', cwd: ws, projectInstructions: false, tools: false,
+      chatFn: async () => {
+        await waiting;
+        return { content: 'done', toolCalls: null, promptTokens: 1, completionTokens: 1 };
+      },
+    });
+    const first = agent.send('first');
+    await assert.rejects(agent.send('second'), /already has a turn in progress/);
+    assert.throws(() => agent.reset(), /while a turn is in progress/);
+    release();
+    await first;
+  });
+
+  test('createAgent() continues future calls on a provider-selected fallback', async () => {
+    const seenModels = [];
+    let call = 0;
+    const chatFn = async (opts) => {
+      seenModels.push(opts.model);
+      call++;
+      return {
+        content: call === 1 ? 'recovered' : 'still here',
+        toolCalls: null,
+        promptTokens: 2,
+        completionTokens: 1,
+        ...(call === 1 ? { selectedModel: 'fallback-free' } : {}),
+      };
+    };
+    const agent = lib.createAgent({
+      model: 'starting-free', cwd: ws, projectInstructions: false, tools: false, chatFn,
+    });
+    const first = await agent.send('one');
+    const second = await agent.send('two');
+    assert.equal(first.model, 'fallback-free');
+    assert.equal(second.model, 'fallback-free');
+    assert.deepEqual(seenModels, ['starting-free', 'fallback-free']);
   });
 
   test('a missing provider key is reported before any request', async () => {
@@ -3656,9 +5702,11 @@ describe('src/agent-runner.js (shared loop)', async () => {
       { content: 'It says hello runner.' },
     ]);
 
+    const events = [];
     const run = await runAgent({
       model: 'mock', messages, tools: TOOL_DEFS, chatFn,
       toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type) => { events.push(type); },
     });
 
     assert.equal(run.status, 'completed');
@@ -3666,10 +5714,111 @@ describe('src/agent-runner.js (shared loop)', async () => {
     assert.equal(run.iterations, 2);
     assert.equal(run.usage.promptTokens, 20, 'usage accumulates across iterations');
     assert.deepEqual(run.toolCalls.map(c => c.name), ['read_file']);
+    assert.ok(events.indexOf('tool_call') < events.indexOf('tool_start'), 'tool starts only after it is announced/approved');
+    assert.ok(events.indexOf('tool_start') < events.indexOf('tool_result'), 'running status begins before the result');
     assert.ok(
       messages.some(m => m.role === 'tool' && m.content.includes('hello runner')),
       'the tool result lands in the message list',
     );
+  });
+
+  test('an interrupt at the approval boundary cancels before the tool starts', async () => {
+    const messages = [{ role: 'user', content: 'run the command' }];
+    const events = [];
+    const ac = new AbortController();
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([{
+        toolCalls: [{ id: 't1', function: { name: 'bash', arguments: { command: 'touch must-not-exist' } } }],
+      }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      signal: ac.signal,
+      approve: async () => {
+        ac.abort();
+        return false;
+      },
+      emit: (type) => { events.push(type); },
+    });
+
+    assert.equal(run.status, 'cancelled');
+    assert.ok(events.includes('tool_denied'), 'parked approval is settled as denied');
+    assert.ok(!events.includes('tool_start'), 'aborted operation never enters its running state');
+    await assert.rejects(fsp.access(path.join(sandbox, 'must-not-exist')), 'the command was never executed');
+  });
+
+  test('interrupting a multi-tool batch pairs every declared call before cancellation', async () => {
+    const messages = [{ role: 'user', content: 'read both files' }];
+    const ac = new AbortController();
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([{
+        toolCalls: [
+          { id: 'first', function: { name: 'read_file', arguments: { path: 'one.txt' } } },
+          { id: 'second', function: { name: 'read_file', arguments: { path: 'two.txt' } } },
+        ],
+      }]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      signal: ac.signal,
+      approve: async () => {
+        ac.abort();
+        return true;
+      },
+    });
+
+    assert.equal(run.status, 'cancelled');
+    const results = messages.filter(message => message.role === 'tool');
+    assert.deepEqual(results.map(message => message.tool_call_id), ['first', 'second']);
+    assert.ok(results.every(message => /cancelled before execution/.test(message.content)));
+    assert.deepEqual(run.toolCalls.map(call => call.isError), [true, true]);
+  });
+
+  test('persists a provider-selected fallback for later iterations and callers', async () => {
+    const messages = [{ role: 'user', content: 'go' }];
+    const events = [];
+    const changed = [];
+    const rotationState = {
+      attemptedModels: ['groq/start', 'openrouter/free'],
+    };
+    const run = await runAgent({
+      model: 'groq/start', messages, rotationState,
+      chatFn: async (opts) => {
+        await opts.onModelSwitch({
+          from: 'groq/start', to: 'openrouter/free', reason: 'rate limit',
+          status: 429, switch: 1, error: Object.assign(new Error('limited'), { status: 429 }),
+        });
+        return {
+          content: 'recovered', toolCalls: null, promptTokens: 4, completionTokens: 1,
+          selectedModel: 'openrouter/free',
+        };
+      },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type, data) => events.push({ type, data }),
+      onModelChange: model => changed.push(model),
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(run.model, 'openrouter/free');
+    assert.deepEqual(run.attemptedModels, ['groq/start', 'openrouter/free']);
+    assert.deepEqual(changed, ['openrouter/free']);
+    assert.equal(events.find(event => event.type === 'model_switch')?.data.status, 429);
+    assert.equal(events.find(event => event.type === 'usage')?.data.model, 'openrouter/free');
+  });
+
+  test('does not commit a fallback model that also fails', async () => {
+    const changed = [];
+    const run = await runAgent({
+      model: 'groq/start', messages: [{ role: 'user', content: 'go' }],
+      rotationState: { attemptedModels: ['groq/start', 'openrouter/free'] },
+      chatFn: async (opts) => {
+        await opts.onModelSwitch({
+          from: 'groq/start', to: 'openrouter/free', reason: 'rate limit',
+          status: 429, switch: 1, error: new Error('limited'),
+        });
+        throw new Error('fallback also failed');
+      },
+      onModelChange: model => changed.push(model),
+    });
+    assert.equal(run.status, 'failed');
+    assert.deepEqual(changed, [], 'persistent session model remains the last successful model');
   });
 
   test('emits every appended message by reference, so callers can mirror history', async () => {
@@ -3802,6 +5951,21 @@ describe('src/agent-runner.js (shared loop)', async () => {
     assert.ok(requests < 12, 'did not burn the iteration budget');
   });
 
+  test('trace records repetition and iteration caps as terminal statuses', async () => {
+    const { createTurnTrace } = await import('../src/trace.js');
+    const finished = [];
+    const repeating = createTurnTrace({ onFinish: turn => finished.push(turn.status) });
+    repeating.repeat();
+    assert.equal(repeating.turn.status, 'repeating');
+    assert.ok(repeating.turn.completedAt);
+    assert.ok(repeating.turn.metrics.durationMs >= 0);
+
+    const capped = createTurnTrace({ onFinish: turn => finished.push(turn.status) });
+    capped.maxIterations();
+    assert.equal(capped.turn.status, 'max_iterations');
+    assert.deepEqual(finished, ['repeating', 'max_iterations']);
+  });
+
   test('repeat guard ignores legitimate repetition that follows progress', async () => {
     // Running the same check after an edit is normal and must not trip the guard.
     const bash = (command) => ({ toolCalls: [{ id: 'b', function: { name: 'bash', arguments: { command } } }] });
@@ -3865,14 +6029,16 @@ describe('src/agent-runner.js (shared loop)', async () => {
   // `python3 check_cert.py`, the gate didn't recognise it, and kept nudging —
   // an 8-call task became 20 calls and 80k input tokens.
   test('running the script you just wrote counts as verification', async () => {
-    const { looksLikeVerification } = await import('../src/agent-runner.js');
+    const { looksLikeMutation, looksLikeVerification } = await import('../src/agent-runner.js');
     for (const cmd of ['python3 /app/check_cert.py', 'node build.js', './run.sh',
                        'bash verify.sh', 'python3 -m pytest', 'npm test', 'cargo test']) {
       assert.equal(looksLikeVerification(cmd), true, `${cmd} verifies`);
     }
     // Still narrow enough to be meaningful: looking around is not verifying.
     for (const cmd of ['cat notes.txt', 'ls -la', 'echo hello', 'git status',
-                       'python3 -c "print(1)"', 'npm run dev']) {
+                       'python3 -c "print(1)"', 'npm run dev',
+                       'npm test || true', 'npm test | tee test.log',
+                       'npm test; echo done', 'npm test &']) {
       assert.equal(looksLikeVerification(cmd), false, `${cmd} does not verify`);
     }
     // Starting a server proves nothing — it blocks until the bash timeout — and
@@ -3880,6 +6046,314 @@ describe('src/agent-runner.js (shared loop)', async () => {
     for (const cmd of ['node app.js', 'node server.js', 'python3 main.py']) {
       assert.equal(looksLikeVerification(cmd), false, `${cmd} is a server start`);
     }
+
+    for (const cmd of [
+      'cp .env.example .env.local',
+      "sed -i '' 's/a/b/' .env.local",
+      'npm install',
+      'DATABASE_URL=file:./dev.db npx prisma migrate dev --name init',
+      'echo hi > out.txt',
+    ]) {
+      assert.equal(looksLikeMutation(cmd), true, `${cmd} mutates the workspace`);
+    }
+    for (const cmd of ['ls -la', 'cat package.json', 'npm run build', 'node --check file.js', 'echo hi 2>&1']) {
+      assert.equal(looksLikeMutation(cmd), false, `${cmd} is read-only or verification`);
+    }
+  });
+
+  test('collection, help, version, and dry runs do not count as verification', async () => {
+    const { looksLikeVerification } = await import('../src/agent-runner.js');
+    for (const command of [
+      'pytest --co -q', 'python3 -m pytest --collect-only',
+      'pytest --collect-only=true', 'pytest --help', 'mypy --version',
+      'npm test -- --help', 'npm run build --dry-run',
+      'npx vitest --help', 'node --test --help', 'cargo test --help',
+      'go test --help', 'ruff check --help', 'env CHECK=1 python3 -m pytest --co',
+    ]) assert.equal(looksLikeVerification(command), false, command);
+    for (const command of ['python3 -m pytest -q', 'pytest --co && pytest -q', 'node --check app.js']) {
+      assert.equal(looksLikeVerification(command), true, command);
+    }
+  });
+
+  test('test collection cannot satisfy the verification gate after a source edit', async () => {
+    await fsp.writeFile(path.join(sandbox, 'pytest.py'), 'print("655 tests collected")\n');
+    const messages = [{ role: 'user', content: 'make and verify the change' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'collection.js', content: 'const value = 1;\n' } } }] },
+        { toolCalls: [{ id: 'c', function: { name: 'bash', arguments: { command: 'python3 -m pytest --collect-only' } } }] },
+        { content: 'done' },
+        { toolCalls: [{ id: 'v', function: { name: 'bash', arguments: { command: 'node --check collection.js' } } }] },
+        { content: 'Syntax checked; full test coverage remains unknown.' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox }, verifyGate: true, actNudge: 0,
+    });
+    assert.equal(run.iterations, 5);
+    assert.ok(messages.some(message => /edited files but haven't verified/.test(message.content ?? '')));
+  });
+
+  test('verification rejects discovery hidden in wrappers, pytest configuration, and make flags', async () => {
+    const { looksLikeVerification } = await import('../src/agent-runner.js');
+    const { annotateBashEvidence } = await import('../src/evidence.js');
+    for (const command of [
+      'pnpm jest --help', 'yarn vitest --help', 'bun jest --help',
+      'pytest -o addopts=--collect-only', 'pytest --override-ini="addopts=--co -q"',
+      'PYTEST_ADDOPTS=--co pytest', 'env PYTEST_ADDOPTS="--co -q" pytest',
+      'make -n', 'make --just-print', 'make --recon', 'make -qn target',
+    ]) assert.equal(looksLikeVerification(command), false, command);
+    for (const command of [
+      'pytest -o addopts=--collect-only', 'pytest --override-ini="addopts=--co -q"',
+      'PYTEST_ADDOPTS=--co pytest', 'env PYTEST_ADDOPTS="--co -q" pytest',
+    ]) assert.match(annotateBashEvidence(command, 'collected'), /collection-only/, command);
+    for (const command of [
+      'pnpm jest --runInBand', 'yarn vitest run', 'make -j2 test',
+      'pytest -o addopts=-q', 'PYTEST_ADDOPTS=-q pytest',
+    ]) assert.equal(looksLikeVerification(command), true, command);
+    for (const command of [
+      'printf "pytest --co"', 'echo "PYTEST_ADDOPTS=--co pytest"',
+      'pytest -k "--collect-only"',
+    ]) assert.equal(annotateBashEvidence(command, 'output'), 'output', command);
+  });
+
+  test('verification recognizes environment prefixes and checks only the final workspace state', async () => {
+    const { looksLikeMutation, looksLikeVerification } = await import('../src/agent-runner.js');
+    for (const command of [
+      'NODE_ENV=test npm test',
+      'env PYTHONPATH=src python3 -m pytest -q',
+      'python3 -m compileall -q src',
+      'python3 -m pip_audit --requirement requirements.txt',
+      'pip-audit -r requirements.txt',
+      'cp first.js second.js && node --check second.js',
+      'npm test > test.log',
+    ]) {
+      assert.equal(looksLikeVerification(command), true, command);
+    }
+    for (const command of [
+      'npm test && cp replacement.js app.js',
+      'node --check app.js && echo broken > app.js',
+      'npm test || true',
+      'NODE_ENV=test npm test | tee test.log',
+    ]) {
+      assert.equal(looksLikeVerification(command), false, command);
+    }
+    for (const command of [
+      'python3 -m compileall -q src',
+      'python3 -m pytest --cov=src --cov-report=html',
+      'python3 -m pip_audit --requirement requirements.txt',
+      'pip-audit -r requirements.txt',
+    ]) {
+      assert.equal(looksLikeMutation(command), false, 'generated artifacts and audits: ' + command);
+    }
+  });
+
+  test('discarded output is not a workspace edit and cannot trigger review verification', async () => {
+    const { looksLikeMutation } = await import('../src/agent-runner.js');
+    for (const command of [
+      'ls -la 2>/dev/null', 'find . -name "*.toml" 2> /dev/null',
+      'git status --short 2>/dev/null || echo "not a git repo"',
+      'ls >"/dev/null"', "ls >>'/dev/null'", 'ls >/dev/null 2>&1',
+    ]) assert.equal(looksLikeMutation(command), false, command);
+    for (const command of ['echo x > app.js', 'ls 2>/dev/null > listing.txt', 'ls > /dev/nullish']) {
+      assert.equal(looksLikeMutation(command), true, command);
+    }
+    const messages = [{ role: 'user', content: 'Review without making changes.' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'list', function: { name: 'bash', arguments: { command: 'ls -la 2>/dev/null' } } }] },
+        { content: 'Review complete; no changes were needed.' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox }, verifyGate: true, actNudge: 0,
+    });
+    assert.equal(run.iterations, 2, 'a read-only review must finish without verification nags');
+    assert.ok(!messages.some(message => /edited files but haven't verified/.test(message.content ?? '')));
+  });
+
+  test('generated discovery matrix distinguishes executed checks from discovery under wrappers', async () => {
+    const { looksLikeVerification } = await import('../src/agent-runner.js');
+    const { annotateBashEvidence } = await import('../src/evidence.js');
+    const prefixes = ['', 'env CHECK=1 ', 'CHECK=1 ', 'sudo ', 'time ', 'env CHECK=1 time '];
+    for (const prefix of prefixes) {
+      for (const runner of ['pytest', 'python3 -m pytest', 'mypy', 'npx jest', 'pnpm jest', 'yarn vitest', 'node --test', 'cargo test', 'go test', 'make']) {
+        assert.equal(looksLikeVerification(`${prefix}${runner}`), true, `${prefix}${runner}`);
+        for (const flag of ['--help', '--version', '--dry-run']) {
+          const command = `${prefix}${runner} ${flag}`;
+          assert.equal(looksLikeVerification(command), false, command);
+        }
+      }
+      for (const runner of ['pytest', 'python3 -m pytest']) {
+        for (const flag of ['--co', '--collect-only', '--collectonly']) {
+          for (const suffix of ['', ' -q | tail -5 || true', ' 2>/dev/null']) {
+            const command = `${prefix}${runner} ${flag}${suffix}`;
+            assert.equal(looksLikeVerification(command), false, command);
+            assert.match(annotateBashEvidence(command, 'collected'), /collection-only/, command);
+          }
+        }
+      }
+    }
+  });
+
+  test('a model-returned tool that was not offered is paired but never executed', async () => {
+    const target = path.join(sandbox, 'unoffered-tool.txt');
+    await fsp.rm(target, { force: true });
+    const messages = [{ role: 'user', content: 'do not escape the offered tools' }];
+    const events = [];
+    const readOnlyTools = TOOL_DEFS.filter(tool => tool.function.name === 'read_file');
+    const run = await runAgent({
+      model: 'mock', messages, tools: readOnlyTools,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'hidden', function: { name: 'bash', arguments: { command: 'touch unoffered-tool.txt' } } }] },
+        { content: 'The tool was unavailable.' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type, data) => events.push({ type, data }),
+      verifyGate: false,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(fs.existsSync(target), false, 'unoffered Bash was never executed');
+    const result = events.find(event => event.type === 'tool_result');
+    assert.equal(result?.data.isError, true);
+    assert.match(result?.data.result ?? '', /was not offered/);
+    assert.ok(messages.some(message => message.role === 'tool' && message.tool_call_id === 'hidden'));
+  });
+
+  test('a second identical failed tool call stops tools and forces a blocker explanation', async () => {
+    const target = path.join(sandbox, 'must-not-run-after-failures.txt');
+    await fsp.rm(target, { force: true });
+    const messages = [{ role: 'user', content: 'handle failures honestly' }];
+    const events = [];
+    const offeredCounts = [];
+    const responses = [
+      { toolCalls: [{ id: 'f1', function: { name: 'read_file', arguments: {} } }] },
+      { toolCalls: [
+        { id: 'f2', function: { name: 'read_file', arguments: {} } },
+        { id: 'later', function: { name: 'write_file', arguments: { path: 'must-not-run-after-failures.txt', content: 'bad' } } },
+      ] },
+      { content: 'I am blocked because read_file was missing its path.' },
+    ];
+    let responseIndex = 0;
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: async options => {
+        offeredCounts.push(options.tools.length);
+        return { content: '', toolCalls: null, promptTokens: 1, completionTokens: 1, ...responses[responseIndex++] };
+      },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type, data) => events.push({ type, data }),
+      verifyGate: false,
+      repeatGuard: 0,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(run.content, 'I am blocked because read_file was missing its path.');
+    assert.equal(offeredCounts.at(-1), 0, 'the explanation request has tools disabled');
+    assert.equal(fs.existsSync(target), false, 'later declared calls are cancelled, not executed');
+    assert.equal(events.filter(event => event.type === 'tool_failure_limit').length, 1);
+    assert.ok(messages.some(message => message.role === 'user' && /identical read_file tool call failed twice/.test(message.content ?? '')));
+    assert.deepEqual(
+      messages.filter(message => message.role === 'tool').map(message => message.tool_call_id),
+      ['f1', 'f2', 'later'],
+      'every declared call remains protocol-paired',
+    );
+    assert.ok(run.toolCalls.every(call => call.isError));
+  });
+
+  test('a failure-limit explanation ends without asking for verification with tools disabled', async () => {
+    const messages = [{ role: 'user', content: 'make a change and verify' }];
+    const responses = [
+      { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'blocked.js', content: 'const value = 1;\n' } } }] },
+      { toolCalls: [{ id: 'f1', function: { name: 'bash', arguments: { command: 'exit 2' } } }] },
+      { toolCalls: [{ id: 'f2', function: { name: 'bash', arguments: { command: 'exit 2' } } }] },
+      { content: 'The edit is unverified because the check failed.' },
+    ];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS, chatFn: scripted(responses),
+      toolContext: { cwd: sandbox, workspace: sandbox }, verifyGate: true, actNudge: 0,
+    });
+    assert.equal(run.iterations, 4);
+    assert.ok(!messages.some(message => /automated check/.test(message.content ?? '')));
+  });
+
+  test('Bash variants returning the same exception stop before exhausting the turn', async () => {
+    const messages = [{ role: 'user', content: 'assess the project' }];
+    const events = [];
+    const commands = [1, 2, 3, 4].map(n => `printf 'attempt ${n}\\nsqlite3.OperationalError: unable to open database file\\n' >&2; exit 1`);
+    let requests = 0;
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: async ({ tools }) => {
+        requests++;
+        if (!tools.length) return { content: 'Disk SQLite is blocked; these checks did not pass.' };
+        return { toolCalls: [{ id: `f${requests}`, function: { name: 'bash', arguments: { command: commands[(requests - 1) % commands.length] } } }] };
+      },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      emit: (type, data) => events.push({ type, ...data }),
+      maxIterations: 8, actNudge: 0, repeatGuard: 0,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(run.toolCalls.length, 3);
+    assert.equal(requests, 4);
+    assert.equal(events.filter(event => event.type === 'tool_failure_limit').length, 1);
+    assert.match(messages.at(-2).content, /same error/);
+  });
+
+  test('failure limits reset after edits or user steering and keep distinct errors separate', async () => {
+    for (const progress of ['edit', 'follow-up', 'different-error']) {
+      const messages = [{ role: 'user', content: 'investigate' }];
+      const events = [];
+      const fail = (n, detail = 'unavailable') => ({ toolCalls: [{
+        id: `f${n}`, function: { name: 'bash', arguments: { command: `printf 'attempt ${n}\\nRuntimeError: ${detail}\\n' >&2; exit 1` } },
+      }] });
+      const responses = [fail(1), fail(2)];
+      if (progress === 'edit') responses.push({ toolCalls: [{
+        id: 'edit', function: { name: 'write_file', arguments: { path: 'fix.js', content: 'const fixed = true;\n' } },
+      }] });
+      responses.push(fail(3, progress === 'different-error' ? 'another issue' : 'unavailable'));
+      responses.push(fail(4, progress === 'different-error' ? 'third issue' : 'unavailable'));
+      responses.push({ content: 'Investigation summary.' });
+      let requests = 0;
+      let steered = false;
+      const run = await runAgent({
+        model: 'mock', messages, tools: TOOL_DEFS,
+        chatFn: async () => responses[requests++],
+        toolContext: { cwd: sandbox, workspace: sandbox },
+        takeFollowUps: () => {
+          if (progress === 'follow-up' && requests === 2 && !steered) {
+            steered = true;
+            return { role: 'user', content: 'I changed the environment; try again.' };
+          }
+          return null;
+        },
+        emit: type => events.push(type), verifyGate: false, actNudge: 0, repeatGuard: 0,
+      });
+      assert.equal(run.status, 'completed', progress);
+      assert.equal(events.includes('tool_failure_limit'), false, progress);
+      assert.equal(run.toolCalls.filter(call => call.isError).length, 4, progress);
+    }
+  });
+
+  test('removing only known generated caches does not count as a source edit', async () => {
+    const { looksLikeMutation } = await import('../src/agent-runner.js');
+    for (const command of [
+      'rm -rf .mypy_cache && mypy src',
+      'rm -rf .pytest_cache src/__pycache__',
+      'rm --recursive --force "nested path/.ruff_cache"',
+    ]) assert.equal(looksLikeMutation(command), false, command);
+    for (const command of [
+      'rm -rf .mypy_cache src/app.py', 'rm -rf src',
+      'rm -rf .mypy_cache/../src', 'rm -rf "$CACHE"',
+      'rm -rf .mypy_cache; echo changed > app.py',
+    ]) assert.equal(looksLikeMutation(command), true, command);
+    const messages = [{ role: 'user', content: 'review the project' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'c', function: { name: 'bash', arguments: { command: 'rm -rf .mypy_cache' } } }] },
+        { content: 'Review complete.' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox }, verifyGate: true,
+    });
+    assert.equal(run.iterations, 2);
   });
 
   test('the verification gate blocks finishing after an unverified edit', async () => {
@@ -3900,6 +6374,74 @@ describe('src/agent-runner.js (shared loop)', async () => {
     assert.equal(run.status, 'completed');
   });
 
+  test('a full read-back verifies the matching plain-text edit in a bare workspace', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-readback-verify-'));
+    const messages = [{ role: 'user', content: 'write and confirm the note' }];
+    try {
+      const run = await runAgent({
+        model: 'mock', messages, tools: TOOL_DEFS,
+        chatFn: scripted([
+          { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'note.txt', content: 'checked\n' } } }] },
+          { toolCalls: [{ id: 'r', function: { name: 'read_file', arguments: { path: 'note.txt', offset: 0, limit: 0 } } }] },
+          { content: 'Written and confirmed.' },
+        ]),
+        toolContext: { cwd: dir, workspace: dir },
+        verifyGate: true,
+      });
+      assert.equal(run.status, 'completed');
+      assert.equal(messages.filter(m => /edited files but haven't verified/.test(m.content ?? '')).length, 0);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('reading an unrelated file does not verify a pending plain-text edit', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-readback-unrelated-'));
+    const messages = [{ role: 'user', content: 'write and confirm the target' }];
+    try {
+      await fsp.writeFile(path.join(dir, 'other.txt'), 'unrelated\n');
+      const run = await runAgent({
+        model: 'mock', messages, tools: TOOL_DEFS,
+        chatFn: scripted([
+          { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'target.txt', content: 'checked\n' } } }] },
+          { toolCalls: [{ id: 'r1', function: { name: 'read_file', arguments: { path: 'other.txt' } } }] },
+          { content: 'Done.' },
+          { toolCalls: [{ id: 'r2', function: { name: 'read_file', arguments: { path: 'target.txt' } } }] },
+          { content: 'Now confirmed.' },
+        ]),
+        toolContext: { cwd: dir, workspace: dir },
+        verifyGate: true,
+      });
+      assert.equal(run.status, 'completed');
+      assert.equal(messages.filter(m => /edited files but haven't verified/.test(m.content ?? '')).length, 1);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('reading source code does not replace an executable verification check', async () => {
+    const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'claudette-readback-source-'));
+    const messages = [{ role: 'user', content: 'write and verify the module' }];
+    try {
+      const run = await runAgent({
+        model: 'mock', messages, tools: TOOL_DEFS,
+        chatFn: scripted([
+          { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'module.js', content: 'export const ok = true;\n' } } }] },
+          { toolCalls: [{ id: 'r', function: { name: 'read_file', arguments: { path: 'module.js' } } }] },
+          { content: 'Done.' },
+          { toolCalls: [{ id: 'v', function: { name: 'bash', arguments: { command: 'node --check module.js' } } }] },
+          { content: 'Verified.' },
+        ]),
+        toolContext: { cwd: dir, workspace: dir },
+        verifyGate: true,
+      });
+      assert.equal(run.status, 'completed');
+      assert.equal(messages.filter(m => /edited files but haven't verified/.test(m.content ?? '')).length, 1);
+    } finally {
+      await fsp.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test('the verification gate stays out of the way for a read-only turn', async () => {
     const messages = [{ role: 'user', content: 'just look' }];
     await runAgent({
@@ -3912,6 +6454,93 @@ describe('src/agent-runner.js (shared loop)', async () => {
       verifyGate: true,
     });
     assert.ok(!messages.some(m => /automated check/.test(m.content ?? '')), 'nothing was edited, so nothing to verify');
+  });
+
+  test('post-verification guard forces a final summary after bounded extra investigation', async () => {
+    const messages = [{ role: 'user', content: 'create and verify it' }];
+    const offeredToolCounts = [];
+    const responses = [
+      { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'verified.js', content: 'const ok = true;\n' } } }] },
+      { toolCalls: [{ id: 'v', function: { name: 'bash', arguments: { command: 'node --check verified.js' } } }] },
+      { toolCalls: [{ id: 'l', function: { name: 'list_dir', arguments: { path: '.' } } }] },
+      { toolCalls: [{ id: 'r', function: { name: 'read_file', arguments: { path: 'verified.js' } } }] },
+      { content: 'Implemented and verified.' },
+    ];
+    let call = 0;
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: async (opts) => {
+        offeredToolCounts.push(opts.tools.length);
+        return { content: '', toolCalls: null, promptTokens: 1, completionTokens: 1, ...responses[call++] };
+      },
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      postVerifyGuard: 1,
+      actNudge: 0,
+      repeatGuard: 0,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(offeredToolCounts.at(-1), 0, 'second ignored completion nudge disables tools once');
+    const nudges = messages.filter(m => /automated completion check/.test(m.content ?? ''));
+    assert.equal(nudges.length, 2);
+    assert.match(nudges[1].content, /next response has tools disabled/);
+  });
+
+  test('an edit after a passing check invalidates it and requires verification again', async () => {
+    const messages = [{ role: 'user', content: 'make both files' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w1', function: { name: 'write_file', arguments: { path: 'first.js', content: 'const first = true;\n' } } }] },
+        { toolCalls: [{ id: 'v1', function: { name: 'bash', arguments: { command: 'node --check first.js' } } }] },
+        { toolCalls: [{ id: 'w2', function: { name: 'bash', arguments: { command: 'cp first.js second.js' } } }] },
+        { content: 'done' },
+        { toolCalls: [{ id: 'v2', function: { name: 'bash', arguments: { command: 'node --check second.js' } } }] },
+        { content: 'both verified' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      postVerifyGuard: 1,
+      actNudge: 0,
+      repeatGuard: 0,
+      verifyGate: true,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(messages.filter(m => /edited files but haven't verified/.test(m.content ?? '')).length, 1);
+    assert.equal(messages.filter(m => /automated completion check/.test(m.content ?? '')).length, 0);
+  });
+
+  test('a Bash edit followed by a passing check in the same call needs no extra verification', async () => {
+    const messages = [{ role: 'user', content: 'create and verify a script' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'combined.js', content: 'const ok = true;\n' } } }] },
+        { toolCalls: [{ id: 'v', function: { name: 'bash', arguments: { command: 'cp combined.js combined-copy.js && node --check combined-copy.js' } } }] },
+        { content: 'verified' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      verifyGate: true, actNudge: 0, repeatGuard: 0,
+    });
+    assert.equal(run.status, 'completed');
+    assert.equal(run.iterations, 3);
+    assert.ok(!messages.some(m => /automated check/.test(m.content ?? '')));
+  });
+
+  test('a failed Bash command can still invalidate a previously passing check', async () => {
+    const messages = [{ role: 'user', content: 'edit and verify' }];
+    const run = await runAgent({
+      model: 'mock', messages, tools: TOOL_DEFS,
+      chatFn: scripted([
+        { toolCalls: [{ id: 'w', function: { name: 'write_file', arguments: { path: 'partial.js', content: 'const ok = true;\n' } } }] },
+        { toolCalls: [{ id: 'v', function: { name: 'bash', arguments: { command: 'node --check partial.js' } } }] },
+        { toolCalls: [{ id: 'e', function: { name: 'bash', arguments: { command: 'echo broken > partial.js && false' } } }] },
+        { content: 'done' },
+      ]),
+      toolContext: { cwd: sandbox, workspace: sandbox },
+      verifyGate: true, actNudge: 0, repeatGuard: 0,
+    });
+    assert.equal(run.toolCalls.at(-1).isError, true);
+    assert.ok(messages.some(m => /edited files but haven't verified/.test(m.content ?? '')),
+      'nonzero exit status does not undo an earlier write');
   });
 
   test('a cancelled request ends the run as cancelled, not failed', async () => {
@@ -3980,6 +6609,20 @@ describe('src/agent-runner.js (shared loop)', async () => {
     const merged = mergeToolCalls({ content: '{"name":"read_file","arguments":{"path":"a.js"}}', toolCalls: api });
     assert.equal(merged.length, 2);
     assert.equal(merged[0].function.name, 'read_file');
+  });
+
+  test('mergeToolCalls collapses exact text duplicates but preserves distinct and API calls', () => {
+    const first = '{"name":"write_file","arguments":{"path":"a.txt","content":"x"}}';
+    const second = '{"name":"write_file","arguments":{"path":"b.txt","content":"y"}}';
+    const merged = mergeToolCalls({ content: `${first}\n${first}\n${second}`, toolCalls: null });
+    assert.deepEqual(merged.map(call => call.function.arguments.path), ['a.txt', 'b.txt']);
+
+    const explicit = [
+      { id: 'one', function: { name: 'bash', arguments: { command: 'echo twice' } } },
+      { id: 'two', function: { name: 'bash', arguments: { command: 'echo twice' } } },
+    ];
+    assert.equal(mergeToolCalls({ content: '', toolCalls: explicit }).length, 2,
+      'provider-native calls carry explicit IDs and remain authoritative');
   });
 
   test('dropOrphanToolMessages is re-exported from chat.js unchanged', async () => {
@@ -4321,8 +6964,109 @@ describe('ollama.js (context window)', async () => {
   });
 });
 
+describe('clipboard commands', async () => {
+  const { copyToClipboard, copyLastAssistantMessage } = await import('../src/clipboard.js');
+
+  test('copies the latest assistant text verbatim without copying tool results or prompts', async () => {
+    const answer = '\n**Answer**\n```js\nconst greeting = "你好 🌍";\n```\n';
+    const messages = [
+      { role: 'assistant', content: 'older answer' },
+      { role: 'assistant', content: answer },
+      { role: 'tool', content: 'tool output' },
+      { role: 'user', content: 'new prompt' },
+      { role: 'assistant', content: '   ', tool_calls: [] },
+    ];
+    const before = structuredClone(messages);
+    const copied = [];
+    assert.equal(await copyLastAssistantMessage(messages, async text => copied.push(text)), true);
+    assert.deepEqual(copied, [answer]);
+    assert.deepEqual(messages, before, 'copying does not change session history');
+  });
+
+  test('leaves the clipboard alone when no answer exists and propagates copy failures', async () => {
+    const copy = async () => { throw new Error('clipboard unavailable'); };
+    assert.equal(await copyLastAssistantMessage([], copy), false);
+    assert.equal(await copyLastAssistantMessage([{ role: 'user', content: 'hello' }], copy), false);
+    await assert.rejects(copyLastAssistantMessage([{ role: 'assistant', content: 'answer' }], copy),
+      /clipboard unavailable/);
+  });
+
+  test('native backends receive literal Unicode text through stdin, including Windows encoding', async () => {
+    const dir = await makeTmpDir();
+    const answer = 'line one\n你好 🌍\n$(echo must-stay-literal) `echo also-literal`';
+    const capture = 'const fs=require("node:fs");const chunks=[];process.stdin.on("data",c=>chunks.push(c));process.stdin.on("end",()=>fs.writeFileSync(process.argv[1],Buffer.concat(chunks)));';
+    try {
+      for (const [platform, env, command, args, encoding] of [
+        ['darwin', {}, '/usr/bin/pbcopy', [], 'utf8'],
+        ['win32', {}, 'clip.exe', [], 'utf16le'],
+        ['linux', { WAYLAND_DISPLAY: 'wayland-0' }, 'wl-copy', [], 'utf8'],
+        ['linux', { DISPLAY: ':0' }, 'xclip', ['-selection', 'clipboard'], 'utf8'],
+      ]) {
+        const target = path.join(dir, 'clipboard.txt');
+        const calls = [];
+        await copyToClipboard(answer, {
+          platform, env,
+          execFile: (file, argv, options, callback) => {
+            calls.push({ file, argv });
+            assert.ok(!options.shell, 'clipboard text must not pass through a shell');
+            return nativeExecFile(process.execPath, ['-e', capture, target], options, callback);
+          },
+        });
+        assert.deepEqual(calls, [{ file: command, argv: args }]);
+        assert.deepEqual(await fsp.readFile(target), Buffer.from(answer, encoding));
+      }
+    } finally { await cleanDir(dir); }
+  });
+
+  test('Linux falls back when a clipboard utility is missing and reports unavailable backends', async () => {
+    const seen = [];
+    await copyToClipboard('answer', {
+      platform: 'linux', env: { WAYLAND_DISPLAY: 'wayland-0' },
+      execFile: (file, _args, options, callback) => {
+        seen.push(file);
+        return file === 'wl-copy'
+          ? nativeExecFile('/nonexistent-claudette-clipboard', [], options, callback)
+          : nativeExecFile(process.execPath, ['-e', 'process.stdin.resume()'], options, callback);
+      },
+    });
+    assert.deepEqual(seen, ['wl-copy', 'xclip']);
+    await assert.rejects(copyToClipboard('answer', {
+      platform: 'linux', env: {},
+      execFile: (_file, _args, options, callback) => nativeExecFile('/nonexistent-claudette-clipboard', [], options, callback),
+    }), /Could not copy to clipboard:.*Install wl-clipboard/s);
+  });
+
+  test('clipboard handles early pipe closure, timeout, all fallback backends, and unsupported platforms', async () => {
+    await assert.rejects(copyToClipboard('text', { platform: 'plan9' }), /not supported/);
+    let attempts = 0;
+    const seen = [];
+    await copyToClipboard('large input\n'.repeat(200000), {
+      platform: 'linux', env: { DISPLAY: ':0' },
+      execFile: (file, args, options, callback) => {
+        seen.push([file, args]);
+        attempts++;
+        return nativeExecFile(process.execPath,
+          ['-e', attempts < 3 ? 'process.exit(2)' : 'process.stdin.resume()'], options, callback);
+      },
+    });
+    assert.deepEqual(seen, [
+      ['xclip', ['-selection', 'clipboard']],
+      ['xsel', ['--clipboard', '--input']],
+      ['wl-copy', []],
+    ]);
+    await assert.rejects(copyToClipboard('timeout', {
+      platform: 'darwin',
+      execFile: (_file, _args, options, callback) => {
+        assert.equal(options.timeout, 5000, 'native clipboard operations have a deadline');
+        return nativeExecFile(process.execPath, ['-e', 'process.stdin.resume();setInterval(()=>{},1000)'],
+          { ...options, timeout: 50 }, callback);
+      },
+    }), /Could not copy to clipboard/);
+  });
+});
+
 describe('src/completion.js (tab completion)', async () => {
-  const { completeSlashCommand, completeAtPath, SLASH_COMMANDS } = await import('../src/completion.js');
+  const { completeSlashCommand, completeAtPath, createCompleter, SLASH_COMMANDS } = await import('../src/completion.js');
 
   let dir;
   before(async () => {
@@ -4340,6 +7084,7 @@ describe('src/completion.js (tab completion)', async () => {
     const [hits, partial] = completeSlashCommand('/mod');
     assert.deepEqual(hits, ['/model', '/models']);
     assert.equal(partial, '/mod');
+    assert.deepEqual(completeSlashCommand('/cop'), [['/copy'], '/cop']);
   });
 
   test('offers every command for a bare slash, and none for prose', () => {
@@ -4372,6 +7117,13 @@ describe('src/completion.js (tab completion)', async () => {
   test('completeAtPath ignores lines with no @token', async () => {
     assert.equal(await completeAtPath('just a prompt', dir), null);
   });
+
+  test('readline/promises completer returns a Promise tuple instead of callback-style undefined', async () => {
+    const completer = createCompleter(() => dir);
+    assert.equal(completer.length, 1, 'one-argument form is treated as a Promise completer by readline');
+    assert.deepEqual(await completer('/mod'), [['/model', '/models'], '/mod']);
+    assert.deepEqual(await completer('look at @sr'), [['src/'], 'sr']);
+  });
 });
 
 // ─── Durability: atomic writes + compaction archive ───────────────────────────
@@ -4390,6 +7142,8 @@ describe('session durability (atomic writes, compaction archive)', async () => {
     assert.equal(await fsp.readFile(target, 'utf8'), '{"a":1}\n');
     const strays = (await fsp.readdir(path.dirname(target))).filter(f => f.endsWith('.tmp'));
     assert.deepEqual(strays, [], 'temp file was renamed, not left');
+    assert.equal((await fsp.stat(path.dirname(target))).mode & 0o777, 0o700);
+    assert.equal((await fsp.stat(target)).mode & 0o777, 0o600);
   });
 
   test('writeFileAtomic overwrites in place', async () => {
@@ -4427,7 +7181,7 @@ describe('session durability (atomic writes, compaction archive)', async () => {
 // executeTool runs against a throwaway sandbox.
 
 describe('bench/evals.js (eval loops)', async () => {
-  const { runEvalIteration, matchToolCalls, argsMatch, loadCases, parseArgs } =
+  const { runEvalIteration, evaluateExpectations, matchToolCalls, argsMatch, loadCases, parseArgs } =
     await import('../bench/evals.js');
 
   // A replayed response reports the tokens recorded when it was captured and a
@@ -4437,6 +7191,9 @@ describe('bench/evals.js (eval loops)', async () => {
     assert.equal(parseArgs(['--all']).cache, false, 'off unless asked for');
     assert.equal(parseArgs(['--cache']).cache, true);
     assert.equal(parseArgs(['--no-cache']).cache, false, 'older commands still parse');
+    assert.equal(parseArgs(['--all']).rotation, false, 'model identity is pinned by default');
+    assert.equal(parseArgs(['--rotation']).rotation, true, 'fallback rotation requires an explicit opt-in');
+    assert.equal(parseArgs(['--no-rotation']).rotation, false, 'explicit pinning still parses');
   });
 
   // A chatFn that replays a fixed sequence of model responses.
@@ -4484,7 +7241,9 @@ describe('bench/evals.js (eval loops)', async () => {
     });
 
     assert.equal(record.error, null);
+    assert.equal(record.status, 'completed');
     assert.equal(record.turns, 2);
+    assert.deepEqual(record.assistantResponses.map(response => response.toolCalls), [['bash'], []]);
     assert.equal(record.toolCalls.length, 1);
     assert.ok(record.toolCalls[0].output.includes('eval-ok'), 'real executeTool ran the command');
     assert.ok(record.pass, `expected pass, failures: ${record.failures.join(' | ')}`);
@@ -4615,6 +7374,35 @@ describe('bench/evals.js (eval loops)', async () => {
     assert.ok(!record.failures.some(f => f.includes('final answer')), 'the answer itself matched');
   });
 
+  test('evaluateExpectations enforces exact files, allowlists, and zero tool errors', async () => {
+    const sandbox = await makeTmpDir();
+    try {
+      await fsp.writeFile(path.join(sandbox, 'target.txt'), 'wrong\n');
+      await fsp.writeFile(path.join(sandbox, 'extra.txt'), 'scope creep\n');
+      await fsp.writeFile(path.join(sandbox, 'locked.txt'), 'changed\n');
+      await fsp.mkdir(path.join(sandbox, '.venv', 'bin'), { recursive: true });
+      await fsp.writeFile(path.join(sandbox, '.venv', 'bin', 'python'), 'allowed generated tree\n');
+      const evaluated = await evaluateExpectations({
+        toolCalls: [{ name: 'read_file', isError: true }],
+        finalText: 'done',
+      }, {
+        noToolErrors: true,
+        allowedFiles: ['target.txt', 'locked.txt', '.venv/**'],
+        unchangedFiles: ['locked.txt'],
+        files: { 'target.txt': { equals: 'exact\n' } },
+      }, sandbox, { 'locked.txt': 'original\n' });
+      assert.equal(evaluated.pass, false);
+      assert.ok(evaluated.failures.some(failure => failure.includes('tool errors are forbidden')));
+      assert.ok(evaluated.failures.some(failure => failure.includes('does not exactly equal')));
+      assert.ok(evaluated.failures.some(failure => failure.includes('unexpected file created: extra.txt')));
+      assert.ok(evaluated.failures.some(failure => failure.includes('seeded file changed: locked.txt')));
+      assert.ok(!evaluated.failures.some(failure => failure.includes('.venv/bin/python')),
+        'a trailing /** entry permits only that generated subtree');
+    } finally {
+      await cleanDir(sandbox);
+    }
+  });
+
   // A whole model's column of failures used to read "agent run failed after 1
   // iterations", with the provider error — the only thing that explains it —
   // dropped on the floor.
@@ -4648,6 +7436,7 @@ describe('bench/evals.js (eval loops)', async () => {
     });
 
     assert.equal(record.turns, 3, 'hit the turn cap');
+    assert.equal(record.status, 'max_iterations', 'records why no final answer was available');
     assert.ok(!record.pass, 'no final answer → answer expectation fails');
   });
 
@@ -4660,6 +7449,184 @@ describe('bench/evals.js (eval loops)', async () => {
     }
     const ids = cases.map(c => c.id);
     assert.equal(new Set(ids).size, ids.length, 'case ids unique');
+  });
+
+  test('review-evidence fixture accepts grounded findings and rejects collection coverage claims', async () => {
+    const cases = await loadCases();
+    const caseDef = cases.find(candidate => candidate.id === 'review-evidence');
+    const sandbox = await makeTmpDir();
+    try {
+      for (const [rel, content] of Object.entries(caseDef.files)) {
+        const absolute = path.join(sandbox, rel);
+        await fsp.mkdir(path.dirname(absolute), { recursive: true });
+        await fsp.writeFile(absolute, content);
+      }
+      const record = {
+        toolCalls: Object.keys(caseDef.files).map(file => ({ name: 'read_file', args: { path: file } })),
+        finalText: 'src/ports.py:3 accepts 0 contrary to its documented range. Add the missing zero boundary test. ' +
+          'pyproject.toml already configures Ruff and strict mypy. Collection does not execute tests; actual coverage is unknown.',
+      };
+      assert.deepEqual(await evaluateExpectations(record, caseDef.expect, sandbox, caseDef.files),
+        { pass: true, failures: [] });
+      const unsupported = { ...record, finalText: 'Coverage is only 50%. Lower the 70% threshold and add Ruff and mypy.' };
+      assert.equal((await evaluateExpectations(unsupported, caseDef.expect, sandbox, caseDef.files)).pass, false);
+      const contradiction = { ...record, finalText: `${record.finalText}\nCoverage threshold will fail on any run.` };
+      assert.ok((await evaluateExpectations(contradiction, caseDef.expect, sandbox, caseDef.files))
+        .failures.includes('final answer contains a forbidden claim'));
+      for (const claim of [
+        'Actual coverage would likely be 100%.',
+        'Both statements would be covered, producing 100 % statement coverage.',
+      ]) {
+        const guessed = { ...record, finalText: `${record.finalText}\n${claim}` };
+        assert.ok((await evaluateExpectations(guessed, caseDef.expect, sandbox, caseDef.files))
+          .failures.includes('final answer contains a forbidden claim'));
+      }
+      const markdown = { ...record, finalText: 'src/ports.py accepts 0. Collection does **not** establish actual test coverage.' };
+      assert.equal((await evaluateExpectations(markdown, caseDef.expect, sandbox, caseDef.files)).pass, true);
+      await fsp.appendFile(path.join(sandbox, 'src/ports.py'), '\n# unsolicited edit\n');
+      const edited = await evaluateExpectations(record, caseDef.expect, sandbox, caseDef.files);
+      assert.ok(edited.failures.includes('seeded file changed: src/ports.py'));
+    } finally {
+      await cleanDir(sandbox);
+    }
+  });
+
+  test('fix-failing-test stays CommonJS beneath an ESM workspace', async () => {
+    const cases = await loadCases();
+    const caseDef = cases.find(candidate => candidate.id === 'fix-failing-test');
+    assert.ok(caseDef, 'fixture exists');
+    const esmParent = await makeTmpDir();
+    const sandbox = path.join(esmParent, 'nested-fixture');
+    try {
+      await fsp.writeFile(path.join(esmParent, 'package.json'), '{"type":"module"}\n');
+      for (const [rel, content] of Object.entries(caseDef.files)) {
+        const absolute = path.join(sandbox, rel);
+        await fsp.mkdir(path.dirname(absolute), { recursive: true });
+        await fsp.writeFile(absolute, content);
+      }
+      const initial = spawnSync('sh', ['test.sh'], { cwd: sandbox, encoding: 'utf8' });
+      const output = `${initial.stdout}\n${initial.stderr}`;
+      assert.equal(initial.status, 1, 'the deliberately broken implementation fails');
+      assert.match(output, /returned -1, expected 5/, 'failure is the intended arithmetic assertion');
+      assert.doesNotMatch(output, /require is not defined/, 'parent ESM metadata does not contaminate the fixture');
+    } finally {
+      await cleanDir(esmParent);
+    }
+  });
+
+  test('diverse Farm fixtures reject seeds and accept known-good solutions', async () => {
+    const cases = await loadCases();
+    const scenarios = [
+      {
+        id: 'farm-env-matrix',
+        command: [process.execPath, ['verify.mjs']],
+        solutions: {
+          'src/config.js': "const MODES = new Set(['dev', 'test', 'prod']);\n\nexport function readConfig(env = process.env) {\n  const rawPort = String(env.PORT ?? '');\n  const parsedPort = /^\\d+$/.test(rawPort) ? Number.parseInt(rawPort, 10) : NaN;\n  const port = Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535 ? parsedPort : 3000;\n  const mode = MODES.has(env.MODE) ? env.MODE : 'dev';\n  const label = String(env.APP_LABEL ?? '').trim() || 'Claudette';\n  return { port, mode, label };\n}\n",
+          'bin/show-config.js': "import { readConfig } from '../src/config.js';\n\nconst { label, mode, port } = readConfig();\nconsole.log(`${label}|${mode}|${port}`);\n",
+        },
+      },
+      {
+        id: 'farm-unicode-path',
+        command: [process.execPath, ['verify.mjs']],
+        solutions: {
+          'content/menu data.json': '{\n  "currency": "USD",\n  "items": [\n    {\n      "id": "dessert-01",\n      "displayName": "Crème brûlée ☕",\n      "priceCents": 775,\n      "seasonal": true\n    },\n    {\n      "id": "tea-02",\n      "displayName": "Jasmine tea 茉莉花茶",\n      "priceCents": 450\n    }\n  ]\n}\n',
+        },
+      },
+      {
+        id: 'farm-js-python-pipeline',
+        command: ['sh', ['pipeline.sh']],
+        solutions: {
+          'lib/score.mjs': 'export function score(raw, scale) {\n  return raw * scale;\n}\n',
+          'summarize.py': 'import json\n\n\ndef render(payload):\n    rows = sorted(payload["rows"], key=lambda row: row["name"])\n    return "\\n".join(\n        f\'{payload["prefix"]}:{row["name"]}={row["score"]}\' for row in rows\n    )\n\n\nif __name__ == "__main__":\n    with open("out/report.json", encoding="utf-8") as handle:\n        print(render(json.load(handle)))\n',
+        },
+      },
+      {
+        id: 'farm-shell-env',
+        command: ['sh', ['verify.sh']],
+        solutions: {
+          'bin/render-env.sh': '#!/bin/sh\nset -eu\nif [ "$#" -ne 2 ]; then\n  echo "usage: render-env.sh FIRST SECOND" >&2\n  exit 2\nfi\ntarget=${DEPLOY_TARGET:-local}\nprintf \'[%s] %s :: %s\\n\' "$target" "$1" "$2"\n',
+        },
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      const caseDef = cases.find(candidate => candidate.id === scenario.id);
+      assert.ok(caseDef, `${scenario.id} exists`);
+      const sandbox = await makeTmpDir();
+      try {
+        for (const [rel, content] of Object.entries(caseDef.files)) {
+          const absolute = path.join(sandbox, rel);
+          await fsp.mkdir(path.dirname(absolute), { recursive: true });
+          await fsp.writeFile(absolute, content);
+        }
+        const [command, args] = scenario.command;
+        const seeded = spawnSync(command, args, { cwd: sandbox, encoding: 'utf8' });
+        assert.notEqual(seeded.status, 0, `${scenario.id} seed must fail`);
+        for (const [rel, content] of Object.entries(scenario.solutions)) {
+          const absolute = path.join(sandbox, rel);
+          await fsp.mkdir(path.dirname(absolute), { recursive: true });
+          await fsp.writeFile(absolute, content);
+        }
+        const solved = spawnSync(command, args, { cwd: sandbox, encoding: 'utf8' });
+        assert.equal(solved.status, 0,
+          `${scenario.id} solution failed: ${solved.stdout}\n${solved.stderr}`);
+        assert.equal(await fsp.readFile(path.join(sandbox, '.passed'), 'utf8'), 'ok\n');
+      } finally {
+        await cleanDir(sandbox);
+      }
+    }
+  });
+
+  test('loadCases ignores AppleDouble, hidden, and non-file JSON entries', async () => {
+    const dir = await makeTmpDir();
+    try {
+      const valid = { id: 'visible', title: 'Visible', prompt: 'Do it', expect: { answer: { matches: 'done' } } };
+      await fsp.writeFile(path.join(dir, 'visible.json'), JSON.stringify(valid));
+      await fsp.writeFile(path.join(dir, '._visible.json'), Buffer.from([0, 5, 22, 7, 0, 2]));
+      await fsp.writeFile(path.join(dir, '.hidden.json'), '{not json');
+      await fsp.mkdir(path.join(dir, 'directory.json'));
+      assert.deepEqual(await loadCases(dir), [valid]);
+    } finally {
+      await cleanDir(dir);
+    }
+  });
+});
+
+// ─── Harbor adapter contracts ─────────────────────────────────────────────────
+// Harbor installs inside benchmark task containers. Keep its supply-chain pins
+// and provider routing explicit: a mutable ref or silent provider fallback makes
+// a benchmark impossible to reproduce and can send credentials to the wrong API.
+
+describe('bench/harbor adapter contracts', () => {
+  const adapterPath = path.join(ROOT, 'bench', 'harbor', 'src', 'claudette_harbor', 'agent.py');
+  const pyprojectPath = path.join(ROOT, 'bench', 'harbor', 'pyproject.toml');
+
+  test('pins the benchmark runtime and verifies the downloaded installer', async () => {
+    const [adapter, pyproject] = await Promise.all([
+      fsp.readFile(adapterPath, 'utf8'),
+      fsp.readFile(pyprojectPath, 'utf8'),
+    ]);
+
+    assert.match(pyproject, /harbor==0\.22\.0/);
+    assert.match(adapter, /_COMMIT_SHA = re\.compile\(r"\^\[0-9a-fA-F\]\{40\}\$"\)/);
+    assert.match(adapter, /_NVM_VERSION = "v0\.40\.2"/);
+    assert.match(adapter, /_NODE_VERSION = "22\.23\.2"/);
+    assert.match(adapter, /_NVM_INSTALL_SHA256 = "[0-9a-f]{64}"/);
+    assert.match(adapter, /sha256sum -c -/);
+    assert.doesNotMatch(adapter, /_version or ["']main["']/);
+    assert.doesNotMatch(adapter, /curl[^\n]*\|\s*(?:sh|bash)/);
+  });
+
+  test('routes every supported provider alias explicitly and rejects unknown prefixes', async () => {
+    const adapter = await fsp.readFile(adapterPath, 'utf8');
+
+    for (const alias of ['deepseek', 'hf', 'huggingface', 'google', 'gemini', 'xai', 'grok', 'perplexity', 'pplx']) {
+      assert.match(adapter, new RegExp(`^[ \\t]*["']${alias}["']:\\s*\\[`, 'm'), `${alias} is routed`);
+    }
+    assert.match(adapter, /provider not in _PROVIDER_KEYS and provider != "ollama"/);
+    assert.match(adapter, /Unknown Claudette provider prefix/);
+    assert.doesNotMatch(adapter, /_PROVIDER_KEYS\.get\(provider, \[\]\)[\s\S]{0,400}provider (?:not in|==)/,
+      'unknown prefixes are rejected before credential lookup or local routing');
   });
 });
 
@@ -4734,6 +7701,66 @@ describe('bench/tasks.js (YAML task loading)', async () => {
     assert.equal(addTool.singleTurn, true);
     assert.equal(addTool.timeoutSec, 180);
   });
+
+  test('loadTasks ignores AppleDouble, hidden, and non-file task entries', async () => {
+    const { loadTasks } = await import('../bench/tasks.js');
+    const dir = await makeTmpDir();
+    try {
+      const valid = {
+        id: 'visible', title: 'Visible', category: 'test', prompt: 'Do it', verify: ['true'],
+      };
+      await fsp.writeFile(path.join(dir, 'visible.json'), JSON.stringify(valid));
+      await fsp.writeFile(path.join(dir, '._visible.yaml'), Buffer.from([0, 5, 22, 7, 0, 2]));
+      await fsp.writeFile(path.join(dir, '.hidden.yml'), 'not: [supported');
+      await fsp.mkdir(path.join(dir, 'directory.json'));
+      assert.deepEqual(await loadTasks(dir), [valid]);
+    } finally {
+      await cleanDir(dir);
+    }
+  });
+});
+
+describe('benchmark report discovery', () => {
+  test('summary and leaderboard loaders ignore AppleDouble and non-file JSON entries', async () => {
+    const [{ loadLatestPerModel }, { loadLatestReports }] = await Promise.all([
+      import('../bench/eval-summary.js'),
+      import('../bench/leaderboard.js'),
+    ]);
+    const evalDir = await makeTmpDir();
+    const reportDir = await makeTmpDir();
+    try {
+      await fsp.writeFile(path.join(evalDir, '2026-08-31-eval.json'), JSON.stringify({
+        model: 'mock/eval',
+        generatedAt: '2026-08-31T00:00:00.000Z',
+        results: [{
+          caseId: 'case-a', passAtK: true, repeat: 1,
+          avgPromptTokens: 10, avgCompletionTokens: 2, iterations: [],
+        }],
+      }));
+      await fsp.writeFile(path.join(reportDir, '2026-08-31-report.json'), JSON.stringify({
+        model: 'mock/bench', task: { id: 'task-a' }, completedAt: '2026-08-31T00:00:00.000Z',
+        summary: { overallScore: 9, hardScore: 8, judgeScore: 7 },
+      }));
+      for (const dir of [evalDir, reportDir]) {
+        await fsp.writeFile(path.join(dir, '._sidecar.json'), Buffer.from([0, 5, 22, 7, 0, 2]));
+        await fsp.writeFile(path.join(dir, '.hidden.json'), '{not json');
+        await fsp.mkdir(path.join(dir, 'directory.json'));
+      }
+
+      const evals = await loadLatestPerModel(null, evalDir);
+      assert.equal(evals.length, 1);
+      assert.equal(evals[0].model, 'mock/eval');
+      assert.equal(evals[0].passed, 1);
+      const reports = await loadLatestReports(reportDir);
+      assert.deepEqual(reports, [{
+        file: '2026-08-31-report.json', model: 'mock/bench', taskId: 'task-a',
+        overall: 9, hard: 8, judge: 7,
+      }]);
+    } finally {
+      await cleanDir(evalDir);
+      await cleanDir(reportDir);
+    }
+  });
 });
 
 // ─── Bench request cache ──────────────────────────────────────────────────────
@@ -4790,12 +7817,39 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
   let tmpDir;
   let mockServer;
   let mockBaseUrl;
+  const observedToolResults = [];
+  const hermeticModelEnv = {
+    CLAUDETTE_FREE_TIER_ONLY: '0',
+    CLAUDETTE_REQUIRE_TOOLS: '0',
+    ANTHROPIC_API_KEY: '',
+    OPENAI_API_KEY: '',
+    DEEPSEEK_API_KEY: '',
+    DEEPSEEK_KEY: '',
+    GROQ_API_KEY: '',
+    HF_TOKEN: '',
+    HF_KEY: '',
+    HUGGINGFACE_API_KEY: '',
+    OPENROUTER_API_KEY: '',
+    TOGETHER_API_KEY: '',
+    FIREWORKS_API_KEY: '',
+    GEMINI_API_KEY: '',
+    GOOGLE_API_KEY: '',
+    XAI_API_KEY: '',
+    MISTRAL_API_KEY: '',
+    COHERE_API_KEY: '',
+    PERPLEXITY_API_KEY: '',
+  };
 
   before(async () => {
     tmpDir = await makeTmpDir();
     await fsp.writeFile(path.join(tmpDir, 'notes.txt'), 'alpha from file\n', 'utf8');
 
     mockServer = http.createServer(async (req, res) => {
+      if (req.method === 'GET' && req.url === '/broker-loopback') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('loopback-ok');
+        return;
+      }
       if (req.method === 'GET' && req.url === '/api/tags') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -4812,9 +7866,17 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
           for (const r of recs) res.write(JSON.stringify(r) + '\n');
           res.end();
         };
+        const lastUser = [...(body.messages ?? [])].reverse().find(m => m.role === 'user');
         const lastTool = [...(body.messages ?? [])].reverse().find(m => m.role === 'tool');
         if (lastTool) {
-          ndjson([{ message: { content: 'Saw alpha from file.' } }, { done: true, prompt_eval_count: 5, eval_count: 6 }]);
+          observedToolResults.push(String(lastTool.content ?? ''));
+          ndjson([{ message: { content: 'Tool result received.' } }, { done: true, prompt_eval_count: 5, eval_count: 6 }]);
+        } else if (typeof lastUser?.content === 'string' && lastUser.content.startsWith('bash64:')) {
+          const command = Buffer.from(lastUser.content.slice('bash64:'.length), 'base64url').toString('utf8');
+          ndjson([
+            { message: { content: 'Running sandbox probe.', tool_calls: [{ function: { name: 'bash', arguments: { command } } }] } },
+            { done: true, prompt_eval_count: 4, eval_count: 5 },
+          ]);
         } else {
           ndjson([
             { message: { content: 'Reading file.', tool_calls: [{ function: { name: 'read_file', arguments: { path: 'notes.txt' } } }] } },
@@ -4834,11 +7896,17 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
     await cleanDir(tmpDir);
   });
 
-  function driveIpc({ timeout = 20_000 } = {}) {
+  function driveIpc({ timeout = 20_000, prompt = 'inspect the file', approvalFlag = '-y', env = {} } = {}) {
     return new Promise((resolve, reject) => {
-      const proc = spawn('node', ['claudette.js', '--json-ipc', '-y', '--cwd', tmpDir, '--model', 'mock-ipc:latest'], {
+      const proc = spawn('node', ['claudette.js', '--json-ipc', approvalFlag, '--cwd', tmpDir, '--model', 'mock-ipc:latest'], {
         cwd: ROOT,
-        env: { ...process.env, OLLAMA_BASE_URL: mockBaseUrl },
+        env: {
+          ...process.env,
+          ...hermeticModelEnv,
+          OLLAMA_BASE_URL: mockBaseUrl,
+          CLAUDETTE_WORKSPACE_SANDBOX: process.platform === 'darwin' ? '1' : '0',
+          ...env,
+        },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let stdout = '', stderr = '', buffer = '';
@@ -4858,7 +7926,7 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
           if (msg.type === 'ready') {
             if (!promptSent) {
               promptSent = true;
-              proc.stdin.write(JSON.stringify({ type: 'prompt', text: 'inspect the file' }) + '\n');
+              proc.stdin.write(JSON.stringify({ type: 'prompt', text: prompt }) + '\n');
             } else {
               proc.stdin.write(JSON.stringify({ type: 'exit' }) + '\n');
               proc.stdin.end();
@@ -4867,19 +7935,26 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
         }
       });
       proc.stderr.on('data', d => stderr += d);
-      const timer = setTimeout(() => { proc.kill('SIGTERM'); resolve({ events, nonJson, stdout, stderr, timedOut: true }); }, timeout);
-      proc.on('close', () => { clearTimeout(timer); resolve({ events, nonJson, stdout, stderr, timedOut: false }); });
+      const timer = setTimeout(() => { proc.kill('SIGTERM'); resolve({ events, nonJson, stdout, stderr, code: null, timedOut: true }); }, timeout);
+      proc.on('close', code => { clearTimeout(timer); resolve({ events, nonJson, stdout, stderr, code, timedOut: false }); });
       proc.on('error', reject);
     });
   }
 
   test('emits pure JSONL and a complete event sequence through a tool loop', async () => {
-    const { events, nonJson, timedOut } = await driveIpc();
+    const { events, nonJson, timedOut, stderr, stdout } = await driveIpc();
     assert.equal(timedOut, false, 'process exits cleanly after {type:exit}');
     assert.deepEqual(nonJson, [], 'stdout is pure JSONL — no spinner/markdown/banner leaks');
+    if (process.platform === 'darwin') {
+      assert.match(stderr, /\[sandbox\] confined to /, 'CLI relaunched inside the workspace sandbox');
+      await assert.doesNotReject(
+        fsp.access(path.join(tmpDir, '.claudette', 'state', 'sessions')),
+        `sandboxed CLI created workspace-local sessions; stderr: ${stderr}`
+      );
+    }
 
     const types = events.map(e => e.type);
-    assert.ok(types.includes('ready'), 'ready emitted');
+    assert.ok(types.includes('ready'), `ready emitted; events=${JSON.stringify(events)} stderr=${stderr} stdout=${stdout}`);
     assert.ok(types.includes('turn'), 'turn emitted');
 
     const toolCall = events.find(e => e.type === 'tool_call');
@@ -4889,9 +7964,81 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
     const done = events.find(e => e.type === 'done');
     assert.ok(done && typeof done.tokens === 'number', 'done event reports a token count');
     assert.ok(
-      events.some(e => e.type === 'assistant' && /alpha from file/.test(e.content ?? '')),
+      events.some(e => e.type === 'assistant' && /Tool result received/.test(e.content ?? '')),
       'final assistant content is present',
     );
+  });
+
+  test('sandboxed CLI brokers Bash once and preserves every security boundary under --yolo', { skip: process.platform !== 'darwin' }, async () => {
+    const outside = path.join(path.dirname(tmpDir), `claudette-broker-outside-${randomUUID()}.txt`);
+    const socketEntriesBefore = new Set((await fsp.readdir('/tmp')).filter(name => name.startsWith('claudette-broker-')));
+    await fsp.writeFile(path.join(tmpDir, 'apiscanner.py'), 'first\nsecond\nthird\n', 'utf8');
+    await fsp.writeFile(path.join(tmpDir, 'package.json'), JSON.stringify({
+      scripts: { 'broker-probe': 'node -e "console.log(\'npm-ok\')"' },
+    }), 'utf8');
+    await fsp.writeFile(outside, 'outside-secret', 'utf8');
+
+    const command = [
+      'echo "bash_pid=$$"',
+      'wc -l apiscanner.py',
+      'cat notes.txt',
+      `python3 -c 'print("python-ok")'`,
+      `node -e 'console.log("node-ok")'`,
+      'npm run --silent broker-probe',
+      'case "$HOME" in "$PWD"/.claudette/home) echo "home-ok";; *) echo "home-unsafe=$HOME";; esac',
+      'case "$TMPDIR" in "$PWD"/.claudette/tmp) echo "tmp-ok";; *) echo "tmp-unsafe=$TMPDIR";; esac',
+      'test -z "$DEVELOPER_DIR"; echo "developer_env_scrubbed=$?"',
+      `cat ${JSON.stringify(outside)} >/dev/null 2>&1; echo "outside_read=$?"`,
+      `printf changed > ${JSON.stringify(outside)} 2>/dev/null; echo "outside_write=$?"`,
+      '/usr/bin/curl --max-time 3 -fsS https://example.com >/dev/null 2>&1; echo "external_network=$?"',
+      `/usr/bin/curl --max-time 3 -fsS ${JSON.stringify(`${mockBaseUrl}/broker-loopback`)}; echo`,
+      `kill -0 ${process.pid} >/dev/null 2>&1; echo "parent_signal=$?"`,
+      `/usr/bin/osascript -e 'tell application "System Events" to count processes' >/dev/null 2>&1; echo "apple_event=$?"`,
+      'test -z "$CLAUDETTE_BROKER_TEST_SECRET"; echo "secret_scrubbed=$?"',
+      'pwd',
+    ].join('\n');
+    observedToolResults.length = 0;
+    try {
+      const result = await driveIpc({
+        prompt: `bash64:${Buffer.from(command).toString('base64url')}`,
+        approvalFlag: '--yolo',
+        env: {
+          CLAUDETTE_BROKER_TEST_SECRET: 'must-not-reach-bash',
+          DEVELOPER_DIR: '/tmp/model-controlled-xcode',
+        },
+        timeout: 30_000,
+      });
+      assert.equal(result.timedOut, false, `CLI exits cleanly; stderr=${result.stderr}`);
+      assert.equal(result.code, 0);
+      assert.deepEqual(result.nonJson, [], 'JSON mode remains a pure protocol stream');
+      assert.ok(result.events.some(event => event.type === 'ready'), 'CLI reaches ready inside the outer sandbox');
+      assert.ok(result.events.some(event => event.type === 'tool_call' && event.name === 'bash'));
+      const output = observedToolResults.find(value => value.includes('bash_pid=')) ?? '';
+      assert.match(output, /3 apiscanner\.py/);
+      assert.match(output, /alpha from file/);
+      assert.match(output, /python-ok/);
+      assert.match(output, /node-ok/);
+      assert.match(output, /npm-ok/);
+      assert.match(output, /home-ok/);
+      assert.match(output, /tmp-ok/);
+      assert.match(output, /developer_env_scrubbed=0/);
+      assert.match(output, /outside_read=[1-9]/);
+      assert.match(output, /outside_write=[1-9]/);
+      assert.match(output, /external_network=[1-9]/);
+      assert.match(output, /loopback-ok/);
+      assert.match(output, /parent_signal=[1-9]/);
+      assert.match(output, /apple_event=[1-9]/);
+      assert.match(output, /secret_scrubbed=0/);
+      assert.match(output, new RegExp(tmpDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+      assert.equal(await fsp.readFile(outside, 'utf8'), 'outside-secret');
+      const bashPid = Number(output.match(/bash_pid=(\d+)/)?.[1]);
+      assert.ok(bashPid > 0);
+      assert.throws(() => process.kill(bashPid, 0), error => error?.code === 'ESRCH', 'brokered Bash process exited');
+      const socketEntriesAfter = new Set((await fsp.readdir('/tmp')).filter(name => name.startsWith('claudette-broker-')));
+      assert.deepEqual(socketEntriesAfter, socketEntriesBefore, 'direct IPC leaves no broker socket behind');
+    } finally {
+      await fsp.unlink(outside).catch(() => {});
+    }
   });
 
   // Regression: readline emits `line` events during a turn with nobody
@@ -4901,7 +8048,7 @@ describe('CLI JSON IPC protocol (--json-ipc)', async () => {
     return new Promise((resolve, reject) => {
       const proc = spawn('node', ['claudette.js', '--json-ipc', '-y', '--cwd', tmpDir, '--model', 'mock-ipc:latest'], {
         cwd: ROOT,
-        env: { ...process.env, OLLAMA_BASE_URL: mockBaseUrl },
+        env: { ...process.env, ...hermeticModelEnv, OLLAMA_BASE_URL: mockBaseUrl },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       let buffer = '';

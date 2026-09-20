@@ -223,11 +223,22 @@
   <main id="main"><p class="empty">Loading…</p></main>
 
   <script>
+    const API_TOKEN_STORAGE_KEY = 'claudette.serverToken';
+    const suppliedToken = new URLSearchParams(window.location.search).get('token');
+    if (suppliedToken) {
+      sessionStorage.setItem(API_TOKEN_STORAGE_KEY, suppliedToken);
+      const cleanUrl = new URL(window.location.href);
+      cleanUrl.searchParams.delete('token');
+      history.replaceState(null, '', `${cleanUrl.pathname}${cleanUrl.search}${cleanUrl.hash}`);
+    }
+    const apiToken = sessionStorage.getItem(API_TOKEN_STORAGE_KEY) || '';
+
     let allReports = [];
     let activeFilter = 'all';
 
     async function load() {
-      const res = await fetch('/api/bench');
+      const headers = apiToken ? { Authorization: `Bearer ${apiToken}` } : {};
+      const res = await fetch('/api/bench', { headers });
       const data = await res.json();
       allReports = data.reports;
       render();
@@ -264,7 +275,7 @@
     function renderFilters(reports) {
       const tasks = ['all', ...new Set(reports.map(r => r.taskId))];
       document.getElementById('filters').innerHTML = tasks.map(t =>
-        `<button class="filter-btn ${t === activeFilter ? 'active' : ''}" data-task="${t}">${t}</button>`
+        `<button class="filter-btn ${t === activeFilter ? 'active' : ''}" data-task="${escHtml(t)}">${escHtml(t)}</button>`
       ).join('');
       document.querySelectorAll('.filter-btn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -297,22 +308,25 @@
         const ts = r.startedAt ? new Date(r.startedAt).toLocaleString() : '';
         return `
           <div class="run-card" id="card-${i}">
-            <div class="run-header" onclick="toggle(${i})">
+            <div class="run-header" data-run-index="${i}">
               <span class="chevron">▶</span>
               <div>
-                <div class="task-name">${r.taskId || '?'}</div>
-                <div class="task-model">${r.model || '?'} · ${ts}</div>
+                <div class="task-name">${escHtml(r.taskId || '?')}</div>
+                <div class="task-model">${escHtml(r.model || '?')} · ${escHtml(ts)}</div>
               </div>
               <div class="verify-pills">${verPills}</div>
-              <div class="task-meta">${r.category || ''}</div>
-              <div class="score-pill ${scoreClass(hard)}" title="Hard score">${formatScore(hard)}</div>
-              <div class="score-pill ${scoreClass(overall)}" title="Overall score">${formatScore(overall)}</div>
+              <div class="task-meta">${escHtml(r.category || '')}</div>
+              <div class="score-pill ${scoreClass(hard)}" title="Hard score">${escHtml(formatScore(hard))}</div>
+              <div class="score-pill ${scoreClass(overall)}" title="Overall score">${escHtml(formatScore(overall))}</div>
             </div>
             <div class="run-body" id="body-${i}" style="display:none">
               ${renderBody(r)}
             </div>
           </div>`;
       }).join('');
+      document.querySelectorAll('.run-header').forEach(header => {
+        header.addEventListener('click', () => toggle(Number(header.dataset.runIndex)));
+      });
     }
 
     function renderBody(r) {
@@ -332,7 +346,7 @@
         ? `<p class="judge-fail">Judge failed: ${escHtml(r.llmJudgment.error)}</p>`
         : r.llmJudgment?.scores
         ? `<div class="judge-scores">
-            ${Object.entries(r.llmJudgment.scores).map(([k,v]) => `<span>${k}: <b>${v}</b></span>`).join('')}
+            ${Object.entries(r.llmJudgment.scores).map(([k,v]) => `<span>${escHtml(k)}: <b>${escHtml(v)}</b></span>`).join('')}
            </div>
            <p class="judge-summary">${escHtml(r.llmJudgment.summary || '')}</p>`
         : `<p class="judge-fail">No judge data</p>`;
@@ -346,11 +360,11 @@
 
         <p class="section-title">Metrics</p>
         <div class="metrics-row">
-          <span>hard <b>${r.summary.hardScore}</b></span>
-          <span>judge <b>${r.summary.judgeScore ?? 'n/a'}</b></span>
-          <span>overall <b>${r.summary.overallScore}</b></span>
+          <span>hard <b>${escHtml(r.summary.hardScore)}</b></span>
+          <span>judge <b>${escHtml(r.summary.judgeScore ?? 'n/a')}</b></span>
+          <span>overall <b>${escHtml(r.summary.overallScore)}</b></span>
           <span>files changed <b>${r.hardChecks?.filesChanged ? 'yes' : 'no'}</b></span>
-          <span>verify pass rate <b>${r.hardChecks?.verificationPassRate}</b></span>
+          <span>verify pass rate <b>${escHtml(r.hardChecks?.verificationPassRate)}</b></span>
         </div>
 
         ${diffStat ? `<p class="section-title">Diff Stat</p><pre class="diff-stat">${escHtml(diffStat)}</pre>` : ''}
@@ -372,12 +386,17 @@
     }
 
     function escHtml(s) {
-      return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
 
     document.getElementById('refresh-btn').addEventListener('click', load);
     load().catch(err => {
-      document.getElementById('main').innerHTML = `<p class="empty">Error: ${err.message}</p>`;
+      document.getElementById('main').innerHTML = `<p class="empty">Error: ${escHtml(err.message)}</p>`;
     });
   </script>
 </body>

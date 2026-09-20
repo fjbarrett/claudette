@@ -160,7 +160,7 @@ export async function withRetry(attempt, {
  */
 export function createStallGuard({ timeoutMs = resolveStallTimeout(), signal, label = 'Provider' } = {}) {
   const controller = new AbortController();
-  const signals = [controller.signal, ...(signal ? [signal] : [])];
+  const signals = [controller.signal, ...(signal ? [signal] : [])].filter(Boolean);
   let timer = null;
   let stalled = false;
 

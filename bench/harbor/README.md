@@ -8,7 +8,8 @@ regression loop.
 
 ## How it works
 
-- `install()` puts Node 22 (nvm) into the task container and
+- `install()` verifies the pinned NVM v0.40.2 installer, puts exact Node
+  22.23.2 into the task container, and
   `npm install -g`'s claudette from a GitHub tarball of this repo
   (no npm dependencies, so installs are quick).
 - `run()` pipes one `{"type":"prompt","text":...}` line into
@@ -37,12 +38,12 @@ export OPENROUTER_API_KEY=...   # or the key for whatever provider you use
   -d terminal-bench@2.1 \
   -a claudette_harbor:Claudette \
   -m openrouter/openai/gpt-5-nano \
-  --agent-kwarg version=feature/context-management \
+  --agent-kwarg version=<40-character-claudette-commit-sha> \
   -n 1
 ```
 
-- `--agent-kwarg version=<ref>` pins the claudette git ref (branch, tag,
-  SHA) installed in the container; defaults to `main`. **Push before you
+- `--agent-kwarg version=<sha>` is required and must be the full 40-character
+  Claudette commit SHA. Mutable branches/tags are rejected. **Push before you
   run** — the container installs from GitHub, not your working tree.
 - `-t <task-name>` runs a single task; omit for the whole dataset.
 - Results land under `runs/` (harbor's default output dir).
