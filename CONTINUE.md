@@ -17,6 +17,12 @@
   then MCP client, subagents Phase 2+, persisted permissions,
   Terminal-Bench 10-20 task slice, benchmark rebaseline, verify-grep to
   real tests, Windows port.
+- 2026-09-20: verify-grep TODO started (38dfb09, NOT pushed).
+  count-lines-tool + extract-print-help assert behavior; echo-cheats
+  fail the new checks and passed the old greps. Remaining grep tasks
+  (edit-two-timeouts, session-error-handling, add-status-endpoint,
+  health-check-script, project scaffolds) still to convert. Eval-matrix
+  TODO blocked: no local Ollama daemon; needs cloud auth + farm.
 
 ## Active objectives (2026-09-05)
 
